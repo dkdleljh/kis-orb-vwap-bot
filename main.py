@@ -33,6 +33,7 @@ from core.event_store import EventStore
 from core import events as ievents
 from core.ledger import Ledger, ledger_enabled
 from core.oms import OMS, oms_enabled
+from core.reconcile import reconcile_enabled, reconcile_open_orders
 
 
 class TradingEngine:
@@ -1104,6 +1105,13 @@ class TradingEngine:
                 starting_cash = 0.0
             self.ledger = Ledger(starting_cash=starting_cash)
 
+        # [PHASE5] Optional reconcile loop (default OFF)
+        self.reconcile_on: bool = bool(reconcile_enabled())
+        self.reconcile_interval_sec = max(
+            0, int(os.environ.get("KIS_RECONCILE_INTERVAL_SEC", "0") or 0)
+        )
+        self._reconcile_last: dict[str, object] = {"ts": None, "issue_count": 0}
+
         # Best-effort error counters for health/status (never used for control-flow)
         self._error_counts: dict[str, int] = defaultdict(int)
 
@@ -1254,6 +1262,8 @@ class TradingEngine:
         ]
         if self.position_snapshot_interval_sec > 0:
             tasks.append(asyncio.create_task(self.position_snapshot_loop()))
+        if self.reconcile_on and self.reconcile_interval_sec > 0:
+            tasks.append(asyncio.create_task(self.reconcile_loop()))
 
         await asyncio.gather(*tasks)
 
@@ -2433,6 +2443,11 @@ class TradingEngine:
         except Exception:
             recent_counts = {}
 
+        try:
+            recent_type_dist = self.event_store.recent_type_distribution(max_lines=5000)
+        except Exception:
+            recent_type_dist = {}
+
         universe_summary = {
             "base_universe_count": int(len(getattr(self, "base_universe", []) or [])),
             "target_symbols_count": int(len(self.target_symbols)),
@@ -2453,9 +2468,22 @@ class TradingEngine:
             "position": pos.to_dict() if pos else None,
             "symbols": list(self.target_symbols),
             "universe": universe_summary,
+            "institutional": {
+                "oms_enabled": bool(self.oms is not None),
+                "ledger_enabled": bool(self.ledger is not None),
+                "reconcile_enabled": bool(os.environ.get("KIS_INSTITUTIONAL_RECONCILE", "0") == "1"),
+                "reconcile_interval_sec": int(getattr(self, "reconcile_interval_sec", 0) or 0),
+                "reconcile_last": dict(getattr(self, "_reconcile_last", {}) or {}),
+                "position_snapshot_interval_sec": int(getattr(self, "position_snapshot_interval_sec", 0) or 0),
+            },
+            "errors": {
+                "event_store_error_count": int(getattr(self.event_store, "error_count", 0) or 0),
+                "engine_error_counts": dict(self._error_counts),
+            },
             "events": {
                 "base_dir": events_dir,
                 "recent_counts": recent_counts,
+                "recent_type_distribution": recent_type_dist,
             },
         }
 
@@ -2503,6 +2531,49 @@ class TradingEngine:
                     self._error_counts["position_snapshot_loop"] += 1
                 except Exception:
                     pass
+            await asyncio.sleep(interval)
+
+    async def reconcile_loop(self) -> None:
+        """Best-effort reconcile loop (Phase5 skeleton).
+
+        Enabled when:
+            KIS_INSTITUTIONAL_RECONCILE=1
+            KIS_RECONCILE_INTERVAL_SEC>0
+
+        Compares internal OMS view vs broker open-orders query (if available).
+        """
+        interval = float(self.reconcile_interval_sec)
+        while True:
+            issues = []
+            try:
+                broker_orders = await self.rest.get_open_orders()
+                internal: dict[str, dict[str, Any]] = {}
+                if self.oms is not None:
+                    # Access is best-effort; OMS is an in-memory helper.
+                    for k, rec in (getattr(self.oms, "_orders_by_key", {}) or {}).items():
+                        internal[str(k)] = {
+                            "symbol": getattr(rec, "symbol", None),
+                            "side": getattr(rec, "side", None),
+                            "qty": getattr(rec, "qty", None),
+                            "state": str(getattr(rec, "state", "")),
+                            "broker_order_id": getattr(rec, "broker_order_id", None),
+                            "filled_qty": getattr(rec, "filled_qty", None),
+                        }
+                issues = reconcile_open_orders(internal_orders=internal, broker_orders=broker_orders)
+                self._reconcile_last = {
+                    "ts": now_local(self.tz).isoformat(),
+                    "issue_count": int(len(issues)),
+                }
+                if issues:
+                    self.logger.warning("reconcile issues=%s sample=%s", len(issues), issues[0].kind)
+            except Exception as e:
+                self._error_counts["reconcile_loop"] += 1
+                self._reconcile_last = {
+                    "ts": now_local(self.tz).isoformat(),
+                    "issue_count": -1,
+                    "error": str(e),
+                }
+
             await asyncio.sleep(interval)
 
 

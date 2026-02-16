@@ -369,3 +369,16 @@ class KISRestOrders:
         except Exception as e:
             self.logger.error(f"get_quote({symbol}) exception: {e}")
             return {}
+
+    async def get_open_orders(self) -> list[dict]:
+        """Best-effort open order query.
+
+        Phase5 reconcile needs a broker-side view of working orders.
+
+        Notes:
+        - KIS order inquiry endpoints/fields differ by account type and environment.
+        - For now we provide a safe default that returns an empty list.
+        - When KIS_INSTITUTIONAL_RECONCILE=1, callers should treat empty results as
+          "unknown" rather than "no open orders".
+        """
+        return []

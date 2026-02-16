@@ -59,3 +59,45 @@ def reconcile_positions(
                 )
             )
     return issues
+
+
+def reconcile_open_orders(*, internal_orders: Dict[str, Dict[str, Any]], broker_orders: List[Dict[str, Any]]) -> List[ReconcileIssue]:
+    """Compare internal OMS view vs broker open orders (Phase5 skeleton).
+
+    Args:
+        internal_orders: mapping idempotency_key -> {symbol, side, qty, state, broker_order_id, filled_qty, ...}
+        broker_orders: list of broker open order dicts (best-effort)
+
+    Returns:
+        Reconcile issues. This is intentionally conservative and best-effort.
+    """
+    issues: List[ReconcileIssue] = []
+
+    # Normalize broker orders by broker_order_id when available.
+    broker_by_id: Dict[str, Dict[str, Any]] = {}
+    for o in broker_orders or []:
+        try:
+            oid = str(o.get("order_id") or o.get("ODNO") or "")
+        except Exception:
+            oid = ""
+        if oid:
+            broker_by_id[oid] = dict(o)
+
+    # Compare: internal submitted/acked orders should exist broker-side (when broker query is available).
+    for key, rec in (internal_orders or {}).items():
+        broker_id = str(rec.get("broker_order_id") or "")
+        state = str(rec.get("state") or "")
+        symbol = rec.get("symbol")
+
+        if state in {"SUBMITTED", "ACKED", "PARTIALLY_FILLED"} and broker_orders is not None:
+            if broker_id and broker_id not in broker_by_id:
+                issues.append(
+                    ReconcileIssue(
+                        kind="open_order_missing_on_broker",
+                        symbol=str(symbol) if symbol else None,
+                        message=f"internal order present but missing on broker open-orders: broker_order_id={broker_id} state={state}",
+                        details={"idempotency_key": key, "internal": rec},
+                    )
+                )
+
+    return issues

@@ -4,7 +4,10 @@
 venv/
 __pycache__/
 logs/
-reports/
+# Generated reports (keep generator scripts tracked)
+reports/*.md
+reports/*.json
+reports/*.csv
 *.log
 *.pid
 .kis_*
