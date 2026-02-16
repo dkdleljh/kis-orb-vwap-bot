@@ -1,0 +1,23 @@
+Harden this KIS ORB VWAP bot with safe production defaults, and ensure live trading works when explicitly enabled.
+
+Observations:
+- main.py and scheduler.py are running.
+- logs show token fetch failed 403 with message: 1 per minute.
+- logs show 'market closed or server under maintenance - skipping websocket connection' repeatedly on weekends.
+
+Goals:
+- Implement token caching and exponential backoff / rate limiting to prevent 403.
+- Ensure weekend/market-closed behavior is quiet: log at INFO less frequently (e.g., once per 10-30 min), not every minute.
+- Add a healthcheck/status output.
+- Ensure scheduler lock works reliably and processes exit cleanly.
+- Make LIVE trading actually submit orders when enabled, but keep safe defaults:
+  - Require explicit confirmation env KIS_LIVE_CONFIRM=YES else paper-only.
+  - Add risk guardrails (max position size, max trades/day) with sane defaults.
+  - Add a kill-switch env KIS_KILL_SWITCH=1 to prevent new orders.
+- Add smoke test script.
+
+Run checks.
+Summarize changes and how to run.
+
+When completely finished, run this exact command:
+openclaw gateway wake --text "Done: kis_orb_vwap_bot hardened + live trading enabled behind confirm" --mode now

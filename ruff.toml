@@ -1,0 +1,5 @@
+[lint]
+exclude = ["archive/**", "dashboard/node_modules/**", "tests/**"]
+
+[lint.per-file-ignores]
+"tests/*" = ["F401", "F811"]

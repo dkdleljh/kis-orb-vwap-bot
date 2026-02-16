@@ -1,0 +1,19 @@
+# Local-only
+.env
+.env.production
+venv/
+__pycache__/
+logs/
+reports/
+*.log
+*.pid
+.kis_*
+
+# Runtime state / results (may contain PnL, equity, trades)
+session_state.json
+tuning_results.json
+health_status.json
+
+# Frontend dependencies
+/dashboard/node_modules/
+/dashboard/build/

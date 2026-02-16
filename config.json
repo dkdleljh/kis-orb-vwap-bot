@@ -1,0 +1,150 @@
+{
+  "env": "local",
+  "timezone": "Asia/Seoul",
+  "account": {
+    "account_no": "YOUR_ACCOUNT_NO",
+    "account_product_code": "01"
+  },
+  "products": {
+    "lever": "122630",
+    "inverse": "114800"
+  },
+  "rest": {
+    "base_url": "https://openapi.koreainvestment.com:9443",
+    "mock": false
+  },
+  "ws": {
+    "url": "ws://ops.koreainvestment.com:21000",
+    "reconnect_backoff_sec": [
+      1,
+      2,
+      3,
+      5,
+      8,
+      13
+    ],
+    "ping_interval_sec": 20
+  },
+  "trading": {
+    "entry_budget_pct": 0.2,
+    "max_entries_per_day": 10,
+    "stop_loss_pct": -0.015,
+    "take_profit_pct": 0.03,
+    "quick_profit_pct": 0.01,
+    "min_profit_for_guarantee_pct": 0.008,
+    "daily_loss_limit_pct": -0.05,
+    "max_consecutive_stop": 3,
+    "max_spread_pct": 0.005,
+    "entry_retry_limit": 5,
+    "use_atr_stops": true,
+    "atr_multiplier": 2.0,
+    "enable_time_filter": true,
+    "min_entry_score": 50,
+    "same_day_trading": true,
+    "max_trades_per_symbol": 3,
+    "min_profit_per_trade": 0.005
+  },
+  "advanced_risk": {
+    "enabled": true,
+    "circuit_breaker_losses": 5,
+    "circuit_breaker_cooldown_min": 60,
+    "max_drawdown_pct": -0.15,
+    "max_daily_trades": 15,
+    "max_position_pct": 0.2,
+    "enable_atr_sizing": true,
+    "risk_per_trade_pct": 1.0
+  },
+  "time_rules": {
+    "observe_start": "08:59:00",
+    "or_start": "09:00:00",
+    "or_end": "09:05:00",
+    "entry_start": "09:05:05",
+    "early_exit": "15:00:00",
+    "force_exit": "15:15:00"
+  },
+  "us_trading": {
+    "enabled": true,
+    "timezone": "America/New_York",
+    "market_open": "09:30:00",
+    "market_close": "16:00:00",
+    "early_exit": "15:30:00",
+    "force_exit": "15:45:00",
+    "max_position_pct": 0.15,
+    "stop_loss_pct": -0.03,
+    "take_profit_pct": 0.05,
+    "quick_profit_pct": 0.015,
+    "min_profit_for_guarantee_pct": 0.01,
+    "same_day_trading": true
+  },
+  "logging": {
+    "dir": "logs"
+  },
+  "automation": {
+    "retry": {
+      "max_attempts": 5,
+      "base_delay_sec": 1,
+      "max_delay_sec": 60,
+      "jitter": true,
+      "rate_limit_cooldown_sec": 65
+    },
+    "healthcheck": {
+      "enabled": true,
+      "interval_sec": 60
+    }
+  },
+  "modules": {
+    "kukjang": {
+      "enabled": true,
+      "symbols": [],
+      "lever": "122630",
+      "inverse": "114800",
+      "dynamic_universe": {
+        "enabled": true,
+        "scan_interval_sec": 90,
+        "top_n": 30,
+        "max_symbols": 40,
+        "always_include": [
+          "122630",
+          "114800"
+        ],
+        "min_price": 1000,
+        "exclude_spac": true,
+        "remove_after_miss_count": 2
+      }
+    },
+    "hwanjeon": {
+      "enabled": true,
+      "currencies": [
+        "USD",
+        "EUR",
+        "JPY"
+      ],
+      "poll_interval": 60,
+      "alerts": {
+        "USD_above": 1400,
+        "USD_below": 1200,
+        "USD_change": 2.0
+      }
+    },
+    "mijang": {
+      "enabled": true,
+      "symbols": [],
+      "exchange": "NASD",
+      "stop_loss_pct": -0.03,
+      "take_profit_pct": 0.05,
+      "force_exit": "04:00:00",
+      "dynamic_universe": {
+        "enabled": true,
+        "scan_interval_sec": 300,
+        "source": "popular_list",
+        "top_n": 50,
+        "max_symbols": 60,
+        "min_price_usd": 5,
+        "exchanges": [
+          "NASD",
+          "NYSE"
+        ]
+      }
+    }
+  }
+}

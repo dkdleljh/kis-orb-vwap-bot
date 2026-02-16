@@ -1,0 +1,41 @@
+{
+  "env": "prod",
+  "timezone": "Asia/Seoul",
+  "account": {
+    "account_no": "12345678",
+    "account_product_code": "01"
+  },
+  "products": {
+    "lever": "122630",
+    "inverse": "114800"
+  },
+  "rest": {
+    "base_url": "https://openapi.koreainvestment.com:9443",
+    "mock": false
+  },
+  "ws": {
+    "url": "wss://openapi.koreainvestment.com:9443",
+    "reconnect_backoff_sec": [1, 2, 3, 5, 8, 13],
+    "ping_interval_sec": 20
+  },
+  "trading": {
+    "entry_budget_pct": 0.20,
+    "max_entries_per_day": 5,
+    "stop_loss_pct": -0.010,
+    "take_profit_pct": 0.012,
+    "daily_loss_limit_pct": -0.020,
+    "max_consecutive_stop": 2,
+    "max_spread_pct": 0.003,
+    "entry_retry_limit": 3
+  },
+  "time_rules": {
+    "observe_start": "09:05:00",
+    "or_start": "09:05:00",
+    "or_end": "09:10:00",
+    "entry_start": "09:10:00",
+    "force_exit": "14:50:00"
+  },
+  "logging": {
+    "dir": "logs"
+  }
+}
