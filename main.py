@@ -33,7 +33,12 @@ from core.event_store import EventStore
 from core import events as ievents
 from core.ledger import Ledger, ledger_enabled
 from core.oms import OMS, oms_enabled
-from core.reconcile import reconcile_enabled, reconcile_open_orders
+from core.reconcile import (
+    reconcile_enabled,
+    reconcile_open_orders,
+    reconcile_positions,
+    should_block_new_entries,
+)
 
 
 class TradingEngine:
@@ -1100,7 +1105,9 @@ class TradingEngine:
         self.ledger: Ledger | None = None
         if ledger_enabled():
             try:
-                starting_cash = float(os.environ.get("KIS_LEDGER_STARTING_CASH", "0") or 0.0)
+                starting_cash = float(
+                    os.environ.get("KIS_LEDGER_STARTING_CASH", "0") or 0.0
+                )
             except Exception:
                 starting_cash = 0.0
             self.ledger = Ledger(starting_cash=starting_cash)
@@ -1172,7 +1179,9 @@ class TradingEngine:
                 await self.auth.fetch_approval_key(force=True)
         except Exception as e:
             # Preflight should not crash the engine; the normal retry loops below will handle it.
-            self.logger.warning(f"Preflight auth failed (will retry in normal loop): {e}")
+            self.logger.warning(
+                f"Preflight auth failed (will retry in normal loop): {e}"
+            )
 
         # KIS 토큰은 1분당 1회 제한(EGW00133)이 있어, 스케줄러/재기동 상황에서 바로 죽지 않도록 재시도합니다.
         while True:
@@ -1600,18 +1609,20 @@ class TradingEngine:
                         ievents.Signal(
                             symbol=str(signal.symbol),
                             side=str(signal.side),
-                            strength=float(indicators.get('ml_score', 50) or 50) / 100.0,
-                            reason='state_machine',
-                            model='ml_score_heuristic',
+                            strength=float(indicators.get("ml_score", 50) or 50)
+                            / 100.0,
+                            reason="state_machine",
+                            model="ml_score_heuristic",
                         ).to_event(run_id=self.run_id)
                     )
                 except Exception:
                     pass
 
-                asyncio.create_task(self.handle_entry(signal, book, bar_start=bar.start))
+                asyncio.create_task(
+                    self.handle_entry(signal, book, bar_start=bar.start)
+                )
         except Exception as e:
             self.logger.error(f"Evaluate entry failed for {symbol}: {e}")
-
 
     def _append_event(self, ev: ievents.Event) -> None:
         try:
@@ -1624,7 +1635,9 @@ class TradingEngine:
             except Exception:
                 pass
 
-    def _record_position_snapshot(self, symbol: str, *, trigger: str, note: str = "") -> None:
+    def _record_position_snapshot(
+        self, symbol: str, *, trigger: str, note: str = ""
+    ) -> None:
         """Best-effort PositionSnapshot logging.
 
         Phase4 integration:
@@ -1667,7 +1680,9 @@ class TradingEngine:
         except Exception:
             self._error_counts["snapshot_event"] += 1
 
-    def _make_idempotency_key(self, symbol: str, side: str, *, bar_start: datetime | None = None) -> str:
+    def _make_idempotency_key(
+        self, symbol: str, side: str, *, bar_start: datetime | None = None
+    ) -> str:
         """Create a stable idempotency key for an order decision.
 
         Phase3 recommendation:
@@ -1692,7 +1707,9 @@ class TradingEngine:
         ts = dt_utc.strftime("%Y%m%dT%H%MZ")
         return f"{self.run_id}:{symbol}:{side}:{ts}"
 
-    async def handle_entry(self, signal: Signal, book: OrderBookTop, *, bar_start: datetime | None = None) -> None:
+    async def handle_entry(
+        self, signal: Signal, book: OrderBookTop, *, bar_start: datetime | None = None
+    ) -> None:
         """Attempt to enter a position from a validated trading signal.
 
         Args:
@@ -1707,7 +1724,9 @@ class TradingEngine:
 
         symbol = cast(str, signal.symbol)
 
-        idempotency_key = self._make_idempotency_key(symbol, str(signal.side or 'BUY'), bar_start=bar_start)
+        idempotency_key = self._make_idempotency_key(
+            symbol, str(signal.side or "BUY"), bar_start=bar_start
+        )
 
         # Concurrency guard: prevent duplicate concurrent entries per symbol
         if not hasattr(self, "_trade_lock"):
@@ -1757,9 +1776,18 @@ class TradingEngine:
 
             if book.ask <= 0:
                 try:
-                    self.event_store.append(ievents.RiskDecision(symbol=symbol, allowed=False, reason="ask=0", idempotency_key=idempotency_key).to_event(run_id=self.run_id))
+                    self.event_store.append(
+                        ievents.RiskDecision(
+                            symbol=symbol,
+                            allowed=False,
+                            reason="ask=0",
+                            idempotency_key=idempotency_key,
+                        ).to_event(run_id=self.run_id)
+                    )
                     if self.oms is not None:
-                        self.oms.mark_risk(idempotency_key=idempotency_key, allowed=False)
+                        self.oms.mark_risk(
+                            idempotency_key=idempotency_key, allowed=False
+                        )
                 except Exception:
                     pass
                 self.logger.info("entry skipped: ask=0")
@@ -1779,9 +1807,18 @@ class TradingEngine:
             # qty=0 원인을 로그로 남겨서 즉시 진단 가능하게
             if qty <= 0:
                 try:
-                    self.event_store.append(ievents.RiskDecision(symbol=symbol, allowed=False, reason="qty=0", idempotency_key=idempotency_key).to_event(run_id=self.run_id))
+                    self.event_store.append(
+                        ievents.RiskDecision(
+                            symbol=symbol,
+                            allowed=False,
+                            reason="qty=0",
+                            idempotency_key=idempotency_key,
+                        ).to_event(run_id=self.run_id)
+                    )
                     if self.oms is not None:
-                        self.oms.mark_risk(idempotency_key=idempotency_key, allowed=False)
+                        self.oms.mark_risk(
+                            idempotency_key=idempotency_key, allowed=False
+                        )
                 except Exception:
                     pass
                 self.logger.info(
@@ -1792,9 +1829,18 @@ class TradingEngine:
 
             if self.trades_today >= self.max_trades_per_day:
                 try:
-                    self.event_store.append(ievents.RiskDecision(symbol=symbol, allowed=False, reason="max_trades_per_day", idempotency_key=idempotency_key).to_event(run_id=self.run_id))
+                    self.event_store.append(
+                        ievents.RiskDecision(
+                            symbol=symbol,
+                            allowed=False,
+                            reason="max_trades_per_day",
+                            idempotency_key=idempotency_key,
+                        ).to_event(run_id=self.run_id)
+                    )
                     if self.oms is not None:
-                        self.oms.mark_risk(idempotency_key=idempotency_key, allowed=False)
+                        self.oms.mark_risk(
+                            idempotency_key=idempotency_key, allowed=False
+                        )
                 except Exception:
                     pass
                 self.logger.warning(
@@ -1822,7 +1868,12 @@ class TradingEngine:
 
             if self.oms is not None:
                 try:
-                    self.oms.register_intent(symbol=symbol, side="BUY", qty=int(qty), idempotency_key=idempotency_key)
+                    self.oms.register_intent(
+                        symbol=symbol,
+                        side="BUY",
+                        qty=int(qty),
+                        idempotency_key=idempotency_key,
+                    )
                 except Exception:
                     self._error_counts["oms_register_intent"] += 1
 
@@ -1891,8 +1942,12 @@ class TradingEngine:
                             fee=0.0,
                         )
                     if self.oms is not None:
-                        self.oms.apply_fill(idempotency_key=idempotency_key, fill_qty=int(qty))
-                    self._record_position_snapshot(symbol, trigger="fill", note="paper_entry")
+                        self.oms.apply_fill(
+                            idempotency_key=idempotency_key, fill_qty=int(qty)
+                        )
+                    self._record_position_snapshot(
+                        symbol, trigger="fill", note="paper_entry"
+                    )
                 except Exception:
                     pass
                 self.peak_pnl_pct[symbol] = -0.01
@@ -1915,7 +1970,10 @@ class TradingEngine:
                         ).to_event(run_id=self.run_id)
                     )
                     if self.oms is not None:
-                        self.oms.mark_submitted(idempotency_key=idempotency_key, broker_order_id=broker_order_id)
+                        self.oms.mark_submitted(
+                            idempotency_key=idempotency_key,
+                            broker_order_id=broker_order_id,
+                        )
                     if broker_order_id:
                         self.event_store.append(
                             ievents.OrderAck(
@@ -1926,7 +1984,10 @@ class TradingEngine:
                             ).to_event(run_id=self.run_id)
                         )
                         if self.oms is not None:
-                            self.oms.mark_acked(idempotency_key=idempotency_key, broker_order_id=broker_order_id)
+                            self.oms.mark_acked(
+                                idempotency_key=idempotency_key,
+                                broker_order_id=broker_order_id,
+                            )
                 except Exception:
                     pass
                 await asyncio.sleep(2)
@@ -1960,8 +2021,12 @@ class TradingEngine:
                                 fee=0.0,
                             )
                         if self.oms is not None:
-                            self.oms.apply_fill(idempotency_key=idempotency_key, fill_qty=int(pos.qty))
-                        self._record_position_snapshot(symbol, trigger="fill", note="live_entry")
+                            self.oms.apply_fill(
+                                idempotency_key=idempotency_key, fill_qty=int(pos.qty)
+                            )
+                        self._record_position_snapshot(
+                            symbol, trigger="fill", note="live_entry"
+                        )
                     except Exception:
                         pass
                     # 진입 성공 시 Peak PnL 초기화
@@ -2072,8 +2137,12 @@ class TradingEngine:
                         fee=0.0,
                     )
                 if self.oms is not None:
-                    self.oms.apply_fill(idempotency_key=idempotency_key, fill_qty=int(pos.qty))
-                self._record_position_snapshot(symbol, trigger="fill", note=f"paper_exit:{reason}")
+                    self.oms.apply_fill(
+                        idempotency_key=idempotency_key, fill_qty=int(pos.qty)
+                    )
+                self._record_position_snapshot(
+                    symbol, trigger="fill", note=f"paper_exit:{reason}"
+                )
             except Exception:
                 pass
 
@@ -2146,8 +2215,12 @@ class TradingEngine:
                         fee=0.0,
                     )
                 if self.oms is not None:
-                    self.oms.apply_fill(idempotency_key=idempotency_key, fill_qty=int(pos.qty))
-                self._record_position_snapshot(symbol, trigger="fill", note=f"live_exit:{reason}")
+                    self.oms.apply_fill(
+                        idempotency_key=idempotency_key, fill_qty=int(pos.qty)
+                    )
+                self._record_position_snapshot(
+                    symbol, trigger="fill", note=f"live_exit:{reason}"
+                )
             except Exception:
                 pass
 
@@ -2471,13 +2544,21 @@ class TradingEngine:
             "institutional": {
                 "oms_enabled": bool(self.oms is not None),
                 "ledger_enabled": bool(self.ledger is not None),
-                "reconcile_enabled": bool(os.environ.get("KIS_INSTITUTIONAL_RECONCILE", "0") == "1"),
-                "reconcile_interval_sec": int(getattr(self, "reconcile_interval_sec", 0) or 0),
+                "reconcile_enabled": bool(
+                    os.environ.get("KIS_INSTITUTIONAL_RECONCILE", "0") == "1"
+                ),
+                "reconcile_interval_sec": int(
+                    getattr(self, "reconcile_interval_sec", 0) or 0
+                ),
                 "reconcile_last": dict(getattr(self, "_reconcile_last", {}) or {}),
-                "position_snapshot_interval_sec": int(getattr(self, "position_snapshot_interval_sec", 0) or 0),
+                "position_snapshot_interval_sec": int(
+                    getattr(self, "position_snapshot_interval_sec", 0) or 0
+                ),
             },
             "errors": {
-                "event_store_error_count": int(getattr(self.event_store, "error_count", 0) or 0),
+                "event_store_error_count": int(
+                    getattr(self.event_store, "error_count", 0) or 0
+                ),
                 "engine_error_counts": dict(self._error_counts),
             },
             "events": {
@@ -2541,6 +2622,7 @@ class TradingEngine:
             KIS_RECONCILE_INTERVAL_SEC>0
 
         Compares internal OMS view vs broker open-orders query (if available).
+        Also checks position mismatch and sets kill-switch for critical issues.
         """
         interval = float(self.reconcile_interval_sec)
         while True:
@@ -2550,7 +2632,9 @@ class TradingEngine:
                 internal: dict[str, dict[str, Any]] = {}
                 if self.oms is not None:
                     # Access is best-effort; OMS is an in-memory helper.
-                    for k, rec in (getattr(self.oms, "_orders_by_key", {}) or {}).items():
+                    for k, rec in (
+                        getattr(self.oms, "_orders_by_key", {}) or {}
+                    ).items():
                         internal[str(k)] = {
                             "symbol": getattr(rec, "symbol", None),
                             "side": getattr(rec, "side", None),
@@ -2559,13 +2643,58 @@ class TradingEngine:
                             "broker_order_id": getattr(rec, "broker_order_id", None),
                             "filled_qty": getattr(rec, "filled_qty", None),
                         }
-                issues = reconcile_open_orders(internal_orders=internal, broker_orders=broker_orders)
-                self._reconcile_last = {
-                    "ts": now_local(self.tz).isoformat(),
-                    "issue_count": int(len(issues)),
-                }
-                if issues:
-                    self.logger.warning("reconcile issues=%s sample=%s", len(issues), issues[0].kind)
+
+                # Check open orders
+                order_issues = reconcile_open_orders(
+                    internal_orders=internal, broker_orders=broker_orders
+                )
+                issues.extend(order_issues)
+
+                # Check positions if ledger is enabled
+                if self.ledger is not None:
+                    broker_positions = await self.rest.get_all_positions()
+                    internal_positions: dict[str, dict[str, Any]] = {}
+                    for sym, pos in self.ledger.positions.items():
+                        internal_positions[sym] = {
+                            "qty": pos.qty,
+                            "avg_price": pos.avg_price,
+                        }
+                    position_issues = reconcile_positions(
+                        internal=internal_positions, broker=broker_positions
+                    )
+                    issues.extend(position_issues)
+
+                # Classify and take action based on severity
+                if should_block_new_entries(issues):
+                    # Create kill-switch flag file for critical issues
+                    flag_path = os.path.join(self.base_dir, "STOP_TRADING.flag")
+                    try:
+                        with open(flag_path, "w") as f:
+                            f.write(
+                                f"reconcile_critical:{now_local(self.tz).isoformat()}\n"
+                            )
+                    except Exception:
+                        pass
+                    self.logger.error(
+                        "CRITICAL reconcile issues detected: blocking new entries. issues=%s",
+                        len(issues),
+                    )
+                    self._reconcile_last = {
+                        "ts": now_local(self.tz).isoformat(),
+                        "issue_count": len(issues),
+                        "blocked": True,
+                        "severity": "critical",
+                    }
+                else:
+                    self._reconcile_last = {
+                        "ts": now_local(self.tz).isoformat(),
+                        "issue_count": len(issues),
+                        "blocked": False,
+                    }
+                    if issues:
+                        self.logger.warning(
+                            "reconcile issues=%s sample=%s", len(issues), issues[0].kind
+                        )
             except Exception as e:
                 self._error_counts["reconcile_loop"] += 1
                 self._reconcile_last = {
@@ -2575,7 +2704,6 @@ class TradingEngine:
                 }
 
             await asyncio.sleep(interval)
-
 
     async def _load_prev_closes_if_needed(self, symbols: list[str]) -> None:
         """Populate cached previous-close values for supplied symbols.

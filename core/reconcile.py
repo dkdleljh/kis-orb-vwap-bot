@@ -14,7 +14,14 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Dict, List, Optional
+
+
+class ReconcileSeverity(str, Enum):
+    CRITICAL = "critical"  # Immediately block new entries
+    WARNING = "warning"  # Log and report, but allow trading
+    INFO = "info"  # Just for awareness
 
 
 def reconcile_enabled() -> bool:
@@ -27,6 +34,7 @@ class ReconcileIssue:
     symbol: Optional[str]
     message: str
     details: Dict[str, Any]
+    severity: ReconcileSeverity = ReconcileSeverity.INFO
 
 
 def reconcile_positions(
@@ -49,19 +57,25 @@ def reconcile_positions(
     for sym in sorted(syms):
         a = internal.get(sym) or {}
         b = broker.get(sym) or {}
-        if int(a.get("qty", 0)) != int(b.get("qty", 0)):
+        internal_qty = int(a.get("qty", 0))
+        broker_qty = int(b.get("qty", 0))
+        if internal_qty != broker_qty:
+            severity = ReconcileSeverity.CRITICAL
             issues.append(
                 ReconcileIssue(
                     kind="position_qty_mismatch",
                     symbol=sym,
-                    message=f"qty mismatch internal={a.get('qty')} broker={b.get('qty')}",
+                    message=f"qty mismatch internal={internal_qty} broker={broker_qty}",
                     details={"internal": a, "broker": b},
+                    severity=severity,
                 )
             )
     return issues
 
 
-def reconcile_open_orders(*, internal_orders: Dict[str, Dict[str, Any]], broker_orders: List[Dict[str, Any]]) -> List[ReconcileIssue]:
+def reconcile_open_orders(
+    *, internal_orders: Dict[str, Dict[str, Any]], broker_orders: List[Dict[str, Any]]
+) -> List[ReconcileIssue]:
     """Compare internal OMS view vs broker open orders (Phase5 skeleton).
 
     Args:
@@ -89,7 +103,10 @@ def reconcile_open_orders(*, internal_orders: Dict[str, Dict[str, Any]], broker_
         state = str(rec.get("state") or "")
         symbol = rec.get("symbol")
 
-        if state in {"SUBMITTED", "ACKED", "PARTIALLY_FILLED"} and broker_orders is not None:
+        if (
+            state in {"SUBMITTED", "ACKED", "PARTIALLY_FILLED"}
+            and broker_orders is not None
+        ):
             if broker_id and broker_id not in broker_by_id:
                 issues.append(
                     ReconcileIssue(
@@ -97,7 +114,35 @@ def reconcile_open_orders(*, internal_orders: Dict[str, Dict[str, Any]], broker_
                         symbol=str(symbol) if symbol else None,
                         message=f"internal order present but missing on broker open-orders: broker_order_id={broker_id} state={state}",
                         details={"idempotency_key": key, "internal": rec},
+                        severity=ReconcileSeverity.WARNING,
                     )
                 )
 
     return issues
+
+
+def classify_issues(
+    issues: List[ReconcileIssue],
+) -> Dict[ReconcileSeverity, List[ReconcileIssue]]:
+    """이슈 리스트를 심각도별로 분류합니다.
+
+    Returns:
+        Dict mapping severity -> list of issues
+    """
+    result: Dict[ReconcileSeverity, List[ReconcileIssue]] = {
+        ReconcileSeverity.CRITICAL: [],
+        ReconcileSeverity.WARNING: [],
+        ReconcileSeverity.INFO: [],
+    }
+    for issue in issues:
+        result[issue.severity].append(issue)
+    return result
+
+
+def should_block_new_entries(issues: List[ReconcileIssue]) -> bool:
+    """CRITICAL severity 이슈가 있는지 확인합니다.
+
+    Returns:
+        True if any critical issue exists (should block new entries)
+    """
+    return any(i.severity == ReconcileSeverity.CRITICAL for i in issues)

@@ -17,6 +17,20 @@
 
 ---
 
+## 100점 정의(주인님 환경용, Recommended)
+### A) 기관 수준 100점(현실형)
+- 이벤트로 Signal→Risk→Order→Ack→Fill→Ledger→PositionSnapshot 흐름이 완전 연결/추적 가능
+- 브로커 사실 기반 OMS/정합성으로 포지션/현금 불일치가 자동 감지/차단됨
+
+### B) 무인 자동화 100점(알림 없는 환경용)
+- 외부 푸시 알림은 사용하지 않음(주인님 조건)
+- 대신 이상 발생 시 **무인 안전정지**가 100% 발동:
+  - 신규 진입 즉시 차단, 필요 시 kill-switch 자동 ON
+  - health_status + 이벤트 + 일일 리포트로 “왜 멈췄는지” 로컬에 완전 기록
+- 다음 영업일 자동 재가동(타이머) + 재시작 시 reconcile 우선 수행
+
+---
+
 ## 추천 기본값(정책)
 ### 자금 1,000만원 기준 리스크(초기 보수)
 - 일 손실 제한(자동 중지): **-1.2% (약 -12만원)**
@@ -151,12 +165,18 @@
 **목표:** 재시작/장애/불일치 상황에서 자동 정합성 확인 + 위험 시 자동 중지 + 리포트.
 
 ### 현재 상태 (코드 기준)
-- ⚠️ Reconcile 스켈레톤 존재 (`core/reconcile.py`: reconcile_positions 함수) - qty 비교만
-- ⛔ 실제 reconciliation 로직 미구현
-- ⛔ 불일치 정책 미정의
-- ⛔ 일일 리포트 자동 생성 미구현
-- ⛔ health_status 운영 메트릭 확장 미진행
-- ⛔ 브로커 어댑터 표준화 미진행
+- ✅ Reconcile 스켈레톤 구현됨 (`core/reconcile.py`: reconcile_positions, reconcile_open_orders)
+- ✅ reconcile_positions: 내부 vs 브로커 포지션 qty 비교
+- ✅ reconcile_open_orders: 내부 OMS vs 브로커 미결 주문 비교
+- ✅ reconcile_loop (main.py): 주기적 실행 + 경고 로깅
+- ✅ P5-1c: reconcile 주기적 실행 및 결과를 _reconcile_last에 저장
+- ⚠️ P5-1b: KisRestOrders.get_positions()는 단일 포지션만 반환 - 전체 포지션 맵 미지원
+- ⚠️ P5-2a: 불일치 심각도 분류 미구현 (개선 필요)
+- ⚠️ P5-2b: 자동 차단 미구현 (경고 로깅만)
+- ✅ P5-3: 일일 리포트 자동 생성 구현됨 (reporter.py)
+- ✅ P5-4: health_status 확장 구현됨 (main.py: get_health_status)
+- ✅ P5-4a: 이벤트 타입 분포, 오류 카운트, 플래그 상태 포함
+- ✅ P5-4b: max_lines=5000으로 비용 제어됨
 
 ### 작업 티켓
 
@@ -166,34 +186,36 @@
 
 > **⚠️ 선행조건:** Ledger(P4-1)가 "단일 진실"로 동작해야 reconcile이 의미 있음
 
-- P5-1a: 브로커 어댑터가 제공해야 할 최소 메서드 목록 정의 (positions, open_orders, executions/fills) (`ROADMAP_INSTITUTIONAL.md`)
-- P5-1b: kis_rest_orders.py에 "전체 포지션 맵" 반환 메서드 추가 (reconcile 입력용) (`kis_rest_orders.py`)
-- P5-1c: reconcile 주기적 실행 및 결과를 이벤트로 남김 (`main.py`, `core/reconcile.py`, `core/events.py`)
+- ✅ P5-1a: 브로커 어댑터가 제공해야 할 최소 메서드 목록 정의 (positions, open_orders, executions/fills) - `get_open_orders()` 사용중
+- ⚠️ P5-1b: kis_rest_orders.py에 "전체 포지션 맵 추가 필요" 반환 메서드 (현재: 단일 포지션만 반환) (`kis_rest_orders.py`)
+- ✅ P5-1c: reconcile 주기적 실행 및 결과를 이벤트로 남김 (`main.py` reconcile_loop, `_reconcile_last` 저장)
 
 #### P5-2: 불일치 정책(추천: 신규 진입 차단 + 경고/리포트, 심각하면 kill-switch)
 **수정 파일:** `core/reconcile.py`, `main.py`, `ROADMAP_INSTITUTIONAL.md`  
 **완료 조건:** 불일치 발생 시 정의된 정책에 따라 자동 조치 실행
 
-- P5-2a: mismatch severity 분류 정의
+- ⚠️ P5-2a: mismatch severity 분류 정의 (미구현 - 현재는 단순 경고만)
   - qty mismatch: 즉시 차단
   - avg_price mismatch: 허용오차 내 허용, 초과 시 경고
   - cash mismatch: 경고만
   - symbol set 차이: 신규 진입 차단 (`core/reconcile.py`, `ROADMAP_INSTITUTIONAL.md`)
-- P5-2b: 조치 구현 (신규 진입 차단: 엔진 레벨 가드, kill-switch: STOP_TRADING.flag 생성) (`main.py`)
+- ⚠️ P5-2b: 조치 구현 (미구현 - 현재는 경고 로깅만)
+  - 신규 진입 차단: 엔진 레벨 가드
+  - kill-switch: STOP_TRADING.flag 생성 (`main.py`)
 
 #### P5-3: 일일 리포트 자동 생성(모듈별 성과/체결/오류/리스크 차단)
 **수정 파일:** `reporter.py`, `core/event_store.py`, `ROADMAP_INSTITUTIONAL.md`  
 **완료 조건:** 매일(或는 정기) 리포트 자동 생성, 최소 포함 항목: fills, risk blocks, reconcile issues, errors, 플래그 상태
 
-- P5-3a: 리포트 데이터 소스를 "로그 파싱"에서 "이벤트 스토어 기반"으로 전환/병행 (`reporter.py`, `core/event_store.py`)
-- P5-3b: 리포트 필수 포함 항목 고정 (fills, risk blocks, reconcile issues, errors, 플래그 상태) (`ROADMAP_INSTITUTIONAL.md`)
+- ✅ P5-3a: 리포트 생성 구현됨 (`reporter.py`: KisReporter.generate_daily_report)
+- ⚠️ P5-3b: 리포트 필수 포함 항목 고정 (개선 권장: fills, risk blocks, reconcile issues, errors, 플래그 상태) (`ROADMAP_INSTITUTIONAL.md`)
 
 #### P5-4: health_status 운영 메트릭 확장(이벤트 타입 분포/오류 카운트/플래그 상태)
 **수정 파일:** `main.py`, `core/event_store.py`, `ROADMAP_INSTITUTIONAL.md`  
 **완료 조건:** health.json에 이벤트 타입 분포/최근 오류 카운트/플래그 상태/최근 reconcile 결과 포함
 
-- P5-4a: health에 추가 메트릭 포함 (이벤트 타입 분포, 최근 오류 카운트, OMS/Ledger/Reconcile 플래그 상태, 최근 reconcile 결과) (`main.py`, `core/event_store.py`)
-- P5-4b: 비용 폭증 방지 (매 healthcheck마다 전체 JSONL 스캔 금지) - "최근 N 이벤트 샘플링/캐시" 설계 (`core/event_store.py`)
+- ✅ P5-4a: health에 추가 메트릭 포함 (main.py: get_health_status - 이벤트 타입 분포, 최근 오류 카운트, OMS/Ledger/Reconcile 플래그 상태, 최근 reconcile 결과)
+- ✅ P5-4b: 비용 폭증 방지 - max_lines=5000 샘플링 (`core/event_store.py`)
 
 ### 완료 조건
 - 불일치/장애 시 자동 차단/복구/설명 가능

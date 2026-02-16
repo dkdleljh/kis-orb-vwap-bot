@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Optional
 
 import aiohttp
 
@@ -273,6 +273,59 @@ class KISRestOrders:
             self.logger.error(f"get_positions exception: {e}")
             return None
 
+    async def get_all_positions(self) -> Dict[str, Dict[str, any]]:
+        """전체 포지션 맵을 반환합니다 (Reconcile용).
+
+        Returns:
+            Dict mapping symbol -> {qty, avg_price, ...}
+        """
+        url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
+        params = {
+            "CANO": self.account.account_no,
+            "ACNT_PRDT_CD": self.account.product_code,
+        }
+        headers = await self._auth_headers()
+        headers.update({"tr_id": "TTTC8434R", "custtype": "P"})
+
+        positions: Dict[str, Dict[str, any]] = {}
+        try:
+            session = await self._get_session()
+            async with session.get(url, params=params, headers=headers) as resp:
+                data = await resp.json()
+
+            err = self._check_error(data, "get_all_positions")
+            if err:
+                self.logger.error(f"get_all_positions failed: {err}")
+                return positions
+
+            outputs = data.get("output1", [])
+            for row in outputs:
+                sym = row.get("pdno", "")
+                qty = int(float(row.get("hldg_qty", 0) or 0))
+                if qty > 0:
+                    avg_price_candidates = [
+                        "pchs_avg_pric",
+                        "pchs_avg_pric_unpr",
+                        "avg_pric",
+                    ]
+                    avg_price = 0.0
+                    for k in avg_price_candidates:
+                        v = row.get(k)
+                        if v:
+                            avg_price = float(v)
+                            break
+                    positions[sym] = {
+                        "qty": qty,
+                        "avg_price": avg_price,
+                    }
+                    self.logger.info(
+                        f"position for reconcile: {sym} qty={qty} avg={avg_price}"
+                    )
+            return positions
+        except Exception as e:
+            self.logger.error(f"get_all_positions exception: {e}")
+            return positions
+
     async def get_cash_available(self, symbol: str, price: float) -> float:
         _validate_symbol(symbol)
         url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-psbl-order"
@@ -373,12 +426,51 @@ class KISRestOrders:
     async def get_open_orders(self) -> list[dict]:
         """Best-effort open order query.
 
-        Phase5 reconcile needs a broker-side view of working orders.
+        Phase5 reconcile needs a broker-side view of working (unfilled) orders.
+
+        Recommended behavior:
+        - never raise (best-effort)
+        - if endpoint/fields mismatch, return [] and let callers treat it as "unknown"
 
         Notes:
-        - KIS order inquiry endpoints/fields differ by account type and environment.
-        - For now we provide a safe default that returns an empty list.
-        - When KIS_INSTITUTIONAL_RECONCILE=1, callers should treat empty results as
-          "unknown" rather than "no open orders".
+        - KIS provides a cancel/modify-possible order list endpoint commonly used
+          as an "open orders" proxy.
         """
-        return []
+
+        url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl"
+        headers = await self._auth_headers()
+        headers.update({"tr_id": "TTTC8036R", "custtype": "P"})
+
+        # Base params; KIS uses ctx paging keys.
+        params = {
+            "CANO": self.account.account_no,
+            "ACNT_PRDT_CD": self.account.product_code,
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+            # Inquiry divisions vary by document; keep conservative defaults.
+            "INQR_DVSN_1": "0",
+            "INQR_DVSN_2": "0",
+        }
+
+        try:
+            session = await self._get_session()
+            async with session.get(url, params=params, headers=headers) as resp:
+                data = await resp.json()
+
+            err = self._check_error(data, "get_open_orders")
+            if err:
+                self.logger.warning(f"get_open_orders failed: {err}")
+                return []
+
+            # outputs may be output/output1 depending on environment
+            out = data.get("output")
+            if isinstance(out, list):
+                return [dict(x) for x in out]
+            out1 = data.get("output1")
+            if isinstance(out1, list):
+                return [dict(x) for x in out1]
+
+            return []
+        except Exception as e:
+            self.logger.warning(f"get_open_orders exception: {e}")
+            return []
