@@ -31,6 +31,7 @@ from ml_score import calculate_ml_score
 
 from core.event_store import EventStore
 from core import events as ievents
+from core.ledger import Ledger, ledger_enabled
 from core.oms import OMS, oms_enabled
 
 
@@ -1094,6 +1095,15 @@ class TradingEngine:
         # [PHASE3] Optional OMS (default OFF; non-invasive)
         self.oms: OMS | None = OMS() if oms_enabled() else None
 
+        # [PHASE4] Optional fill-based Ledger (default OFF; non-invasive)
+        self.ledger: Ledger | None = None
+        if ledger_enabled():
+            try:
+                starting_cash = float(os.environ.get("KIS_LEDGER_STARTING_CASH", "0") or 0.0)
+            except Exception:
+                starting_cash = 0.0
+            self.ledger = Ledger(starting_cash=starting_cash)
+
         # Best-effort error counters for health/status (never used for control-flow)
         self._error_counts: dict[str, int] = defaultdict(int)
 
@@ -1112,6 +1122,9 @@ class TradingEngine:
         )
         self.healthcheck_interval_sec = max(
             10, int(os.environ.get("KIS_HEALTHCHECK_INTERVAL_SEC", "60"))
+        )
+        self.position_snapshot_interval_sec = max(
+            0, int(os.environ.get("KIS_POSITION_SNAPSHOT_INTERVAL_SEC", "0") or 0)
         )
         self.status_path = os.path.join(self.base_dir, "logs", "health_status.json")
         self.trades_today = 0
@@ -1239,6 +1252,9 @@ class TradingEngine:
             asyncio.create_task(self.monitor_position_loop()),
             asyncio.create_task(self.healthcheck_loop()),
         ]
+        if self.position_snapshot_interval_sec > 0:
+            tasks.append(asyncio.create_task(self.position_snapshot_loop()))
+
         await asyncio.gather(*tasks)
 
     async def restore_position(self) -> None:
@@ -1252,8 +1268,12 @@ class TradingEngine:
             self.state_machine.position = pos
             self.state_machine.set_state(State.IN_POSITION)
 
-            # Best-effort snapshot on restore (startup/resume trigger)
+            # [PHASE4] Best-effort snapshot on restore (startup/resume trigger)
             try:
+                if self.ledger is not None:
+                    lp = self.ledger.get_position(str(pos.symbol))
+                    lp.qty = int(pos.qty)
+                    lp.avg_price = float(pos.avg_price)
                 self._record_position_snapshot(str(pos.symbol), trigger="restore")
             except Exception:
                 pass
@@ -1597,20 +1617,30 @@ class TradingEngine:
     def _record_position_snapshot(self, symbol: str, *, trigger: str, note: str = "") -> None:
         """Best-effort PositionSnapshot logging.
 
-        Phase3 baseline logs a snapshot even in paper mode.
-        Cash is unknown in the current runtime path, so we default to 0.0.
+        Phase4 integration:
+        - if Ledger is enabled, snapshot reflects derived cash/avg/qty
+        - otherwise falls back to state_machine position (cash=0.0)
         """
         qty = 0
         avg = 0.0
         cash = 0.0
 
-        try:
-            pos2 = self.state_machine.position
-            if pos2 and pos2.symbol == symbol:
-                qty = int(pos2.qty)
-                avg = float(pos2.avg_price)
-        except Exception:
-            pass
+        if self.ledger is not None:
+            try:
+                pos = self.ledger.get_position(symbol)
+                qty = int(pos.qty)
+                avg = float(pos.avg_price)
+                cash = float(self.ledger.cash)
+            except Exception:
+                self._error_counts["ledger_snapshot"] += 1
+        else:
+            try:
+                pos2 = self.state_machine.position
+                if pos2 and pos2.symbol == symbol:
+                    qty = int(pos2.qty)
+                    avg = float(pos2.avg_price)
+            except Exception:
+                pass
 
         try:
             self._append_event(
@@ -1842,6 +1872,14 @@ class TradingEngine:
                         ).to_event(run_id=self.run_id)
                     )
 
+                    if self.ledger is not None:
+                        self.ledger.apply_fill(
+                            symbol=symbol,
+                            side="BUY",
+                            qty=int(qty),
+                            price=float(book.ask),
+                            fee=0.0,
+                        )
                     if self.oms is not None:
                         self.oms.apply_fill(idempotency_key=idempotency_key, fill_qty=int(qty))
                     self._record_position_snapshot(symbol, trigger="fill", note="paper_entry")
@@ -1903,6 +1941,14 @@ class TradingEngine:
                                 fee=0.0,
                             ).to_event(run_id=self.run_id)
                         )
+                        if self.ledger is not None:
+                            self.ledger.apply_fill(
+                                symbol=symbol,
+                                side="BUY",
+                                qty=int(pos.qty),
+                                price=float(pos.avg_price),
+                                fee=0.0,
+                            )
                         if self.oms is not None:
                             self.oms.apply_fill(idempotency_key=idempotency_key, fill_qty=int(pos.qty))
                         self._record_position_snapshot(symbol, trigger="fill", note="live_entry")
@@ -2007,6 +2053,14 @@ class TradingEngine:
                         fee=0.0,
                     ).to_event(run_id=self.run_id)
                 )
+                if self.ledger is not None:
+                    self.ledger.apply_fill(
+                        symbol=symbol,
+                        side="SELL",
+                        qty=int(pos.qty),
+                        price=float(exit_price),
+                        fee=0.0,
+                    )
                 if self.oms is not None:
                     self.oms.apply_fill(idempotency_key=idempotency_key, fill_qty=int(pos.qty))
                 self._record_position_snapshot(symbol, trigger="fill", note=f"paper_exit:{reason}")
@@ -2073,6 +2127,14 @@ class TradingEngine:
                         fee=0.0,
                     ).to_event(run_id=self.run_id)
                 )
+                if self.ledger is not None:
+                    self.ledger.apply_fill(
+                        symbol=symbol,
+                        side="SELL",
+                        qty=int(pos.qty),
+                        price=float(exit_price),
+                        fee=0.0,
+                    )
                 if self.oms is not None:
                     self.oms.apply_fill(idempotency_key=idempotency_key, fill_qty=int(pos.qty))
                 self._record_position_snapshot(symbol, trigger="fill", note=f"live_exit:{reason}")
@@ -2422,7 +2484,27 @@ class TradingEngine:
             )
             await asyncio.sleep(self.healthcheck_interval_sec)
 
-    # (position_snapshot_loop removed in Phase3 commit; reintroduced in Phase4)
+    async def position_snapshot_loop(self) -> None:
+        """Periodically emit PositionSnapshot events (best-effort).
+
+        This is OFF by default; enable by setting:
+            KIS_POSITION_SNAPSHOT_INTERVAL_SEC=60
+
+        If Ledger is enabled, periodic snapshots will include derived cash.
+        """
+        interval = float(self.position_snapshot_interval_sec)
+        while True:
+            try:
+                pos = self.state_machine.position
+                if pos:
+                    self._record_position_snapshot(str(pos.symbol), trigger="periodic")
+            except Exception:
+                try:
+                    self._error_counts["position_snapshot_loop"] += 1
+                except Exception:
+                    pass
+            await asyncio.sleep(interval)
+
 
     async def _load_prev_closes_if_needed(self, symbols: list[str]) -> None:
         """Populate cached previous-close values for supplied symbols.
