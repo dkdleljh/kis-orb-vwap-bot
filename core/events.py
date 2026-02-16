@@ -200,23 +200,35 @@ class Fill:
 
 @dataclass(frozen=True)
 class PositionSnapshot:
-    """Derived position/cash snapshot (typically after fills)."""
+    """Derived position/cash snapshot.
+
+    Phase4 adds lightweight metadata about *when/why* the snapshot was taken.
+    Older logs remain compatible because new fields are optional.
+    """
 
     symbol: str
     qty: int
     avg_price: float
     cash: float
     equity: Optional[float] = None
+    trigger: str = ""  # e.g. fill|restore|periodic|manual
+    note: str = ""
 
     def to_event(self, run_id: Optional[str] = None) -> Event:
+        payload: Dict[str, Any] = {
+            "qty": int(self.qty),
+            "avg_price": float(self.avg_price),
+            "cash": float(self.cash),
+            "equity": self.equity,
+        }
+        if self.trigger:
+            payload["trigger"] = self.trigger
+        if self.note:
+            payload["note"] = self.note
+
         return Event.make(
             type="PositionSnapshot",
-            payload={
-                "qty": int(self.qty),
-                "avg_price": float(self.avg_price),
-                "cash": float(self.cash),
-                "equity": self.equity,
-            },
+            payload=payload,
             symbol=self.symbol,
             run_id=run_id,
         )

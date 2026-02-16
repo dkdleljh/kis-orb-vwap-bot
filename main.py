@@ -31,6 +31,7 @@ from ml_score import calculate_ml_score
 
 from core.event_store import EventStore
 from core import events as ievents
+from core.oms import OMS, oms_enabled
 
 
 class TradingEngine:
@@ -1090,6 +1091,12 @@ class TradingEngine:
         self.run_id = os.environ.get("KIS_RUN_ID", "") or f"{int(time.time())}"
         self.event_store = EventStore(events_dir, enabled=True, run_id=self.run_id)
 
+        # [PHASE3] Optional OMS (default OFF; non-invasive)
+        self.oms: OMS | None = OMS() if oms_enabled() else None
+
+        # Best-effort error counters for health/status (never used for control-flow)
+        self._error_counts: dict[str, int] = defaultdict(int)
+
         # 뉴스 점수 캐시(비동기 갱신)
         self.news_score_by_symbol: Dict[str, int] = {}
         self.news_score_updated_at: Dict[str, float] = {}
@@ -1244,6 +1251,12 @@ class TradingEngine:
         if pos:
             self.state_machine.position = pos
             self.state_machine.set_state(State.IN_POSITION)
+
+            # Best-effort snapshot on restore (startup/resume trigger)
+            try:
+                self._record_position_snapshot(str(pos.symbol), trigger="restore")
+            except Exception:
+                pass
             self.logger.info(
                 f"restored position: {pos.symbol} qty={pos.qty} avg={pos.avg_price}"
             )
@@ -1565,17 +1578,81 @@ class TradingEngine:
                 except Exception:
                     pass
 
-                asyncio.create_task(self.handle_entry(signal, book))
+                asyncio.create_task(self.handle_entry(signal, book, bar_start=bar.start))
         except Exception as e:
             self.logger.error(f"Evaluate entry failed for {symbol}: {e}")
 
 
-    def _make_idempotency_key(self, symbol: str, side: str) -> str:
-        # Recommended: stable within a decision attempt; include run_id + second-level timestamp.
-        ts = now_local(self.tz).strftime('%Y%m%dT%H%M%S')
+    def _append_event(self, ev: ievents.Event) -> None:
+        try:
+            self.event_store.append(ev)
+        except Exception:
+            # The event_store itself is best-effort, but keep a separate counter
+            # for higher-level monitoring.
+            try:
+                self._error_counts["event_append"] += 1
+            except Exception:
+                pass
+
+    def _record_position_snapshot(self, symbol: str, *, trigger: str, note: str = "") -> None:
+        """Best-effort PositionSnapshot logging.
+
+        Phase3 baseline logs a snapshot even in paper mode.
+        Cash is unknown in the current runtime path, so we default to 0.0.
+        """
+        qty = 0
+        avg = 0.0
+        cash = 0.0
+
+        try:
+            pos2 = self.state_machine.position
+            if pos2 and pos2.symbol == symbol:
+                qty = int(pos2.qty)
+                avg = float(pos2.avg_price)
+        except Exception:
+            pass
+
+        try:
+            self._append_event(
+                ievents.PositionSnapshot(
+                    symbol=symbol,
+                    qty=qty,
+                    avg_price=avg,
+                    cash=cash,
+                    equity=None,
+                    trigger=trigger,
+                    note=note,
+                ).to_event(run_id=self.run_id)
+            )
+        except Exception:
+            self._error_counts["snapshot_event"] += 1
+
+    def _make_idempotency_key(self, symbol: str, side: str, *, bar_start: datetime | None = None) -> str:
+        """Create a stable idempotency key for an order decision.
+
+        Phase3 recommendation:
+        - tie the key to bar.start (minute bucket) instead of wall-clock seconds
+        - keep it stable across retries for the same bar
+
+        Notes:
+        - For non-bar-driven actions (e.g. exits), callers may pass ``bar_start=None``;
+          we fall back to current local minute.
+        """
+        from datetime import timezone
+
+        dt = bar_start or now_local(self.tz)
+        try:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=self.tz)
+            dt_utc = dt.astimezone(timezone.utc)
+        except Exception:
+            dt_utc = dt
+
+        # minute-granularity is enough for 1m bars and avoids second-level jitter
+        ts = dt_utc.strftime("%Y%m%dT%H%MZ")
         return f"{self.run_id}:{symbol}:{side}:{ts}"
 
-    async def handle_entry(self, signal: Signal, book: OrderBookTop) -> None:
+    async def handle_entry(self, signal: Signal, book: OrderBookTop, *, bar_start: datetime | None = None) -> None:
         """Attempt to enter a position from a validated trading signal.
 
         Args:
@@ -1590,7 +1667,7 @@ class TradingEngine:
 
         symbol = cast(str, signal.symbol)
 
-        idempotency_key = self._make_idempotency_key(symbol, str(signal.side or 'BUY'))
+        idempotency_key = self._make_idempotency_key(symbol, str(signal.side or 'BUY'), bar_start=bar_start)
 
         # Concurrency guard: prevent duplicate concurrent entries per symbol
         if not hasattr(self, "_trade_lock"):
@@ -1641,6 +1718,8 @@ class TradingEngine:
             if book.ask <= 0:
                 try:
                     self.event_store.append(ievents.RiskDecision(symbol=symbol, allowed=False, reason="ask=0", idempotency_key=idempotency_key).to_event(run_id=self.run_id))
+                    if self.oms is not None:
+                        self.oms.mark_risk(idempotency_key=idempotency_key, allowed=False)
                 except Exception:
                     pass
                 self.logger.info("entry skipped: ask=0")
@@ -1661,6 +1740,8 @@ class TradingEngine:
             if qty <= 0:
                 try:
                     self.event_store.append(ievents.RiskDecision(symbol=symbol, allowed=False, reason="qty=0", idempotency_key=idempotency_key).to_event(run_id=self.run_id))
+                    if self.oms is not None:
+                        self.oms.mark_risk(idempotency_key=idempotency_key, allowed=False)
                 except Exception:
                     pass
                 self.logger.info(
@@ -1672,6 +1753,8 @@ class TradingEngine:
             if self.trades_today >= self.max_trades_per_day:
                 try:
                     self.event_store.append(ievents.RiskDecision(symbol=symbol, allowed=False, reason="max_trades_per_day", idempotency_key=idempotency_key).to_event(run_id=self.run_id))
+                    if self.oms is not None:
+                        self.oms.mark_risk(idempotency_key=idempotency_key, allowed=False)
                 except Exception:
                     pass
                 self.logger.warning(
@@ -1685,8 +1768,35 @@ class TradingEngine:
             # 여기부터가 '실제 진입 시도'
             try:
                 self.event_store.append(
-                    ievents.OrderIntent(symbol=symbol, side="BUY", qty=int(qty), order_type="LMT", limit_price=float(book.ask), idempotency_key=idempotency_key).to_event(run_id=self.run_id)
+                    ievents.OrderIntent(
+                        symbol=symbol,
+                        side="BUY",
+                        qty=int(qty),
+                        order_type="LMT",
+                        limit_price=float(book.ask),
+                        idempotency_key=idempotency_key,
+                    ).to_event(run_id=self.run_id)
                 )
+            except Exception:
+                pass
+
+            if self.oms is not None:
+                try:
+                    self.oms.register_intent(symbol=symbol, side="BUY", qty=int(qty), idempotency_key=idempotency_key)
+                except Exception:
+                    self._error_counts["oms_register_intent"] += 1
+
+            try:
+                self.event_store.append(
+                    ievents.RiskDecision(
+                        symbol=symbol,
+                        allowed=True,
+                        reason="ok",
+                        idempotency_key=idempotency_key,
+                    ).to_event(run_id=self.run_id)
+                )
+                if self.oms is not None:
+                    self.oms.mark_risk(idempotency_key=idempotency_key, allowed=True)
             except Exception:
                 pass
 
@@ -1705,8 +1815,36 @@ class TradingEngine:
                     "[PAPER] entry simulated %s qty=%s price=%s", symbol, qty, book.ask
                 )
                 try:
-                    self.event_store.append(ievents.OrderSubmitted(symbol=symbol, idempotency_key=idempotency_key, broker_order_id="PAPER").to_event(run_id=self.run_id))
-                    self.event_store.append(ievents.Fill(symbol=symbol, side="BUY", qty=int(qty), price=float(book.ask), broker_order_id="PAPER", idempotency_key=idempotency_key, fee=0.0).to_event(run_id=self.run_id))
+                    self.event_store.append(
+                        ievents.OrderSubmitted(
+                            symbol=symbol,
+                            idempotency_key=idempotency_key,
+                            broker_order_id="PAPER",
+                        ).to_event(run_id=self.run_id)
+                    )
+                    self.event_store.append(
+                        ievents.OrderAck(
+                            symbol=symbol,
+                            idempotency_key=idempotency_key,
+                            broker_order_id="PAPER",
+                            status="ACK",
+                        ).to_event(run_id=self.run_id)
+                    )
+                    self.event_store.append(
+                        ievents.Fill(
+                            symbol=symbol,
+                            side="BUY",
+                            qty=int(qty),
+                            price=float(book.ask),
+                            broker_order_id="PAPER",
+                            idempotency_key=idempotency_key,
+                            fee=0.0,
+                        ).to_event(run_id=self.run_id)
+                    )
+
+                    if self.oms is not None:
+                        self.oms.apply_fill(idempotency_key=idempotency_key, fill_qty=int(qty))
+                    self._record_position_snapshot(symbol, trigger="fill", note="paper_entry")
                 except Exception:
                     pass
                 self.peak_pnl_pct[symbol] = -0.01
@@ -1720,7 +1858,27 @@ class TradingEngine:
                     f"entry order submitted {symbol} qty={qty} id={order.order_id}"
                 )
                 try:
-                    self.event_store.append(ievents.OrderSubmitted(symbol=symbol, idempotency_key=idempotency_key, broker_order_id=str(order.order_id or "")).to_event(run_id=self.run_id))
+                    broker_order_id = str(order.order_id or "")
+                    self.event_store.append(
+                        ievents.OrderSubmitted(
+                            symbol=symbol,
+                            idempotency_key=idempotency_key,
+                            broker_order_id=broker_order_id,
+                        ).to_event(run_id=self.run_id)
+                    )
+                    if self.oms is not None:
+                        self.oms.mark_submitted(idempotency_key=idempotency_key, broker_order_id=broker_order_id)
+                    if broker_order_id:
+                        self.event_store.append(
+                            ievents.OrderAck(
+                                symbol=symbol,
+                                idempotency_key=idempotency_key,
+                                broker_order_id=broker_order_id,
+                                status="ACK",
+                            ).to_event(run_id=self.run_id)
+                        )
+                        if self.oms is not None:
+                            self.oms.mark_acked(idempotency_key=idempotency_key, broker_order_id=broker_order_id)
                 except Exception:
                     pass
                 await asyncio.sleep(2)
@@ -1733,7 +1891,21 @@ class TradingEngine:
                         f"entry filled {symbol} qty={pos.qty} avg={pos.avg_price}"
                     )
                     try:
-                        self.event_store.append(ievents.Fill(symbol=symbol, side="BUY", qty=int(pos.qty), price=float(pos.avg_price), broker_order_id=str(order.order_id or ""), idempotency_key=idempotency_key, fee=0.0).to_event(run_id=self.run_id))
+                        broker_order_id = str(order.order_id or "")
+                        self.event_store.append(
+                            ievents.Fill(
+                                symbol=symbol,
+                                side="BUY",
+                                qty=int(pos.qty),
+                                price=float(pos.avg_price),
+                                broker_order_id=broker_order_id,
+                                idempotency_key=idempotency_key,
+                                fee=0.0,
+                            ).to_event(run_id=self.run_id)
+                        )
+                        if self.oms is not None:
+                            self.oms.apply_fill(idempotency_key=idempotency_key, fill_qty=int(pos.qty))
+                        self._record_position_snapshot(symbol, trigger="fill", note="live_entry")
                     except Exception:
                         pass
                     # 진입 성공 시 Peak PnL 초기화
@@ -1771,6 +1943,22 @@ class TradingEngine:
             return
         self.state_machine.set_state(State.EXIT_PENDING)
 
+        symbol = str(pos.symbol)
+        idempotency_key = self._make_idempotency_key(symbol, "SELL")
+        try:
+            self.event_store.append(
+                ievents.OrderIntent(
+                    symbol=symbol,
+                    side="SELL",
+                    qty=int(pos.qty),
+                    order_type="MKT" if use_market else "LMT",
+                    limit_price=None,
+                    idempotency_key=idempotency_key,
+                ).to_event(run_id=self.run_id)
+            )
+        except Exception:
+            pass
+
         if not self.live_ordering_enabled():
             exit_price = self.last_price.get(pos.symbol, pos.avg_price)
             gross_pnl_pct = (
@@ -1791,6 +1979,40 @@ class TradingEngine:
                 gross_pnl_pct,
                 net_pnl_pct,
             )
+
+            try:
+                self.event_store.append(
+                    ievents.OrderSubmitted(
+                        symbol=symbol,
+                        idempotency_key=idempotency_key,
+                        broker_order_id="PAPER",
+                    ).to_event(run_id=self.run_id)
+                )
+                self.event_store.append(
+                    ievents.OrderAck(
+                        symbol=symbol,
+                        idempotency_key=idempotency_key,
+                        broker_order_id="PAPER",
+                        status="ACK",
+                    ).to_event(run_id=self.run_id)
+                )
+                self.event_store.append(
+                    ievents.Fill(
+                        symbol=symbol,
+                        side="SELL",
+                        qty=int(pos.qty),
+                        price=float(exit_price),
+                        broker_order_id="PAPER",
+                        idempotency_key=idempotency_key,
+                        fee=0.0,
+                    ).to_event(run_id=self.run_id)
+                )
+                if self.oms is not None:
+                    self.oms.apply_fill(idempotency_key=idempotency_key, fill_qty=int(pos.qty))
+                self._record_position_snapshot(symbol, trigger="fill", note=f"paper_exit:{reason}")
+            except Exception:
+                pass
+
             return
 
         # Smart Market Order: 무조건 시장가가 아니라, 최우선 매수호가(bid)에 지정가 매도
@@ -1809,6 +2031,27 @@ class TradingEngine:
             order = await self.rest.place_sell_market(pos.symbol, pos.qty)
             self.logger.info(f"exit order(Market) {reason} id={order.order_id}")
 
+        try:
+            broker_order_id = str(order.order_id or "")
+            self.event_store.append(
+                ievents.OrderSubmitted(
+                    symbol=symbol,
+                    idempotency_key=idempotency_key,
+                    broker_order_id=broker_order_id,
+                ).to_event(run_id=self.run_id)
+            )
+            if broker_order_id:
+                self.event_store.append(
+                    ievents.OrderAck(
+                        symbol=symbol,
+                        idempotency_key=idempotency_key,
+                        broker_order_id=broker_order_id,
+                        status="ACK",
+                    ).to_event(run_id=self.run_id)
+                )
+        except Exception:
+            pass
+
         await asyncio.sleep(2)
         pos_after = await self.rest.get_positions()
         if not pos_after:
@@ -1816,6 +2059,26 @@ class TradingEngine:
             pnl_pct = (exit_price - pos.avg_price) / pos.avg_price
             is_stop = pnl_pct <= self.stop_loss_pct
             self.risk.record_exit(pnl_pct, is_stop)
+
+            try:
+                broker_order_id = str(order.order_id or "")
+                self.event_store.append(
+                    ievents.Fill(
+                        symbol=symbol,
+                        side="SELL",
+                        qty=int(pos.qty),
+                        price=float(exit_price),
+                        broker_order_id=broker_order_id,
+                        idempotency_key=idempotency_key,
+                        fee=0.0,
+                    ).to_event(run_id=self.run_id)
+                )
+                if self.oms is not None:
+                    self.oms.apply_fill(idempotency_key=idempotency_key, fill_qty=int(pos.qty))
+                self._record_position_snapshot(symbol, trigger="fill", note=f"live_exit:{reason}")
+            except Exception:
+                pass
+
             self.state_machine.position = None
             self.state_machine.set_state(State.WAIT_SIGNAL)
             self.logger.info(f"exit done pnl={pnl_pct:.4f}")
@@ -2158,6 +2421,8 @@ class TradingEngine:
                 status["max_trades_per_day"],
             )
             await asyncio.sleep(self.healthcheck_interval_sec)
+
+    # (position_snapshot_loop removed in Phase3 commit; reintroduced in Phase4)
 
     async def _load_prev_closes_if_needed(self, symbols: list[str]) -> None:
         """Populate cached previous-close values for supplied symbols.

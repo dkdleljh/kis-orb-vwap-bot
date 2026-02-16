@@ -21,6 +21,7 @@ class EventStore:
     base_dir: str
     enabled: bool = True
     run_id: Optional[str] = None
+    error_count: int = 0
 
     def _path_for_day(self, ymd: str) -> str:
         d = os.path.join(self.base_dir, ymd)
@@ -63,6 +64,43 @@ class EventStore:
                 out[ymd] = -1
         return out
 
+    def recent_type_distribution(self, *, max_lines: int = 5000) -> dict[str, int]:
+        """Best-effort distribution of recent event *types* (today's partition).
+
+        Reads at most ``max_lines`` from the tail of today's events.jsonl.
+        Intended for health/status UX only.
+        """
+        path = self._path_for_today()
+        if not os.path.exists(path):
+            return {}
+
+        # naive tail: read all if small; otherwise read last N lines.
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except Exception:
+            return {}
+
+        if max_lines and len(lines) > max_lines:
+            lines = lines[-max_lines:]
+
+        out: dict[str, int] = {}
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+                if not isinstance(d, dict):
+                    continue
+                t = str(d.get("type", ""))
+                if not t:
+                    continue
+                out[t] = int(out.get(t, 0)) + 1
+            except Exception:
+                continue
+        return out
+
     def append(self, ev: Event) -> None:
         if not self.enabled:
             return
@@ -80,4 +118,8 @@ class EventStore:
                 pass
         except Exception:
             # Best effort: never take down the trading process.
+            try:
+                self.error_count += 1
+            except Exception:
+                pass
             return
