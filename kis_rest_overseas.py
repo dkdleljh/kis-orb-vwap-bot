@@ -130,6 +130,8 @@ class KISOverseasRestOrders:
             # Inquire possible amount (day): TTTS3007R (night): JTTT3007R
             "psamount": "TTTS3007R",
             "dayornight": "JTTT3010R",
+            # Inquire not-concluded (미체결): TTTS3018R
+            "nccs": "TTTS3018R" if not is_paper else "VTTS3018R",
         }
         return tr_id_map.get(endpoint, "TTTP6002E")
 
@@ -339,6 +341,62 @@ class KISOverseasRestOrders:
             return None
         out1 = data.get("output1")
         return out1 if isinstance(out1, list) else None
+
+    async def inquire_nccs(
+        self,
+        *,
+        exchange: str,
+        sort_sqn: str = "DS",
+        max_pages: int = 5,
+    ) -> list[dict]:
+        """Inquire overseas not-concluded orders (미체결내역).
+
+        Endpoint:
+        - /uapi/overseas-stock/v1/trading/inquire-nccs
+
+        Notes:
+        - `exchange` must be provided (NASD/NYSE/AMEX...).
+        - Uses continuation keys CTX_AREA_FK200 / CTX_AREA_NK200 when present.
+        """
+        url = f"{self.base_url}/uapi/overseas-stock/v1/trading/inquire-nccs"
+        headers = await self._auth_headers()
+        headers.update({"tr_id": self._get_tr_id("nccs"), "custtype": "P"})
+
+        fk200 = ""
+        nk200 = ""
+        out_rows: list[dict] = []
+
+        session = await self._get_session()
+        for _ in range(max(1, int(max_pages))):
+            params = {
+                "CANO": self.account.account_no,
+                "ACNT_PRDT_CD": self.account.product_code,
+                "OVRS_EXCG_CD": exchange,
+                "SORT_SQN": sort_sqn,
+                "CTX_AREA_FK200": fk200,
+                "CTX_AREA_NK200": nk200,
+            }
+            async with session.get(url, headers=headers, params=params) as resp:
+                data = await resp.json()
+
+            err = self._check_error(data, f"inquire_nccs({exchange})")
+            if err:
+                break
+
+            body_out = data.get("output")
+            if isinstance(body_out, list):
+                for r in body_out:
+                    if isinstance(r, dict):
+                        out_rows.append(r)
+            elif isinstance(body_out, dict):
+                out_rows.append(body_out)
+
+            fk200 = str(data.get("ctx_area_fk200") or data.get("CTX_AREA_FK200") or "")
+            nk200 = str(data.get("ctx_area_nk200") or data.get("CTX_AREA_NK200") or "")
+            if not fk200 and not nk200:
+                break
+
+        return out_rows
 
     async def get_day_or_night(self) -> Optional[str]:
         """Return PSBL_YN from dayornight endpoint.
