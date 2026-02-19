@@ -43,6 +43,7 @@ class FillRec:
     fee: float
     idempotency_key: str
     correlation_id: str
+    module: str
 
 
 @dataclass
@@ -55,6 +56,7 @@ class IntentRec:
     limit_price: Optional[float]
     idempotency_key: str
     correlation_id: str
+    module: str
 
 
 @dataclass
@@ -116,6 +118,9 @@ def _source_from_corr(correlation_id: str) -> str:
     - eng_buy_xxx -> eng_buy
     - kr_entry_xxx -> kr_entry
     - us_exit_xxx -> us_exit
+
+    NOTE: This is *not* the same as "module". We also try to record explicit
+    payload.module in OrderIntent/RiskDecision/Fill (and Signal.context.module).
     """
     cid = (correlation_id or "").strip()
     if not cid:
@@ -124,6 +129,32 @@ def _source_from_corr(correlation_id: str) -> str:
     if len(parts) >= 3:
         return "_".join(parts[:2])
     return parts[0]
+
+
+def _module_fallback(module: str, *, src: str, intent: Optional[IntentRec] = None) -> str:
+    """Resolve a human-friendly module name.
+
+    Preference order:
+    1) explicit payload.module
+    2) intent.module (if provided)
+    3) correlation-id source heuristic (legacy logs)
+    """
+    m = (module or "").strip()
+    if m and m != "unknown":
+        return m
+    if intent is not None:
+        m2 = (intent.module or "").strip()
+        if m2 and m2 != "unknown":
+            return m2
+
+    # Legacy fallback
+    if src.startswith("eng_"):
+        return "engine_orb_vwap"
+    if src.startswith("kr_"):
+        return "kr_module"
+    if src.startswith("us_"):
+        return "us_module"
+    return "unknown"
 
 
 def _fifo_realized_pnl(fills: List[FillRec]) -> Tuple[float, float, Dict[str, Any]]:
@@ -253,6 +284,7 @@ def main() -> int:
                     limit_price=(float(payload["limit_price"]) if "limit_price" in payload and payload.get("limit_price") is not None else None),
                     idempotency_key=str(payload.get("idempotency_key") or ""),
                     correlation_id=cid,
+                    module=str(payload.get("module") or "") or "unknown",
                 )
                 if intent.idempotency_key:
                     intents_by_key[intent.idempotency_key] = intent
@@ -294,6 +326,7 @@ def main() -> int:
                     fee=float(payload.get("fee") or 0),
                     idempotency_key=str(payload.get("idempotency_key") or ""),
                     correlation_id=cid,
+                    module=str(payload.get("module") or "") or "unknown",
                 )
                 fills_by_symbol[sym].append(fill)
                 fills_by_source[src].append(fill)
@@ -392,7 +425,7 @@ def main() -> int:
                 t = _kst(one.ts).strftime("%H:%M:%S")
                 ctx = one.context or {}
                 # compact context
-                ctx_keys = ["close", "vwap", "spread_pct", "rsi", "ma20", "ml_score", "atr_percent", "market_regime"]
+                ctx_keys = ["module", "score", "reason_short", "close", "vwap", "spread_pct", "rsi", "ma20", "ml_score", "atr_percent", "market_regime"]
                 ctx2 = {k: ctx.get(k) for k in ctx_keys if k in ctx}
                 lines.append(f"- {t} {one.side} strength={one.strength:.2f} model={one.model} ctx={ctx2}")
             lines.append("")
@@ -475,8 +508,9 @@ def main() -> int:
                 s_txt = "N/A" if s is None else f"{s:+.4f}"
                 lp = None if intent is None else intent.limit_price
                 lp_txt = "-" if lp is None else str(lp)
+                mod = _module_fallback(f.module, src=src, intent=intent)
                 lines.append(
-                    f"  - {t} {f.side.upper()} {f.qty} @ {f.price} fee={f.fee} src={src} intent_lp={lp_txt} slip={s_txt}"
+                    f"  - {t} {f.side.upper()} {f.qty} @ {f.price} fee={f.fee} module={mod} src={src} intent_lp={lp_txt} slip={s_txt}"
                 )
             lines.append("")
 

@@ -104,6 +104,7 @@ class OrderIntent:
     limit_price: Optional[float] = None
     idempotency_key: str = ""
     correlation_id: str = ""
+    module: str = ""  # human-friendly strategy/module tag
 
     def to_event(self, run_id: Optional[str] = None) -> Event:
         payload: Dict[str, Any] = {
@@ -116,6 +117,8 @@ class OrderIntent:
             payload["limit_price"] = self.limit_price
         if self.correlation_id:
             payload["correlation_id"] = self.correlation_id
+        if self.module:
+            payload["module"] = self.module
         return Event.make(
             type="OrderIntent",
             payload=payload,
@@ -133,15 +136,18 @@ class RiskDecision:
     reason: str = ""
     idempotency_key: str = ""
     correlation_id: str = ""
+    module: str = ""  # human-friendly strategy/module tag
 
     def to_event(self, run_id: Optional[str] = None) -> Event:
-        payload = {
+        payload: Dict[str, Any] = {
             "allowed": bool(self.allowed),
             "reason": self.reason,
             "idempotency_key": self.idempotency_key,
         }
         if self.correlation_id:
             payload["correlation_id"] = self.correlation_id
+        if self.module:
+            payload["module"] = self.module
         return Event.make(
             type="RiskDecision",
             payload=payload,
@@ -212,9 +218,10 @@ class Fill:
     idempotency_key: str = ""
     fee: float = 0.0
     correlation_id: str = ""
+    module: str = ""  # human-friendly strategy/module tag
 
     def to_event(self, run_id: Optional[str] = None) -> Event:
-        payload = {
+        payload: Dict[str, Any] = {
             "side": self.side,
             "qty": int(self.qty),
             "price": float(self.price),
@@ -224,6 +231,8 @@ class Fill:
         }
         if self.correlation_id:
             payload["correlation_id"] = self.correlation_id
+        if self.module:
+            payload["module"] = self.module
         return Event.make(
             type="Fill",
             payload=payload,

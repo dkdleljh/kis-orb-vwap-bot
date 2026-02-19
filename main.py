@@ -915,12 +915,16 @@ class TradingEngine:
                             reason="state_machine",
                             model="ml_score_heuristic",
                             context={
+                                "module": "engine_orb_vwap",
                                 "close": float(bar.close),
                                 "vwap": float(vwap) if vwap is not None else None,
                                 "spread_pct": float(book.spread_pct) if book is not None else None,
                                 "rsi": float(indicators.get("rsi", 0) or 0),
                                 "ma20": float(indicators.get("ma20", 0) or 0),
                                 "ml_score": float(indicators.get("ml_score", 50) or 50),
+                                "score": float(getattr(signal, "score", 0.0) or 0.0),
+                                "reasons": list(getattr(signal, "reasons", []) or []),
+                                "reason_short": ",".join(list(getattr(signal, "reasons", []) or [])[:6]),
                                 "atr": float(indicators.get("atr", 0) or 0),
                                 "atr_percent": float(indicators.get("atr_percent", 0) or 0),
                                 "market_regime": str(self.market_regime or ""),
@@ -1104,6 +1108,7 @@ class TradingEngine:
                             reason="ask=0",
                             idempotency_key=idempotency_key,
                             correlation_id=correlation_id,
+                            module="engine_orb_vwap",
                         ).to_event(run_id=self.run_id)
                     )
                     if self.oms is not None:
@@ -1145,6 +1150,7 @@ class TradingEngine:
                             reason="qty=0",
                             idempotency_key=idempotency_key,
                             correlation_id=correlation_id,
+                            module="engine_orb_vwap",
                         ).to_event(run_id=self.run_id)
                     )
                     if self.oms is not None:
@@ -1173,6 +1179,7 @@ class TradingEngine:
                             reason="max_trades_per_day_mkt",
                             idempotency_key=idempotency_key,
                             correlation_id=correlation_id,
+                            module="engine_orb_vwap",
                         ).to_event(run_id=self.run_id)
                     )
                     if self.oms is not None:
@@ -1200,6 +1207,7 @@ class TradingEngine:
                         limit_price=float(book.ask),
                         idempotency_key=idempotency_key,
                         correlation_id=correlation_id,
+                        module="engine_orb_vwap",
                     ).to_event(run_id=self.run_id)
                 )
             except Exception:
@@ -1224,6 +1232,7 @@ class TradingEngine:
                         reason="ok",
                         idempotency_key=idempotency_key,
                         correlation_id=correlation_id,
+                        module="engine_orb_vwap",
                     ).to_event(run_id=self.run_id)
                 )
                 if self.oms is not None:
@@ -1277,6 +1286,7 @@ class TradingEngine:
                             idempotency_key=idempotency_key,
                             fee=0.0,
                             correlation_id=correlation_id,
+                            module="engine_orb_vwap",
                         ).to_event(run_id=self.run_id)
                     )
 
@@ -1366,6 +1376,7 @@ class TradingEngine:
                                 idempotency_key=idempotency_key,
                                 fee=costs.commission + costs.tax,  # Log actual fee+tax (slippage is implicit in price)
                                 correlation_id=correlation_id,
+                                module="engine_orb_vwap",
                             ).to_event(run_id=self.run_id)
                         )
                         if self.ledger is not None:
@@ -1500,6 +1511,7 @@ class TradingEngine:
                         idempotency_key=idempotency_key,
                         fee=0.0,
                         correlation_id=correlation_id,
+                        module="engine_orb_vwap",
                     ).to_event(run_id=self.run_id)
                 )
                 if self.ledger is not None:
@@ -1587,6 +1599,7 @@ class TradingEngine:
                         idempotency_key=idempotency_key,
                         fee=costs.commission + costs.tax,
                         correlation_id=correlation_id,
+                        module="engine_orb_vwap",
                     ).to_event(run_id=self.run_id)
                 )
                 if self.ledger is not None:

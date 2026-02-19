@@ -60,10 +60,16 @@ class Signal:
     Attributes:
         side: Trade direction to execute (for example, "BUY").
         symbol: Symbol to trade when a signal is generated.
+        score: Composite score used for the decision (best-effort).
+        reasons: Human-readable reason tags that contributed to the score.
+        module: Source module/strategy name that generated the signal.
     """
 
     side: str | None = None  # "BUY"
     symbol: str | None = None
+    score: float = 0.0
+    reasons: list[str] | None = None
+    module: str = "state_machine"
 
 
 class StrategyStateMachine:
@@ -316,7 +322,7 @@ class StrategyStateMachine:
                 self.logger.info(
                     f"HUNTER SIGNAL: {target_symbol} Score={score} Reasons={reasons}"
                 )
-            return Signal(side="BUY", symbol=target_symbol)
+            return Signal(side="BUY", symbol=target_symbol, score=float(score), reasons=list(reasons or []))
         else:
             if score > 0 and self.logger:
                 self.logger.info(
@@ -332,11 +338,11 @@ class StrategyStateMachine:
                     self.logger.info(
                         f"PYRAMIDING: {book.symbol} PnL={pnl_pct:.2%} News={news_score}"
                     )
-                return Signal(side="BUY", symbol=book.symbol)
+                return Signal(side="BUY", symbol=book.symbol, score=float(score), reasons=list(reasons or ["PYRAMIDING"]))
 
         # 인버스(헷징) 로직
         elif bar.close < or_state.or_low and last_price <= vwap:
             if book.symbol == lever_symbol:
-                return Signal(side="BUY", symbol=inverse_symbol)
+                return Signal(side="BUY", symbol=inverse_symbol, score=50.0, reasons=["OR_BREAKDOWN","VWAP_BEAR"])
 
         return Signal()
