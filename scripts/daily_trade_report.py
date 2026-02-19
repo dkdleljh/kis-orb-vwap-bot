@@ -585,10 +585,53 @@ def main() -> int:
                 )
             lines.append("")
 
+        # Compute KR unrealized total from open positions (best-effort)
+        kr_unreal_total = 0.0
+        for sym in traded_symbols:
+            if _detect_market(sym) != "KR":
+                continue
+            fills = fills_by_symbol[sym]
+            _, _, st = _fifo_realized_pnl(fills)
+            open_qty = int(st["open_qty"])
+            open_avg = float(st["open_avg"])
+            last = last_close.get(sym)
+            if open_qty and last is not None:
+                kr_unreal_total += (float(last) - open_avg) * open_qty
+
         lines.append("## 합계\n")
         lines.append(
             f"- KR 실현손익(추정): **{_fmt_money_krw(grand_realized_krw)}** / 수수료 **{_fmt_money_krw(grand_fees_krw)}**"
         )
+        lines.append(
+            f"- KR 미실현손익(추정): **{_fmt_money_krw(kr_unreal_total)}**"
+        )
+
+        # Daily return percent (best-effort) from baseline snapshot
+        baseline_path = ROOT / "logs" / f"daily_baseline_{ymd}.json"
+        baseline_equity = None
+        baseline_cash = None
+        baseline_exposure = None
+        try:
+            if baseline_path.exists():
+                b = json.loads(baseline_path.read_text(encoding="utf-8"))
+                baseline_equity = float(b.get("equity"))
+                baseline_cash = float(b.get("cash"))
+                baseline_exposure = float(b.get("exposure"))
+        except Exception:
+            baseline_equity = None
+
+        day_pnl_krw = float(grand_realized_krw) + float(kr_unreal_total) - float(grand_fees_krw)
+        if baseline_equity and baseline_equity > 0:
+            day_ret_pct = day_pnl_krw / float(baseline_equity)
+            lines.append(
+                f"- 당일 손익(추정, KRW): **{_fmt_money_krw(day_pnl_krw)}** / 당일 수익률(추정): **{day_ret_pct*100:.3f}%**"
+            )
+            lines.append(
+                f"  - baseline(추정): cash={_fmt_money_krw(baseline_cash or 0)} exposure={_fmt_money_krw(baseline_exposure or 0)} equity={_fmt_money_krw(baseline_equity)}"
+            )
+        else:
+            lines.append("- 당일 수익률(추정): baseline 파일이 없어 계산 불가 (logs/daily_baseline_YYYYMMDD.json)\n")
+
         lines.append(
             f"- US 실현손익(추정): **{_fmt_money_usd(grand_realized_usd)}** / 수수료 **{_fmt_money_usd(grand_fees_usd)}**\n"
         )

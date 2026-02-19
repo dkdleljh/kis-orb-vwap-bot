@@ -388,6 +388,10 @@ class TradingEngine:
         self._exit_inflight: set[str] = set()
         # Entry pacing guardrail: store recent entry timestamps (epoch seconds)
         self._entry_ts = deque(maxlen=5000)
+
+        # Daily baseline capture marker (for daily return reporting)
+        self._baseline_written_ymd = ""
+
         self.logger.info(
             "Execution mode: live_enabled=%s confirmed=%s active_live=%s max_qty=%s max_trades/day=%s max_positions=%s",
             self.live_enabled,
@@ -1813,6 +1817,8 @@ class TradingEngine:
         while True:
             self._reset_daily_counters_if_needed()
             self.update_state_by_time()
+            # Best-effort daily baseline capture for return reporting
+            await self._maybe_write_daily_baseline()
             await asyncio.sleep(1)
 
     def update_state_by_time(self) -> None:
@@ -2131,6 +2137,82 @@ class TradingEngine:
             self.trades_today_kr = 0
             self.trades_today_us = 0
             self.trades_today_by_symbol.clear()
+            # Reset baseline marker so we capture once per day.
+            try:
+                self._baseline_written_ymd = ""
+            except Exception:
+                pass
+
+    async def _maybe_write_daily_baseline(self) -> None:
+        """Write a best-effort daily baseline for '당일 수익률(추정)' reporting.
+
+        This is used by `scripts/daily_trade_report.py` to compute an approximate
+        day return percent: (realized + unrealized) / baseline_equity.
+
+        Baseline is written once per trading day after observe_start.
+        """
+        try:
+            now_dt = now_local(self.tz)
+            ymd = now_dt.strftime("%Y%m%d")
+            if not hasattr(self, "_baseline_written_ymd"):
+                self._baseline_written_ymd = ""
+            if self._baseline_written_ymd == ymd:
+                return
+
+            # Capture after observe_start to approximate day-start equity.
+            if not is_after(self.time_rules.observe_start, now_dt):
+                return
+
+            # Use a stable KR symbol for cash query.
+            cash = 0.0
+            try:
+                cash = float(await self.rest.get_cash_available("005930", 1.0))
+            except Exception:
+                cash = 0.0
+            finally:
+                # avoid leaking aiohttp sessions created during baseline capture
+                try:
+                    await self.rest.close()
+                except Exception:
+                    pass
+
+            # Exposure from broker positions (KR only). Best-effort.
+            exposure = 0.0
+            try:
+                pos_map = await self.rest.get_all_positions()
+                for sym, info in (pos_map or {}).items():
+                    try:
+                        qty = int(float((info or {}).get("qty", 0) or 0))
+                        avg = float((info or {}).get("avg_price", 0.0) or 0.0)
+                        if qty > 0 and avg > 0:
+                            exposure += float(avg) * int(qty)
+                    except Exception:
+                        continue
+            except Exception:
+                exposure = 0.0
+
+            baseline_equity = float(cash) + float(exposure)
+            out = {
+                "ts": now_dt.isoformat(),
+                "ymd": ymd,
+                "cash": float(cash),
+                "exposure": float(exposure),
+                "equity": float(baseline_equity),
+            }
+
+            import json
+            import os
+
+            path = os.path.join(self.base_dir, "logs", f"daily_baseline_{ymd}.json")
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(out, f, ensure_ascii=False, indent=2)
+            except Exception:
+                return
+
+            self._baseline_written_ymd = ymd
+        except Exception:
+            return
 
     def get_health_status(self) -> dict[str, object]:
         """Build a serializable snapshot of current engine health state.
