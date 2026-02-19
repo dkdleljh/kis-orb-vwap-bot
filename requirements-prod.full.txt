@@ -70,7 +70,7 @@ httpx==0.25.2
 aiohttp==3.9.1
 websockets==12.0
 requests==2.31.0
-urllib3==2.1.0
+urllib3==1.26.18
 
 # Utilities
 python-dotenv==1.0.0
@@ -78,7 +78,7 @@ click==8.1.7
 rich==13.7.0
 typer==0.9.0
 pyyaml==6.0.1
-python-dateutil==2.8.2
+python-dateutil==2.9.0.post0
 pytz==2023.3
 
 # Logging & Observability

@@ -16,6 +16,7 @@ import os
 from collections import defaultdict, deque
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 from pathlib import Path
 
@@ -31,6 +32,10 @@ from perfect_strategy import Perfect100Strategy, State
 from scoring import ScoreBreakdown, SignalScore
 from core.audit_log import audit_decision
 from strategy_profiles import get_recommended_threshold
+from universe_builder import build_universe, resolve_universe_config
+
+
+KST = ZoneInfo("Asia/Seoul")
 
 
 class KRSwingModule(BaseTradingModule):
@@ -56,6 +61,12 @@ class KRSwingModule(BaseTradingModule):
 
         scoring_cfg = (config.get("scoring", {}) or {})
         self.entry_threshold = int(scoring_cfg.get("kr_swing_entry_threshold", get_recommended_threshold("KR", "SWING")))
+        self.dynamic_config = resolve_universe_config("SWING", context.config.get("dynamic_universe", {}))
+        self.dynamic_enabled = os.environ.get("KIS_DYNAMIC_UNIVERSE", "1").strip() != "0"
+        self._scanner = None
+        self._current_universe: List[str] = []
+        self._last_good_universe: List[str] = []
+        self._last_scan_time: Optional[datetime] = None
 
         self._pos: Optional[Position] = None
 
@@ -84,8 +95,49 @@ class KRSwingModule(BaseTradingModule):
             min_r_ratio=1.2,
         )
 
+    def set_scanner(self, scanner) -> None:
+        self._scanner = scanner
+
     async def _on_initialize(self) -> None:
+        if self.dynamic_enabled:
+            await self._refresh_universe()
+        else:
+            self._current_universe = list(self.symbols) if self.symbols else []
         await self._restore_position()
+
+    async def _refresh_universe(self) -> None:
+        try:
+            universe = await build_universe(
+                market="KR",
+                style="SWING",
+                scanner=self._scanner,
+                base_symbols=list(self.symbols) if self.symbols else [],
+                config=self.dynamic_config,
+            )
+            if universe:
+                self._current_universe = universe
+                self._last_good_universe = universe
+                self._last_scan_time = datetime.now(tz=KST)
+                self.log_info(f"Universe refreshed: {len(universe)} stocks")
+            else:
+                self.log_warning("Scanner returned empty, using last good universe")
+                self._current_universe = self._last_good_universe or []
+        except Exception as e:
+            self.log_error(f"Universe refresh failed: {e}")
+            self._current_universe = self._last_good_universe or []
+
+    async def _universe_refresh_loop(self) -> None:
+        interval = int(self.dynamic_config.get("scan_interval_sec", 600))
+        while self._running:
+            try:
+                await asyncio.sleep(interval)
+                await self._refresh_universe()
+            except Exception as e:
+                self.log_error(f"Universe refresh loop error: {e}")
+                await asyncio.sleep(60)
+
+    def get_current_universe(self) -> List[str]:
+        return self._current_universe.copy()
 
     async def get_cash_available(self, symbol: str, price: float = 0.0) -> float:
         return await self.rest.get_cash_available(symbol, price)
@@ -295,9 +347,14 @@ class KRSwingModule(BaseTradingModule):
     async def monitor_loop(self) -> None:
         # Swing exit management is still delegated to engine-level risk/exit.
         # For now, keep a lightweight position refresh loop.
+        universe_task = None
+        if self.dynamic_enabled:
+            universe_task = asyncio.create_task(self._universe_refresh_loop())
         while self._running:
             try:
                 self._pos = await self.get_positions()
             except Exception:
                 pass
             await asyncio.sleep(10)
+        if universe_task:
+            universe_task.cancel()

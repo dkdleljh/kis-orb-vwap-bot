@@ -16,11 +16,12 @@ Safety:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import random
-import re
 from dataclasses import dataclass
 from datetime import datetime, date, time as dt_time, timedelta
+from pathlib import Path
 from typing import Optional, Dict, Any, List, Set
 
 from zoneinfo import ZoneInfo
@@ -35,12 +36,12 @@ from kis_rest_overseas import KISOverseasRestOrders
 from fee_calculator import USFeeCalculator
 from perfect_strategy import Perfect100Strategy
 from news import NewsSentimentAnalyzer
+from premarket_collector import PremarketCollector, CollectStats
+from modules.us_buy_guard import evaluate_us_buy_guard, is_buy_order_failed, set_symbol_cooldown
+from universe_builder import build_universe, resolve_universe_config
 
 
 KST = ZoneInfo("Asia/Seoul")
-
-_US_SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,9}$")
-
 
 # US stock market holiday and time handling
 _us_holidays_cache: Dict[int, holidays.HolidayBase] = {}
@@ -241,12 +242,13 @@ class MijangModule(BaseTradingModule):
         force_exit = get_force_exit_time()
         self.force_exit_time = force_exit.strftime("%H:%M:%S")
 
-        self._position: Optional[Position] = None
-        self._entry_price: float = 0.0
-        self._peak_pnl: float = 0.0
+        self.max_positions = int(os.environ.get("KIS_US_MAX_POSITIONS", "5"))
+        self.max_position_per_symbol = int(os.environ.get("KIS_US_MAX_POSITION_PER_SYMBOL", "1"))
+        self.allow_existing_holdings = os.environ.get("KIS_US_ALLOW_EXISTING_HOLDINGS", "1").strip() != "0"
+        self._positions: Dict[str, Position] = {}
 
-        self.dynamic_config = context.config.get("dynamic_universe", {})
-        self.dynamic_enabled = self.dynamic_config.get("enabled", False)
+        self.dynamic_config = resolve_universe_config("SCALP", context.config.get("dynamic_universe", {}))
+        self.dynamic_enabled = os.environ.get("KIS_DYNAMIC_UNIVERSE", "1").strip() != "0"
         self._scanner = None
         self._current_universe: List[str] = []
         self._last_good_universe: List[str] = []
@@ -260,6 +262,7 @@ class MijangModule(BaseTradingModule):
         # quote failure backoff
         self._quote_fail_streak = 0
         self._symbol_cooldown_until: Dict[str, float] = {}
+        self._last_integrated_margin_warn_ts: Dict[str, float] = {}
 
         self.news_analyzer = NewsSentimentAnalyzer()
         self.news_score_by_symbol: Dict[str, int] = {}
@@ -298,6 +301,32 @@ class MijangModule(BaseTradingModule):
         # recommended universe cap
         self._universe_cap = int(os.environ.get("KIS_US_UNIVERSE_CAP", str(int(config.get("universe_cap", 30)))))
 
+        # pre-market data/analysis mode (data collection only, no execution)
+        self._premarket_enabled = os.environ.get("KIS_US_PREMARKET_COLLECT", "1").strip() == "1"
+        self._premarket_poll_sec = max(15.0, float(os.environ.get("KIS_US_PREMARKET_POLL_SEC", "60")))
+        self._premarket_max_symbols = int(
+            os.environ.get("KIS_US_PREMARKET_MAX_SYMBOLS", str(self._universe_cap))
+        )
+        self._premarket_summary_interval_sec = int(os.environ.get("KIS_US_PREMARKET_SUMMARY_SEC", "600"))
+        self._premarket_news_interval_sec = int(os.environ.get("KIS_US_PREMARKET_NEWS_SEC", "300"))
+        self._premarket_metrics_interval_sec = int(os.environ.get("KIS_US_PREMARKET_METRICS_SEC", "300"))
+        self._premarket_last_summary_ts = 0.0
+        self._premarket_last_news_ts = 0.0
+        self._premarket_last_metrics_ts = 0.0
+        self._premarket_mode_active = False
+        self._daily_cache: Dict[str, List[Dict[str, Any]]] = {}
+
+        self._data_root = Path(os.environ.get("KIS_DATA_DIR", "data"))
+        self._premarket_collector: Optional[PremarketCollector] = None
+        if self._premarket_enabled:
+            self._premarket_collector = PremarketCollector(
+                rest_client=self.rest,
+                logger=self.logger,
+                data_root=self._data_root,
+                market="US",
+                poll_sec=int(self._premarket_poll_sec),
+            )
+
     def set_scanner(self, scanner) -> None:
         self._scanner = scanner
 
@@ -307,64 +336,32 @@ class MijangModule(BaseTradingModule):
         if self.dynamic_enabled:
             await self._refresh_universe()
         else:
-            self._current_universe = self._apply_universe_policy(list(self.symbols) if self.symbols else [])
+            self._current_universe = list(self.symbols) if self.symbols else []
 
         await self._restore_position()
 
-    def _is_valid_us_symbol(self, symbol: str) -> bool:
-        s = (symbol or "").strip().upper()
-        # Exclude KR-style or odd suffix symbols like 02850K, and anything too long.
-        return bool(_US_SYMBOL_RE.match(s))
-
-    def _apply_universe_policy(self, symbols: List[str]) -> List[str]:
-        # normalize + filter
-        cleaned: List[str] = []
-        for sym in symbols:
-            s = (sym or "").strip().upper()
-            if not s:
-                continue
-            if not self._is_valid_us_symbol(s):
-                continue
-            cleaned.append(s)
-
-        # de-dup while preserving order
-        seen = set()
-        uniq: List[str] = []
-        for s in cleaned:
-            if s in seen:
-                continue
-            seen.add(s)
-            uniq.append(s)
-
-        # cap
-        if self._universe_cap > 0 and len(uniq) > self._universe_cap:
-            uniq = uniq[: self._universe_cap]
-
-        return uniq
-
     async def _refresh_universe(self) -> None:
-        if not self._scanner:
-            self.log_warning("US Scanner not set, using default universe")
-            base = list(self.symbols) if self.symbols else []
-            self._current_universe = self._apply_universe_policy(base)
-            return
-
         try:
-            top_n = int(self.dynamic_config.get("top_n", 30))
-            exchanges = self.dynamic_config.get("exchanges", ["NASD", "NYSE"])
-            min_price = self.dynamic_config.get("min_price_usd", 5.0)
+            dynamic_cfg = dict(self.dynamic_config)
+            if self._universe_cap > 0:
+                dynamic_cfg["cap"] = self._universe_cap
+                dynamic_cfg["max_symbols"] = self._universe_cap
+            universe = await build_universe(
+                market="US",
+                style="SCALP",
+                scanner=self._scanner,
+                base_symbols=list(self.symbols) if self.symbols else [],
+                config=dynamic_cfg,
+            )
 
-            scanned = await self._scanner.scan(top_n=top_n, exchanges=exchanges, min_price=min_price)
-
-            if scanned:
-                scanned2 = self._apply_universe_policy(scanned)
-                self._current_universe = scanned2
-                self._last_good_universe = scanned2
+            if universe:
+                self._current_universe = universe
+                self._last_good_universe = universe
                 self._last_scan_time = datetime.now(tz=KST)
-                self.log_info(f"US Universe refreshed: {len(scanned2)} stocks (cap={self._universe_cap})")
+                self.log_info(f"Universe refreshed: {len(universe)} stocks")
             else:
-                self.log_warning("US Scanner returned empty, using last good universe")
-                self._current_universe = self._last_good_universe or self._apply_universe_policy(list(self.symbols) if self.symbols else [])
+                self.log_warning("Scanner returned empty, using last good universe")
+                self._current_universe = self._last_good_universe or []
         except Exception as e:
             self.log_error(f"Universe refresh failed: {e}")
             self._current_universe = self._last_good_universe or []
@@ -455,19 +452,44 @@ class MijangModule(BaseTradingModule):
             return await self.rest.place_sell_order(symbol, qty, price)
         return await self.rest.place_sell_market(symbol, qty)
 
-    async def get_positions(self) -> Optional[Position]:
+    async def get_positions_list(self) -> List[Position]:
         try:
-            return await self.rest.get_positions()
+            getter = getattr(self.rest, "get_positions_list", None)
+            if callable(getter):
+                return await getter()
+            pos = await self.rest.get_positions()
+            return [pos] if pos else []
         except Exception as e:
             self.log_warning(f"Failed to get positions: {e}")
-            return None
+            return []
+
+    async def get_positions(self) -> Optional[Position]:
+        positions = await self.get_positions_list()
+        return positions[0] if positions else None
+
+    def _positions_map(self, positions: List[Position]) -> Dict[str, Position]:
+        return {str(p.symbol).upper(): p for p in positions if getattr(p, "symbol", None)}
+
+    def _entry_blocked_by_positions(self, symbol: str, positions_map: Dict[str, Position]) -> bool:
+        if symbol in positions_map:
+            # Current position model is one Position row per symbol (no same-symbol add yet).
+            if self.max_position_per_symbol <= 1:
+                return True
+            return True
+        if len(positions_map) >= max(1, self.max_positions):
+            return True
+        if (not self.allow_existing_holdings) and positions_map:
+            return True
+        return False
+
+    async def _refresh_positions(self) -> Dict[str, Position]:
+        self._positions = self._positions_map(await self.get_positions_list())
+        return self._positions
 
     async def _restore_position(self) -> None:
-        pos = await self.get_positions()
-        if pos:
-            self._position = pos
-            self._entry_price = pos.avg_price
-            self._peak_pnl = 0.0
+        positions_map = await self._refresh_positions()
+        self.log_info(f"Restored positions: {len(positions_map)} holdings")
+        for pos in positions_map.values():
             self.log_info(f"Restored position: {pos.symbol} qty={pos.qty}")
 
     async def get_quote(self, symbol: str) -> dict:
@@ -551,18 +573,9 @@ class MijangModule(BaseTradingModule):
         while self._running:
             try:
                 status = get_us_market_status(datetime.now(tz=KST))
-                if not status.get("is_open"):
-                    # keep it quiet; no spam
-                    await asyncio.sleep(30)
-                    continue
-
-                await self._check_positions()
-                await self._check_force_exit()
-
-                if self._current_universe:
-                    await self._check_next_candidate()
-
-                await asyncio.sleep(self._quote_poll_sec)
+                self._log_market_mode_transition(status)
+                sleep_sec = await self._run_market_iteration(status)
+                await asyncio.sleep(sleep_sec)
             except Exception as e:
                 self.log_error(f"Monitor loop error: {e}")
                 await asyncio.sleep(10)
@@ -570,37 +583,298 @@ class MijangModule(BaseTradingModule):
         if universe_task:
             universe_task.cancel()
 
+    async def _run_market_iteration(self, status: Dict[str, Any]) -> float:
+        if status.get("is_open"):
+            await self._check_positions()
+            await self._check_force_exit()
+
+            if self._current_universe:
+                await self._check_next_candidate()
+
+            return self._quote_poll_sec
+
+        if status.get("is_pre_market") and self._premarket_enabled:
+            await self._run_premarket_cycle()
+            return self._premarket_poll_sec
+
+        return 30.0
+
+    def _log_market_mode_transition(self, status: Dict[str, Any]) -> None:
+        is_pre = bool(status.get("is_pre_market"))
+        if is_pre and not self._premarket_mode_active:
+            self._premarket_mode_active = True
+            ymd = datetime.now(tz=KST).strftime("%Y%m%d")
+            root = self._data_root / "premarket_us" / ymd
+            self.log_info(
+                f"Entered US pre-market collection mode: poll={int(self._premarket_poll_sec)}s "
+                f"max_symbols={self._premarket_max_symbols} path={root}"
+            )
+        elif (not is_pre) and self._premarket_mode_active:
+            self._premarket_mode_active = False
+            self.log_info("Exited US pre-market collection mode")
+
+    def _premarket_symbols(self) -> List[str]:
+        if not self._current_universe:
+            return []
+        cap = self._premarket_max_symbols if self._premarket_max_symbols > 0 else len(self._current_universe)
+        return self._current_universe[:cap]
+
+    def _news_cache_path(self, now: datetime) -> Path:
+        return self._data_root / "news_cache_us" / f"{now.strftime('%Y%m%d')}.json"
+
+    def _metrics_path(self, now: datetime) -> Path:
+        return self._data_root / "premarket_metrics_us" / f"{now.strftime('%Y%m%d')}.json"
+
+    def _write_json(self, path: Path, payload: Dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+
+    async def _run_premarket_cycle(self) -> None:
+        now = datetime.now(tz=KST)
+        now_ts = now.timestamp()
+
+        if not self._current_universe:
+            if self.dynamic_enabled:
+                await self._refresh_universe()
+            else:
+                self._current_universe = list(self.symbols) if self.symbols else []
+
+        if self.dynamic_enabled:
+            interval = int(self.dynamic_config.get("scan_interval_sec", 300))
+            due = (self._last_scan_time is None) or ((now - self._last_scan_time).total_seconds() >= interval)
+            if due:
+                await self._refresh_universe()
+
+        symbols = self._premarket_symbols()
+        if not symbols:
+            return
+
+        stats = CollectStats()
+        if self._premarket_collector:
+            stats = await self._premarket_collector.collect_once(symbols)
+
+        if (now_ts - self._premarket_last_news_ts) >= self._premarket_news_interval_sec:
+            await self._update_premarket_news(symbols, now)
+            self._premarket_last_news_ts = now_ts
+
+        if (now_ts - self._premarket_last_metrics_ts) >= self._premarket_metrics_interval_sec:
+            await self._update_premarket_metrics(symbols, now)
+            self._premarket_last_metrics_ts = now_ts
+
+        if (now_ts - self._premarket_last_summary_ts) >= self._premarket_summary_interval_sec:
+            fail_rate = 0.0
+            if stats.requested > 0:
+                fail_rate = (stats.failed / float(stats.requested)) * 100.0
+            self.log_info(
+                f"pre-market summary symbols={len(symbols)} collected={stats.collected}/{stats.requested} "
+                f"failed={stats.failed} cooldown={stats.skipped_cooldown} fail_rate={fail_rate:.1f}%"
+            )
+            self._premarket_last_summary_ts = now_ts
+
+    async def _update_premarket_news(self, symbols: List[str], now: datetime) -> None:
+        updated = 0
+        for symbol in symbols:
+            try:
+                result = await self.news_analyzer.get_us_sentiment_score(symbol)
+                score = int(float(result.get("score", 0)))
+                self.news_score_by_symbol[symbol] = score
+                self.news_score_updated_at[symbol] = now.timestamp()
+                updated += 1
+            except Exception as e:
+                self.log_warning(f"pre-market news update failed: {symbol} err={e}")
+
+        payload = {
+            "updated_at": now.isoformat(),
+            "scores": self.news_score_by_symbol,
+            "updated_at_epoch": self.news_score_updated_at,
+        }
+        self._write_json(self._news_cache_path(now), payload)
+        if updated:
+            self.log_info(f"pre-market news updated: {updated} symbols")
+
+    def _load_daily_bars(self, symbol: str) -> List[Dict[str, Any]]:
+        if symbol in self._daily_cache:
+            return self._daily_cache[symbol]
+        daily_dir = self._data_root / "daily_us"
+        bars: List[Dict[str, Any]] = []
+        try:
+            candidates = sorted(daily_dir.glob(f"{symbol}_*.json"))
+            if candidates:
+                text = candidates[-1].read_text(encoding="utf-8")
+                obj = json.loads(text)
+                if isinstance(obj, list):
+                    bars = [x for x in obj if isinstance(x, dict)]
+        except Exception:
+            bars = []
+        self._daily_cache[symbol] = bars
+        return bars
+
+    def _build_symbol_premarket_metrics(self, symbol: str) -> Dict[str, Any]:
+        if not self._premarket_collector:
+            return {}
+        samples = self._premarket_collector.recent_samples(symbol)
+        if len(samples) < 2:
+            return {}
+
+        last = float(samples[-1].get("last") or 0.0)
+        first = float(samples[0].get("last") or 0.0)
+        if first <= 0 or last <= 0:
+            return {}
+
+        premarket_change_pct = ((last - first) / first) * 100.0
+        trend = "flat"
+        if premarket_change_pct > 0.2:
+            trend = "up"
+        elif premarket_change_pct < -0.2:
+            trend = "down"
+
+        highs: List[float] = []
+        lows: List[float] = []
+        closes: List[float] = []
+        for s in samples:
+            px = float(s.get("last") or 0.0)
+            if px <= 0:
+                continue
+            bid = float(s.get("bid") or px)
+            ask = float(s.get("ask") or px)
+            highs.append(max(px, ask))
+            lows.append(min(px, bid))
+            closes.append(px)
+
+        atr_val = atr(highs, lows, closes, 14)
+        atr_pct = (atr_val / last) * 100.0 if (atr_val > 0 and last > 0) else 0.0
+
+        daily_bars = self._load_daily_bars(symbol)
+        daily_atr_pct = 0.0
+        daily_trend = "unknown"
+        if daily_bars:
+            d_high: List[float] = []
+            d_low: List[float] = []
+            d_close: List[float] = []
+            for row in daily_bars:
+                h = float(row.get("high") or 0.0)
+                l = float(row.get("low") or 0.0)
+                c = float(row.get("close") or 0.0)
+                if h > 0 and l > 0 and c > 0:
+                    d_high.append(h)
+                    d_low.append(l)
+                    d_close.append(c)
+            d_atr = atr(d_high, d_low, d_close, 14)
+            daily_atr_pct = (d_atr / last) * 100.0 if (d_atr > 0 and last > 0) else 0.0
+            if len(d_close) >= 20:
+                ma20 = sum(d_close[-20:]) / 20.0
+                daily_trend = "up" if d_close[-1] >= ma20 else "down"
+
+        return {
+            "last": last,
+            "premarket_change_pct": round(premarket_change_pct, 4),
+            "premarket_atr_pct_est": round(atr_pct, 4),
+            "daily_atr_pct": round(daily_atr_pct, 4),
+            "premarket_trend": trend,
+            "daily_trend": daily_trend,
+            "news_score": int(self.news_score_by_symbol.get(symbol, 0)),
+            "sample_count": len(samples),
+        }
+
+    async def _update_premarket_metrics(self, symbols: List[str], now: datetime) -> None:
+        metrics_by_symbol: Dict[str, Any] = {}
+        for symbol in symbols:
+            m = self._build_symbol_premarket_metrics(symbol)
+            if m:
+                metrics_by_symbol[symbol] = m
+
+        payload = {
+            "updated_at": now.isoformat(),
+            "symbol_count": len(metrics_by_symbol),
+            "metrics": metrics_by_symbol,
+        }
+        self._write_json(self._metrics_path(now), payload)
+
+    def _us_session_bounds_kst(self, now_dt: datetime) -> tuple[datetime, datetime]:
+        """Return (session_start_dt_kst, session_end_dt_kst) for the current US regular session.
+
+        US regular session in KST typically spans 23:30 ~ 06:00 (cross-midnight).
+        This helper prevents naive time-only comparisons that break around midnight.
+        """
+        status = get_us_market_status(now_dt)
+        open_t = datetime.strptime(status["market_open_korea"], "%H:%M:%S").time()
+        close_t = datetime.strptime(status["market_close_korea"], "%H:%M:%S").time()
+
+        crosses_midnight = open_t > close_t
+        today = now_dt.date()
+
+        # Determine the session start date.
+        if crosses_midnight:
+            start_date = today if now_dt.time() >= open_t else (today - timedelta(days=1))
+            end_date = start_date + timedelta(days=1)
+        else:
+            start_date = today
+            end_date = today
+
+        session_start = datetime.combine(start_date, open_t, tzinfo=KST)
+        session_end = datetime.combine(end_date, close_t, tzinfo=KST)
+        return session_start, session_end
+
     async def _check_force_exit(self) -> None:
         now_dt = datetime.now(tz=KST)
         try:
+            status = get_us_market_status(now_dt)
+            if not status.get("is_open"):
+                return
+
             exit_time = datetime.strptime(self.force_exit_time, "%H:%M:%S").time()
-            if now_dt.time() >= exit_time:
-                if self._position:
-                    self.log_warning(f"Force exit time reached ({self.force_exit_time}), closing position")
+            session_start, session_end = self._us_session_bounds_kst(now_dt)
+
+            # Force-exit timestamp should be within the session window.
+            open_t = session_start.time()
+            crosses_midnight = session_start.date() != session_end.date()
+            force_exit_date = session_start.date()
+            if crosses_midnight and exit_time < open_t:
+                force_exit_date = session_start.date() + timedelta(days=1)
+
+            force_exit_dt = datetime.combine(force_exit_date, exit_time, tzinfo=KST)
+
+            if session_start <= now_dt <= session_end and now_dt >= force_exit_dt:
+                if self._positions:
+                    self.log_warning(
+                        f"Force exit time reached ({self.force_exit_time}), closing position"
+                    )
                     await self._handle_exit("force_exit")
         except Exception as e:
             self.log_warning(f"Force exit check failed: {e}")
 
-    async def _handle_exit(self, reason: str) -> None:
-        if not self._position:
+    async def _handle_exit(self, reason: str, symbol: Optional[str] = None) -> None:
+        if not self._positions:
             return
 
-        pos = self._position
-        self.log_info(f"Exiting position: {reason} {pos.symbol} qty={pos.qty}")
+        target_symbols = []
+        if symbol:
+            sym = str(symbol).upper()
+            if sym in self._positions:
+                target_symbols = [sym]
+        else:
+            target_symbols = list(self._positions.keys())
+        if not target_symbols:
+            return
 
         if not self._live_confirm:
             self.log_warning("signals-only mode: exit order suppressed")
             return
 
-        await self.place_sell_order(pos.symbol, pos.qty)
+        for sym in target_symbols:
+            pos = self._positions.get(sym)
+            if not pos:
+                continue
+            self.log_info(f"Exiting position: {reason} {pos.symbol} qty={pos.qty}")
+            await self.place_sell_order(pos.symbol, pos.qty)
         await asyncio.sleep(3)
 
-        pos_after = await self.get_positions()
-        if not pos_after:
-            self._position = None
-            self._entry_price = 0.0
-            self._peak_pnl = 0.0
-            self.log_info(f"Position closed: {reason}")
+        positions_after = await self._refresh_positions()
+        closed_count = sum(1 for sym in target_symbols if sym not in positions_after)
+        if closed_count > 0:
+            self.log_info(f"Position closed: {reason} closed={closed_count}")
 
     def _roll_day_if_needed(self) -> None:
         today = datetime.now(tz=KST).date()
@@ -630,10 +904,11 @@ class MijangModule(BaseTradingModule):
             return
 
     async def _check_positions(self) -> None:
-        pos = await self.get_positions()
-        if pos and not self._position:
-            self._position = pos
-            self._entry_price = pos.avg_price
+        prev = set(self._positions.keys())
+        curr = await self._refresh_positions()
+        new_symbols = sorted(set(curr.keys()) - prev)
+        for sym in new_symbols:
+            pos = curr[sym]
             self.log_info(f"Position detected: {pos.symbol} qty={pos.qty} @ {pos.avg_price}")
 
     def _make_book_from_quote(self, symbol: str, quote: dict, last_price: float) -> OrderBookTop:
@@ -683,7 +958,8 @@ class MijangModule(BaseTradingModule):
         Live orders require KIS_US_LIVE_CONFIRM=YES.
         """
 
-        if self._position:
+        symbol = str(symbol).upper()
+        if self._entry_blocked_by_positions(symbol, self._positions):
             return
 
         try:
@@ -781,15 +1057,52 @@ class MijangModule(BaseTradingModule):
             self.log_info(f"US signal {signal.symbol} side={signal.side} score={signal.score} reasons={signal.reasons[:3]}")
             if not self._live_confirm:
                 return
-
-            # Place a live order (if enabled)
-            cash = await self.get_cash_available(symbol, last_price)
-            budget = cash * self.entry_budget_pct
+            if os.environ.get("KIS_KILL_SWITCH", "0").strip() == "1":
+                return
+            if (Path(__file__).resolve().parents[1] / "STOP_TRADING.flag").exists():
+                return
 
             # 실주문 가격은 ask 기반(매수)으로 보수적으로 산정
             entry_px = float(book.ask) if book.ask > 0 else last_price
+            cash_detail = await self.rest.get_cash_available_detail(symbol, entry_px)
+            cash = float(cash_detail.get("cash_available") or 0.0)
+            ord_psbl_qty: Optional[int] = None
+            raw_ord_psbl_qty = cash_detail.get("ord_psbl_qty")
+            if raw_ord_psbl_qty not in (None, ""):
+                try:
+                    ord_psbl_qty = int(float(raw_ord_psbl_qty))
+                except Exception:
+                    ord_psbl_qty = None
+            integrated_mode = os.environ.get("KIS_US_USE_INTEGRATED_MARGIN", "0").strip() == "1"
+            integrated_margin_estimate_usd = 0.0
+            if integrated_mode:
+                integrated_margin_estimate_usd = await self._estimate_cash_available_from_krw()
+            min_usd = float(os.environ.get("KIS_US_INTEGRATED_MARGIN_MIN_USD", "100"))
+            guard = evaluate_us_buy_guard(
+                integrated_margin_mode=integrated_mode,
+                ord_psbl_qty=ord_psbl_qty,
+                integrated_margin_estimate_usd=integrated_margin_estimate_usd,
+                min_usd=min_usd,
+            )
+            now_ts = datetime.now(tz=KST).timestamp()
+            if not guard.buy_attempt_allowed:
+                return
+            if guard.used_integrated_margin_fallback:
+                last_warn = self._last_integrated_margin_warn_ts.get(symbol, 0.0)
+                if now_ts - last_warn >= 600.0:
+                    self.log_warning(
+                        f"[mijang] ord_psbl_qty={ord_psbl_qty} err={cash_detail.get('err')} -> using integrated margin estimate={integrated_margin_estimate_usd:.2f} USD (min={min_usd:.2f})"
+                    )
+                    self._last_integrated_margin_warn_ts[symbol] = now_ts
+                cash = max(cash, integrated_margin_estimate_usd)
+
+            budget = cash * self.entry_budget_pct
             qty = int(budget / entry_px)
             if qty < 1:
+                return
+
+            latest_positions = await self._refresh_positions()
+            if self._entry_blocked_by_positions(symbol, latest_positions):
                 return
 
             # one-entry-per-symbol-per-day safety pin: mark once we start live attempts
@@ -797,14 +1110,21 @@ class MijangModule(BaseTradingModule):
 
             for attempt in range(self.entry_retry_limit):
                 order = await self.place_buy_order(symbol, qty, entry_px)
+                if is_buy_order_failed(getattr(order, "status", ""), getattr(order, "order_id", "")):
+                    until = set_symbol_cooldown(
+                        cooldown_map=self._symbol_cooldown_until,
+                        symbol=symbol,
+                        now_ts=datetime.now(tz=KST).timestamp(),
+                        cooldown_sec=float(os.environ.get("KIS_US_BUY_REJECT_COOLDOWN_SEC", "120")),
+                    )
+                    self.log_warning(
+                        f"[mijang] buy failed symbol={symbol} reason={getattr(order, 'status', '')} cooldown_until={int(until)}"
+                    )
                 if order.order_id:
                     await asyncio.sleep(3)
-                    pos = await self.get_positions()
-                    if pos and pos.symbol == symbol:
-                        self._position = pos
-                        self._entry_price = entry_px
-                        self._peak_pnl = 0.0
-                        self.log_info(f"Order filled: {symbol} qty={pos.qty}")
+                    refreshed = await self._refresh_positions()
+                    if symbol in refreshed:
+                        self.log_info(f"Order filled: {symbol} qty={refreshed[symbol].qty}")
                         return
                 if order.order_id:
                     await self.rest.cancel_order(order.order_id, symbol, qty)

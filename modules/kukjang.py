@@ -10,10 +10,13 @@ Live gate:
 """
 
 import asyncio
+import json
 import os
 from collections import defaultdict, deque
 from datetime import datetime
+from pathlib import Path
 from typing import Optional, Dict, Any, List
+from zoneinfo import ZoneInfo
 
 from modules.base import BaseTradingModule, ModuleContext
 from models import Position, OrderBookTop, TradeTick, Bar1m, OrderResult
@@ -22,6 +25,33 @@ from perfect_strategy import Perfect100Strategy, State, PerfectSignal
 from indicators import rsi, sma, bollinger_bands, envelope, atr, ema, macd
 from bars_vwap import BarBuilder1m, VwapCalculator
 from fee_calculator import FeeCalculator
+from news import NewsSentimentAnalyzer
+from premarket_collector import PremarketCollector, CollectStats
+from universe_builder import build_universe, resolve_universe_config
+
+
+KST = ZoneInfo("Asia/Seoul")
+
+
+def get_kr_market_status(now: Optional[datetime] = None) -> Dict[str, Any]:
+    now = now or datetime.now(tz=KST)
+    is_weekend = now.weekday() >= 5
+    hhmm = now.hour * 60 + now.minute
+    pre_start = 8 * 60
+    pre_end = 9 * 60
+    regular_end = 15 * 60 + 30
+
+    is_pre_market = (not is_weekend) and (pre_start <= hhmm < pre_end)
+    is_open = (not is_weekend) and (pre_end <= hhmm < regular_end)
+    return {
+        "is_open": is_open,
+        "is_pre_market": is_pre_market,
+        "is_weekend": is_weekend,
+        "market_open_kst": "09:00:00",
+        "market_close_kst": "15:30:00",
+        "pre_market_start_kst": "08:00:00",
+        "pre_market_end_kst": "09:00:00",
+    }
 
 
 class KukjangModule(BaseTradingModule):
@@ -88,13 +118,40 @@ class KukjangModule(BaseTradingModule):
 
         self.market_regime = "NEUTRAL"
 
-        self.dynamic_config = context.config.get("dynamic_universe", {})
-        self.dynamic_enabled = self.dynamic_config.get("enabled", False)
+        self.dynamic_config = resolve_universe_config("SCALP", context.config.get("dynamic_universe", {}))
+        self.dynamic_enabled = os.environ.get("KIS_DYNAMIC_UNIVERSE", "1").strip() != "0"
         self._scanner = None
         self._current_universe: List[str] = []
         self._last_good_universe: List[str] = []
         self._miss_count: Dict[str, int] = {}
         self._last_scan_time: Optional[datetime] = None
+
+        self.news_analyzer = NewsSentimentAnalyzer()
+        self._data_root = Path(os.environ.get("KIS_DATA_DIR", "data"))
+
+        # KR pre-market data/analysis mode (08:00~09:00 KST, data collection only)
+        self._premarket_enabled = os.environ.get("KIS_KR_PREMARKET_COLLECT", "1").strip() == "1"
+        self._premarket_poll_sec = max(15.0, float(os.environ.get("KIS_KR_PREMARKET_POLL_SEC", "60")))
+        default_premarket_max = int(self.dynamic_config.get("max_symbols", 0) or 0)
+        self._premarket_max_symbols = int(
+            os.environ.get("KIS_KR_PREMARKET_MAX_SYMBOLS", str(default_premarket_max))
+        )
+        self._premarket_summary_interval_sec = int(os.environ.get("KIS_KR_PREMARKET_SUMMARY_SEC", "600"))
+        self._premarket_news_interval_sec = int(os.environ.get("KIS_KR_PREMARKET_NEWS_SEC", "300"))
+        self._premarket_metrics_interval_sec = int(os.environ.get("KIS_KR_PREMARKET_METRICS_SEC", "300"))
+        self._premarket_last_summary_ts = 0.0
+        self._premarket_last_news_ts = 0.0
+        self._premarket_last_metrics_ts = 0.0
+        self._premarket_mode_active = False
+        self._premarket_collector: Optional[PremarketCollector] = None
+        if self._premarket_enabled:
+            self._premarket_collector = PremarketCollector(
+                rest_client=self.rest,
+                logger=self.logger,
+                data_root=self._data_root,
+                market="KR",
+                poll_sec=int(self._premarket_poll_sec),
+            )
 
         self.fee_calculator = FeeCalculator(
             commission_rate=0.00015,
@@ -128,49 +185,33 @@ class KukjangModule(BaseTradingModule):
         await self._load_prev_closes_if_needed(self._current_universe)
 
     async def _refresh_universe(self) -> None:
-        if not self._scanner:
-            self.log_warning("Scanner not set, using fallback universe")
-            self._current_universe = self.dynamic_config.get(
-                "always_include", self.symbols
-            )
-            return
-
         try:
-            top_n = self.dynamic_config.get("top_n", 30)
-            max_symbols = self.dynamic_config.get("max_symbols", 40)
-            always_include = self.dynamic_config.get("always_include", [])
-            exclude_spac = self.dynamic_config.get("exclude_spac", True)
-
-            scanned = await self._scanner.get_top_trading_value(limit=top_n)
-
-            if scanned:
-                universe = always_include.copy()
-                for sym in scanned:
-                    if len(universe) >= max_symbols:
-                        break
-                    if sym not in universe:
-                        if exclude_spac and "스팩" in str(sym):
-                            continue
-                        universe.append(sym)
-
+            universe = await build_universe(
+                market="KR",
+                style="SCALP",
+                scanner=self._scanner,
+                base_symbols=list(self.symbols) if self.symbols else [],
+                config=self.dynamic_config,
+            )
+            if universe:
                 self._current_universe = universe
                 self._last_good_universe = universe
-                self._last_scan_time = datetime.now()
+                self._last_scan_time = datetime.now(tz=KST)
                 self.log_info(f"Universe refreshed: {len(universe)} stocks")
             else:
                 self.log_warning("Scanner returned empty, using last good universe")
-                self._current_universe = self._last_good_universe or always_include
+                self._current_universe = self._last_good_universe or []
 
         except Exception as e:
             self.log_error(f"Universe refresh failed: {e}")
-            self._current_universe = self._last_good_universe or self.symbols
+            self._current_universe = self._last_good_universe or []
 
     async def _universe_refresh_loop(self) -> None:
         interval = self.dynamic_config.get("scan_interval_sec", 90)
 
         while self._running:
             try:
-                now = datetime.now()
+                now = datetime.now(tz=KST)
                 if (
                     self._last_scan_time
                     and (now - self._last_scan_time).total_seconds() >= interval
@@ -451,15 +492,184 @@ class KukjangModule(BaseTradingModule):
         self.log_info("Entry failed after retries")
         await asyncio.sleep(30)
 
+    def _log_market_mode_transition(self, status: Dict[str, Any]) -> None:
+        is_pre = bool(status.get("is_pre_market"))
+        if is_pre and not self._premarket_mode_active:
+            self._premarket_mode_active = True
+            ymd = datetime.now(tz=KST).strftime("%Y%m%d")
+            root = self._data_root / "premarket_kr" / ymd
+            self.log_info(
+                f"Entered KR pre-market collection mode: poll={int(self._premarket_poll_sec)}s "
+                f"max_symbols={self._premarket_max_symbols} path={root}"
+            )
+        elif (not is_pre) and self._premarket_mode_active:
+            self._premarket_mode_active = False
+            self.log_info("Exited KR pre-market collection mode")
+
+    def _premarket_symbols(self) -> List[str]:
+        symbols = self._current_universe or list(self.symbols)
+        if not symbols:
+            return []
+        cap = self._premarket_max_symbols if self._premarket_max_symbols > 0 else len(symbols)
+        return symbols[:cap]
+
+    def _news_cache_path(self, now: datetime) -> Path:
+        return self._data_root / "news_cache_kr" / f"{now.strftime('%Y%m%d')}.json"
+
+    def _metrics_path(self, now: datetime) -> Path:
+        return self._data_root / "premarket_metrics_kr" / f"{now.strftime('%Y%m%d')}.json"
+
+    def _write_json(self, path: Path, payload: Dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+
+    async def _update_premarket_news(self, symbols: List[str], now: datetime) -> None:
+        updated = 0
+        for symbol in symbols:
+            try:
+                result = await self.news_analyzer.get_sentiment_score(symbol)
+                score = int(float(result.get("score", 0)))
+                self.news_score_by_symbol[symbol] = score
+                self.news_score_updated_at[symbol] = now.timestamp()
+                updated += 1
+            except Exception as e:
+                self.log_warning(f"pre-market news update failed: {symbol} err={e}")
+
+        payload = {
+            "updated_at": now.isoformat(),
+            "scores": self.news_score_by_symbol,
+            "updated_at_epoch": self.news_score_updated_at,
+        }
+        self._write_json(self._news_cache_path(now), payload)
+        if updated:
+            self.log_info(f"pre-market news updated: {updated} symbols")
+
+    def _build_symbol_premarket_metrics(self, symbol: str) -> Dict[str, Any]:
+        if not self._premarket_collector:
+            return {}
+        samples = self._premarket_collector.recent_samples(symbol)
+        if len(samples) < 2:
+            return {}
+
+        last = float(samples[-1].get("last") or 0.0)
+        first = float(samples[0].get("last") or 0.0)
+        if first <= 0 or last <= 0:
+            return {}
+
+        premarket_change_pct = ((last - first) / first) * 100.0
+        trend = "flat"
+        if premarket_change_pct > 0.2:
+            trend = "up"
+        elif premarket_change_pct < -0.2:
+            trend = "down"
+
+        highs: List[float] = []
+        lows: List[float] = []
+        closes: List[float] = []
+        for s in samples:
+            px = float(s.get("last") or 0.0)
+            if px <= 0:
+                continue
+            bid = float(s.get("bid") or px)
+            ask = float(s.get("ask") or px)
+            highs.append(max(px, ask))
+            lows.append(min(px, bid))
+            closes.append(px)
+
+        if not closes:
+            return {}
+
+        atr_val = atr(highs, lows, closes, 14)
+        atr_pct = (atr_val / last) * 100.0 if (atr_val > 0 and last > 0) else 0.0
+        return {
+            "last": last,
+            "premarket_change_pct": round(premarket_change_pct, 4),
+            "premarket_atr_pct_est": round(atr_pct, 4),
+            "premarket_trend": trend,
+            "news_score": int(self.news_score_by_symbol.get(symbol, 0)),
+            "sample_count": len(samples),
+        }
+
+    async def _update_premarket_metrics(self, symbols: List[str], now: datetime) -> None:
+        metrics_by_symbol: Dict[str, Any] = {}
+        for symbol in symbols:
+            m = self._build_symbol_premarket_metrics(symbol)
+            if m:
+                metrics_by_symbol[symbol] = m
+
+        payload = {
+            "updated_at": now.isoformat(),
+            "symbol_count": len(metrics_by_symbol),
+            "metrics": metrics_by_symbol,
+        }
+        self._write_json(self._metrics_path(now), payload)
+
+    async def _run_premarket_cycle(self) -> None:
+        now = datetime.now(tz=KST)
+        now_ts = now.timestamp()
+
+        if not self._current_universe:
+            if self.dynamic_enabled:
+                await self._refresh_universe()
+            else:
+                self._current_universe = list(self.symbols)
+
+        if self.dynamic_enabled:
+            interval = int(self.dynamic_config.get("scan_interval_sec", 300))
+            due = (self._last_scan_time is None) or ((now - self._last_scan_time).total_seconds() >= interval)
+            if due:
+                await self._refresh_universe()
+                await self._load_prev_closes_if_needed(self._current_universe)
+
+        symbols = self._premarket_symbols()
+        if not symbols:
+            return
+
+        stats = CollectStats()
+        if self._premarket_collector:
+            stats = await self._premarket_collector.collect_once(symbols)
+
+        if (now_ts - self._premarket_last_news_ts) >= self._premarket_news_interval_sec:
+            await self._update_premarket_news(symbols, now)
+            self._premarket_last_news_ts = now_ts
+
+        if (now_ts - self._premarket_last_metrics_ts) >= self._premarket_metrics_interval_sec:
+            await self._update_premarket_metrics(symbols, now)
+            self._premarket_last_metrics_ts = now_ts
+
+        if (now_ts - self._premarket_last_summary_ts) >= self._premarket_summary_interval_sec:
+            fail_rate = 0.0
+            if stats.requested > 0:
+                fail_rate = (stats.failed / float(stats.requested)) * 100.0
+            self.log_info(
+                f"pre-market summary symbols={len(symbols)} collected={stats.collected}/{stats.requested} "
+                f"failed={stats.failed} cooldown={stats.skipped_cooldown} fail_rate={fail_rate:.1f}%"
+            )
+            self._premarket_last_summary_ts = now_ts
+
     async def monitor_loop(self) -> None:
         universe_task = None
         if self.dynamic_enabled:
             universe_task = asyncio.create_task(self._universe_refresh_loop())
 
         while self._running:
-            await self._check_tp_sl()
-            await self._check_force_exit()
-            await asyncio.sleep(1)
+            try:
+                status = get_kr_market_status(datetime.now(tz=KST))
+                self._log_market_mode_transition(status)
+                if status.get("is_pre_market") and self._premarket_enabled:
+                    # pre-market mode: collection/news/metrics/universe refresh only
+                    await self._run_premarket_cycle()
+                    await asyncio.sleep(self._premarket_poll_sec)
+                    continue
+
+                await self._check_tp_sl()
+                await self._check_force_exit()
+                await asyncio.sleep(1)
+            except Exception as e:
+                self.log_error(f"Monitor loop error: {e}")
+                await asyncio.sleep(5)
 
         if universe_task:
             universe_task.cancel()

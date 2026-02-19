@@ -2904,6 +2904,7 @@ async def run_module_system(base_dir: str) -> None:
         logger.info("Loading KR Swing module...")
 
         rest_client = KISRestOrders(rest_base_url, auth, account, logger)
+        scanner = KisScanner(auth, rest_base_url)
 
         ctx = ModuleContext(
             name="kr_swing",
@@ -2914,6 +2915,7 @@ async def run_module_system(base_dir: str) -> None:
         )
 
         kr_swing = KRSwingModule(ctx, logger, rest_client, config.get("trading", {}))
+        kr_swing.set_scanner(scanner)
         modules["kr_swing"] = kr_swing
         logger.info("KR Swing module loaded")
 
@@ -2939,6 +2941,8 @@ async def run_module_system(base_dir: str) -> None:
         )
 
         us_swing = USSwingModule(ctx, logger, overseas_client, config.get("trading", {}))
+        us_swing_scanner = USStockScanner(auth, rest_base_url, logger)
+        us_swing.set_scanner(us_swing_scanner)
         modules["us_swing"] = us_swing
         logger.info("US Swing module loaded")
 

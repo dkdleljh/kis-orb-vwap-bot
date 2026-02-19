@@ -9,16 +9,17 @@
     "base_url": "https://openapi.koreainvestment.com:9443",
     "mock": false
   },
-  "logging": { "dir": "logs" },
-
+  "logging": {
+    "dir": "logs"
+  },
   "trading": {
     "entry_budget_pct": 0.12,
     "max_entries_per_day": 10,
     "max_concurrent_positions": 20,
     "entry_retry_limit": 3,
-    "max_total_position_pct": 0.60,
+    "max_total_position_pct": 0.6,
     "max_symbol_position_pct": 0.08,
-    "cash_reserve_pct": 0.20,
+    "cash_reserve_pct": 0.2,
     "max_new_entries_per_minute": 2,
     "max_spread_pct": 0.01,
     "scoring": {
@@ -26,7 +27,6 @@
       "us_scalp_entry_threshold": 75
     }
   },
-
   "us_trading": {
     "enabled": true,
     "timezone": "America/New_York",
@@ -36,7 +36,6 @@
     "force_exit": "15:45:00",
     "same_day_trading": true
   },
-
   "automation": {
     "retry": {
       "max_attempts": 5,
@@ -45,27 +44,53 @@
       "jitter": true,
       "rate_limit_cooldown_sec": 65
     },
-    "healthcheck": { "enabled": true, "interval_sec": 60 }
+    "healthcheck": {
+      "enabled": true,
+      "interval_sec": 60
+    }
   },
-
   "modules": {
-    "kukjang": { "enabled": false },
-    "kr_swing": { "enabled": false },
-    "hwanjeon": { "enabled": false },
-
+    "kukjang": {
+      "enabled": false
+    },
+    "kr_swing": {
+      "enabled": false
+    },
+    "hwanjeon": {
+      "enabled": false
+    },
     "us_swing": {
       "enabled": true,
-      "symbols": ["AAPL", "MSFT", "NVDA", "TSLA", "SCHD"],
+      "symbols": [
+        "AAPL",
+        "MSFT",
+        "NVDA",
+        "TSLA",
+        "SCHD"
+      ],
       "exchange": "NASD",
       "bar_minutes": 15,
       "entry_budget_pct": 0.12,
       "stop_loss_pct": -0.03,
       "take_profit_pct": 0.06,
-      "entry_retry_limit": 3
+      "entry_retry_limit": 3,
+      "dynamic_universe": {
+        "enabled": true,
+        "scan_interval_sec": 600,
+        "top_n": 120,
+        "max_symbols": 60,
+        "min_price_usd": 3,
+        "min_liquidity": 500000,
+        "volatility_preference": "stable_trend",
+        "exchanges": [
+          "NASD",
+          "NYSE",
+          "AMEX"
+        ]
+      }
     },
-
     "mijang": {
-      "enabled": true,
+      "enabled": false,
       "symbols": [],
       "exchange": "NASD",
       "stop_loss_pct": -0.03,
@@ -75,10 +100,16 @@
         "enabled": true,
         "scan_interval_sec": 300,
         "source": "popular_list",
-        "top_n": 50,
-        "max_symbols": 60,
+        "top_n": 60,
+        "max_symbols": 30,
         "min_price_usd": 5,
-        "exchanges": ["NASD", "NYSE", "AMEX"]
+        "min_liquidity": 1000000,
+        "volatility_preference": "high",
+        "exchanges": [
+          "NASD",
+          "NYSE",
+          "AMEX"
+        ]
       }
     }
   }

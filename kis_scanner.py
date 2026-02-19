@@ -12,7 +12,7 @@ class KisScanner:
         self.base_url = base_url
         self.last_error: str = ""
 
-    async def get_top_trading_value(self, limit: int = 30) -> List[str]:
+    async def get_top_trading_value(self, limit: int = 30, market_div_code: str = "J") -> List[str]:
         """거래대금 상위 종목 발굴 (가장 확실한 주도주)
 
         실운영에서 자주 발생한 문제:
@@ -28,8 +28,12 @@ class KisScanner:
         headers["tr_id"] = "FHPST01710000"  # 거래대금 순위 TR ID
         headers["custtype"] = "P"
 
+        mkt = (market_div_code or "J").strip().upper()
+        if mkt not in {"J", "Y", "K"}:
+            mkt = "J"
+
         base_params = {
-            "FID_COND_MRKT_DIV_CODE": "J",  # J: 전체, Y: 코스피, K: 코스닥
+            "FID_COND_MRKT_DIV_CODE": mkt,  # J: 전체, Y: 코스피, K: 코스닥
             "FID_INPUT_ISCD": "0000",
             "FID_DIV_CLS_CODE": "0",
             "FID_BLNG_CLS_CODE": "0",

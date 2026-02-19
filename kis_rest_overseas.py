@@ -14,7 +14,7 @@ NOTE:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Any
 
 import aiohttp
 import asyncio
@@ -662,85 +662,156 @@ class KISOverseasRestOrders:
         positions = await self.get_positions_list()
         return positions[0] if positions else None
 
-    async def get_cash_available(self, symbol: str = "AAPL", price: float = 100.0) -> float:
-        """Best-effort overseas order-possible cash/amount.
-
-        KIS 해외 '매수가능금액조회(inquire-psamount)'는 종목코드/주문단가를 요구하는 경우가 많아
-        대표 심볼 + 소액 단가로 조회합니다.
+    async def get_cash_available_detail(self, symbol: str = "AAPL", price: float = 100.0) -> dict[str, Any]:
+        """Best-effort overseas order-possible cash/amount with diagnostics.
 
         Returns:
-            float: ovrs_ord_psbl_amt (통화 기준, 보통 USD)
+            dict with keys:
+            - cash_available: float (USD, best-effort)
+            - ord_psbl_qty: int | None
+            - err: str | None
+            - exchange: str | None
+            - day_or_night: str | None
+            - tr_id: str | None
         """
         url = f"{self.base_url}/uapi/overseas-stock/v1/trading/inquire-psamount"
-
-        # param variants
-        ex = self._resolve_exchange(symbol)
-        base = {
-            "CANO": self.account.account_no,
-            "ACNT_PRDT_CD": self.account.product_code,
-            # Some environments expect OVRS_EXCG_CD, others expect EXCD.
-            "OVRS_EXCG_CD": ex,
-            "OVRS_ORD_UNPR": str(float(price)),
-            "ITEM_CD": symbol,
-        }
-
-        base_variants = [
-            base,
-            {**base, "EXCD": self.exchange},
-            {**base, "OVRS_PDNO": symbol},
-            {**base, "OVRS_PDNO": symbol, "EXCD": self.exchange},
-            {**base, "PDNO": symbol},
-            {**base, "PDNO": symbol, "EXCD": self.exchange},
-        ]
-
-        # TR IDs (day/night) – some environments accept these.
-        tr_ids = ["TTTS3007R", "JTTT3007R"]
 
         try:
             session = await self._get_session()
             last_err = None
+            resolved_ex = self._resolve_exchange(symbol)
+            exchange_candidates: list[str] = [resolved_ex, "NASD", "NYSE", "AMEX"]
+            seen_ex: set[str] = set()
+            deduped_exchanges: list[str] = []
+            for ex in exchange_candidates:
+                if not ex or ex in seen_ex:
+                    continue
+                seen_ex.add(ex)
+                deduped_exchanges.append(ex)
+
+            day_or_night_candidates: list[str | None] = [None]
+            try:
+                detected = await self.get_day_or_night()
+                detected_dn = detected.strip().upper() if isinstance(detected, str) else None
+            except Exception:
+                detected_dn = None
+            for dn in (detected_dn, "N", "D"):
+                if dn and dn not in day_or_night_candidates:
+                    day_or_night_candidates.append(dn)
+
+            # TR IDs (day/night) – some environments accept these.
+            tr_ids = ["TTTS3007R", "JTTT3007R"]
             for tr in tr_ids:
                 headers = await self._auth_headers()
                 headers.update({"tr_id": tr, "custtype": "P"})
 
-                for params in base_variants:
-                    # Many examples use POST; some expect query params.
-                    for attempt in range(4):
-                        async with session.post(url, params=params, headers=headers) as resp:
-                            data = await resp.json()
+                for ex in deduped_exchanges:
+                    base = {
+                        "CANO": self.account.account_no,
+                        "ACNT_PRDT_CD": self.account.product_code,
+                        # Some environments expect OVRS_EXCG_CD, others expect EXCD.
+                        "OVRS_EXCG_CD": ex,
+                        "OVRS_ORD_UNPR": str(float(price)),
+                        "ITEM_CD": symbol,
+                    }
+                    for dn in day_or_night_candidates:
+                        base_with_dn = {**base}
+                        if dn:
+                            base_with_dn["DAY_OR_NIGHT"] = dn
 
-                        err = self._check_error(data, f"overseas_get_cash_available[{tr}]")
-                        if err:
-                            if "EGW00201" in err or "초당" in err:
-                                wait = 1 * (2**attempt)
-                                self.logger.warning(
-                                    f"overseas_get_cash_available rate-limited. retry in {wait}s: {err}"
-                                )
-                                await asyncio.sleep(wait)
-                                continue
-                            last_err = err
-                            break
+                        base_variants = [
+                            base_with_dn,
+                            {**base_with_dn, "EXCD": ex},
+                            {**base_with_dn, "OVRS_PDNO": symbol},
+                            {**base_with_dn, "OVRS_PDNO": symbol, "EXCD": ex},
+                            {**base_with_dn, "PDNO": symbol},
+                            {**base_with_dn, "PDNO": symbol, "EXCD": ex},
+                        ]
 
-                        out = data.get("output", {}) or {}
-                        # candidates
-                        for k in ("ovrs_ord_psbl_amt", "ord_psbl_cash", "psbl_cash"):
-                            v = out.get(k)
-                            if v not in (None, ""):
-                                try:
-                                    return float(v)
-                                except Exception:
-                                    continue
-                        break
+                        for params in base_variants:
+                            # Many examples use POST; some expect query params.
+                            for attempt in range(4):
+                                async with session.post(url, params=params, headers=headers) as resp:
+                                    data = await resp.json()
 
-                    # if this params variant failed, try next variant
-                    if last_err:
-                        continue
+                                err = self._check_error(data, f"overseas_get_cash_available[{tr}]")
+                                if err:
+                                    if "EGW00201" in err or "초당" in err:
+                                        wait = 1 * (2**attempt)
+                                        self.logger.warning(
+                                            f"overseas_get_cash_available rate-limited. retry in {wait}s: {err}"
+                                        )
+                                        await asyncio.sleep(wait)
+                                        continue
+
+                                    # For rt_cd=7 "상품이 없습니다", continue trying exchange/day-night variants.
+                                    msg = str(data.get("msg1") or "")
+                                    rt_cd = str(data.get("rt_cd") or "")
+                                    if rt_cd == "7" and ("상품이 없습니다" in msg or "상품이 없" in msg):
+                                        last_err = f"rt_cd={rt_cd} msg={msg}"
+                                        break
+
+                                    last_err = err
+                                    break
+
+                                out = data.get("output", {}) or {}
+                                cash = 0.0
+                                for k in ("ovrs_ord_psbl_amt", "ord_psbl_cash", "psbl_cash"):
+                                    v = out.get(k)
+                                    if v not in (None, ""):
+                                        try:
+                                            cash = float(v)
+                                            break
+                                        except Exception:
+                                            continue
+
+                                ord_psbl_qty: int | None = None
+                                for k in ("ord_psbl_qty", "ovrs_ord_psbl_qty", "psbl_qty"):
+                                    v = out.get(k)
+                                    if v in (None, ""):
+                                        continue
+                                    try:
+                                        ord_psbl_qty = int(float(v))
+                                        break
+                                    except Exception:
+                                        continue
+
+                                return {
+                                    "cash_available": cash,
+                                    "ord_psbl_qty": ord_psbl_qty,
+                                    "err": None,
+                                    "exchange": ex,
+                                    "day_or_night": dn,
+                                    "tr_id": tr,
+                                }
 
             if last_err:
                 self.logger.warning(f"overseas_get_cash_available failed after variants: {last_err}")
-            return 0.0
+            return {
+                "cash_available": 0.0,
+                "ord_psbl_qty": None,
+                "err": str(last_err) if last_err else None,
+                "exchange": None,
+                "day_or_night": None,
+                "tr_id": None,
+            }
         except Exception as e:
             self.logger.error(f"overseas_get_cash_available exception: {e}")
+            return {
+                "cash_available": 0.0,
+                "ord_psbl_qty": None,
+                "err": str(e),
+                "exchange": None,
+                "day_or_night": None,
+                "tr_id": None,
+            }
+
+    async def get_cash_available(self, symbol: str = "AAPL", price: float = 100.0) -> float:
+        """Backward-compatible cash_available-only wrapper."""
+        try:
+            out = await self.get_cash_available_detail(symbol, price)
+            return float(out.get("cash_available") or 0.0)
+        except Exception:
             return 0.0
 
     async def get_quote(self, symbol: str, *, exchange: str | None = None) -> dict:

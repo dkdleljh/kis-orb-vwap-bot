@@ -14,8 +14,10 @@ import asyncio
 import json
 import os
 import sys
+from statistics import pstdev
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 # ensure project root on sys.path
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -136,32 +138,168 @@ def _load_dotenv_like(path: str) -> None:
         return
 
 
-async def _avg_kr(an: NewsSentimentAnalyzer, symbols: list[str]) -> float:
+def _news_stats(scores: list[float], attempts: int) -> dict:
+    if not scores:
+        return {"avg": None, "count": 0, "std": None, "coverage": 0.0, "success_rate": 0.0}
+    return {
+        "avg": float(sum(scores) / len(scores)),
+        "count": int(len(scores)),
+        "std": float(pstdev(scores)) if len(scores) >= 2 else 0.0,
+        "coverage": float(len(scores) / max(1, attempts)),
+        "success_rate": float(len(scores) / max(1, attempts)),
+    }
+
+
+async def _news_kr(an: NewsSentimentAnalyzer, symbols: list[str]) -> dict:
+    targets = symbols[:20]
     scores = []
-    for sym in symbols[:20]:
+    for sym in targets:
         try:
             r = await an.get_sentiment_score(sym)
             s = float(r.get("score") or 0)
             scores.append(s)
         except Exception:
             continue
-    if not scores:
-        return 0.0
-    return sum(scores) / len(scores)
+    return _news_stats(scores, len(targets))
 
 
-async def _avg_us(an: NewsSentimentAnalyzer, symbols: list[str]) -> float:
+async def _news_us(an: NewsSentimentAnalyzer, symbols: list[str]) -> dict:
+    targets = symbols[:10]
     scores = []
-    for sym in symbols[:10]:
+    for sym in targets:
         try:
             r = await an.get_us_sentiment_score(sym)
             s = float(r.get("score") or 0)
             scores.append(s)
         except Exception:
             continue
-    if not scores:
-        return 0.0
-    return sum(scores) / len(scores)
+    return _news_stats(scores, len(targets))
+
+
+def _read_json(path: Path) -> dict[str, Any] | None:
+    try:
+        if not path.exists():
+            return None
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+def _news_stats_from_cache(base_dir: Path, market: str, ymd: str, symbols: list[str], cap: int) -> dict | None:
+    path = base_dir / "data" / f"news_cache_{market.lower()}" / f"{ymd}.json"
+    cached = _read_json(path)
+    if not cached:
+        return None
+    scores = cached.get("scores")
+    if not isinstance(scores, dict):
+        return None
+
+    targets = symbols[: max(1, cap)]
+    vals: list[float] = []
+    for sym in targets:
+        try:
+            if sym in scores:
+                vals.append(float(scores.get(sym)))
+        except Exception:
+            continue
+
+    if not vals:
+        for v in scores.values():
+            try:
+                vals.append(float(v))
+            except Exception:
+                continue
+
+    attempts = len(targets) if targets else len(vals)
+    return _news_stats(vals, attempts)
+
+
+def _normalize_premarket_trend(value: Any) -> str | None:
+    trend = str(value or "").strip().upper()
+    return {"UP": "UP", "DOWN": "DOWN", "FLAT": "FLAT"}.get(trend)
+
+
+def _select_premarket_metric(
+    *,
+    base_dir: Path,
+    market: str,
+    ymd: str,
+    rep_symbol: str,
+) -> dict[str, Any] | None:
+    path = base_dir / "data" / f"premarket_metrics_{market.lower()}" / f"{ymd}.json"
+    payload = _read_json(path)
+    if not payload:
+        return None
+    metrics = payload.get("metrics")
+    if not isinstance(metrics, dict) or not metrics:
+        return None
+    rep = str(rep_symbol or "").strip().upper()
+    if rep and isinstance(metrics.get(rep), dict):
+        return metrics[rep]
+    for v in metrics.values():
+        if isinstance(v, dict):
+            return v
+    return None
+
+
+def _apply_cached_overrides(
+    *,
+    base_dir: Path,
+    market: str,
+    ymd: str,
+    inputs: dict[str, Any],
+    symbols: list[str],
+    rep_symbol: str,
+    news_cap: int,
+) -> dict[str, Any]:
+    out = dict(inputs)
+    out["prev_day"] = dict(out.get("prev_day") or {})
+    out["news"] = dict(out.get("news") or {})
+    out["chart"] = dict(out.get("chart") or {})
+    out["atr"] = dict(out.get("atr") or {})
+
+    cached_news = _news_stats_from_cache(base_dir, market, ymd, symbols, news_cap)
+    if cached_news:
+        out["news"] = {
+            "sentiment_avg": cached_news.get("avg"),
+            "sample_count": cached_news.get("count", 0),
+            "coverage": cached_news.get("coverage", 0.0),
+            "success_rate": cached_news.get("success_rate", 0.0),
+            "std": cached_news.get("std"),
+        }
+
+    pm = _select_premarket_metric(
+        base_dir=base_dir,
+        market=market,
+        ymd=ymd,
+        rep_symbol=rep_symbol,
+    )
+    if not pm:
+        return out
+
+    try:
+        sample_count = int(float(pm.get("sample_count") or 0))
+    except Exception:
+        sample_count = 0
+    if sample_count < 10:
+        return out
+
+    pre_ret = pm.get("premarket_change_pct")
+    atr_pct = pm.get("premarket_atr_pct_est")
+    trend = _normalize_premarket_trend(pm.get("premarket_trend"))
+
+    if pre_ret is not None:
+        out["prev_day"]["return_pct"] = pre_ret
+        out["prev_day"]["sample_count"] = sample_count
+    if atr_pct is not None:
+        out["atr"]["atr_pct"] = atr_pct
+        out["atr"]["sample_count"] = sample_count
+    if trend is not None:
+        out["chart"]["trend"] = trend
+        out["chart"]["sample_count"] = sample_count
+
+    return out
 
 
 def _kr_chart_metrics(base_dir: Path, symbol: str) -> dict:
@@ -189,28 +327,76 @@ def _kr_chart_metrics(base_dir: Path, symbol: str) -> dict:
                 e9 = ema(closes[-200:], 9)
                 e21 = ema(closes[-200:], 21)
                 trend = "UP" if e9 > e21 else "DOWN" if e9 < e21 else "FLAT"
-                return {"kr_atr_pct": atr_pct, "kr_trend": trend, "kr_chart_date": last, "kr_chart_tf": "intraday"}
+                prev_ret = ((closes[-1] / closes[-2]) - 1.0) * 100.0 if len(closes) >= 2 and closes[-2] > 0 else None
+                prev_rng = ((highs[-1] - lows[-1]) / px) * 100.0 if px > 0 else None
+                chart_strength = ((e9 - e21) / px) if px > 0 else None
+                return {
+                    "kr_atr_pct": atr_pct,
+                    "kr_trend": trend,
+                    "kr_chart_strength": chart_strength,
+                    "kr_chart_samples": len(closes),
+                    "kr_prev_day_return_pct": prev_ret,
+                    "kr_prev_day_range_pct": prev_rng,
+                    "kr_chart_date": last,
+                    "kr_chart_tf": "intraday",
+                }
 
     # 2) daily_kr fallback
     daily_dir = base_dir / "data" / "daily_kr"
     files = sorted(daily_dir.glob(f"{symbol}_*.json")) if daily_dir.exists() else []
     if not files:
-        return {"kr_atr_pct": None, "kr_trend": None, "kr_chart_date": None, "kr_chart_tf": None}
+        return {
+            "kr_atr_pct": None,
+            "kr_trend": None,
+            "kr_chart_strength": None,
+            "kr_chart_samples": 0,
+            "kr_prev_day_return_pct": None,
+            "kr_prev_day_range_pct": None,
+            "kr_chart_date": None,
+            "kr_chart_tf": None,
+        }
 
     path = files[-1]
     try:
         daily = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return {"kr_atr_pct": None, "kr_trend": None, "kr_chart_date": None, "kr_chart_tf": None}
+        return {
+            "kr_atr_pct": None,
+            "kr_trend": None,
+            "kr_chart_strength": None,
+            "kr_chart_samples": 0,
+            "kr_prev_day_return_pct": None,
+            "kr_prev_day_range_pct": None,
+            "kr_chart_date": None,
+            "kr_chart_tf": None,
+        }
 
     if not isinstance(daily, list) or len(daily) < 30:
-        return {"kr_atr_pct": None, "kr_trend": None, "kr_chart_date": path.stem.split("_")[-1], "kr_chart_tf": "daily"}
+        return {
+            "kr_atr_pct": None,
+            "kr_trend": None,
+            "kr_chart_strength": None,
+            "kr_chart_samples": 0,
+            "kr_prev_day_return_pct": None,
+            "kr_prev_day_range_pct": None,
+            "kr_chart_date": path.stem.split("_")[-1],
+            "kr_chart_tf": "daily",
+        }
 
     closes = [float(b.get("close") or 0) for b in daily if float(b.get("close") or 0) > 0]
     highs = [float(b.get("high") or 0) for b in daily if float(b.get("high") or 0) > 0]
     lows = [float(b.get("low") or 0) for b in daily if float(b.get("low") or 0) > 0]
     if len(closes) < 30:
-        return {"kr_atr_pct": None, "kr_trend": None, "kr_chart_date": path.stem.split("_")[-1], "kr_chart_tf": "daily"}
+        return {
+            "kr_atr_pct": None,
+            "kr_trend": None,
+            "kr_chart_strength": None,
+            "kr_chart_samples": len(closes),
+            "kr_prev_day_return_pct": None,
+            "kr_prev_day_range_pct": None,
+            "kr_chart_date": path.stem.split("_")[-1],
+            "kr_chart_tf": "daily",
+        }
 
     a = atr(highs[-60:], lows[-60:], closes[-60:], 14)
     px = closes[-1]
@@ -219,33 +405,91 @@ def _kr_chart_metrics(base_dir: Path, symbol: str) -> dict:
     e21 = ema(closes[-120:], 21)
     trend = "UP" if e9 > e21 else "DOWN" if e9 < e21 else "FLAT"
 
-    return {"kr_atr_pct": atr_pct, "kr_trend": trend, "kr_chart_date": path.stem.split("_")[-1], "kr_chart_tf": "daily"}
+    prev_ret = ((closes[-1] / closes[-2]) - 1.0) * 100.0 if len(closes) >= 2 and closes[-2] > 0 else None
+    prev_rng = ((highs[-1] - lows[-1]) / px) * 100.0 if px > 0 else None
+    chart_strength = ((e9 - e21) / px) if px > 0 else None
+
+    return {
+        "kr_atr_pct": atr_pct,
+        "kr_trend": trend,
+        "kr_chart_strength": chart_strength,
+        "kr_chart_samples": len(closes),
+        "kr_prev_day_return_pct": prev_ret,
+        "kr_prev_day_range_pct": prev_rng,
+        "kr_chart_date": path.stem.split("_")[-1],
+        "kr_chart_tf": "daily",
+    }
 
 
 def _us_chart_metrics(base_dir: Path, symbol: str = "VOO") -> dict:
     """Compute simple US daily regime metrics from cached yfinance snapshot."""
     data_dir = base_dir / "data" / "daily_us"
     if not data_dir.exists():
-        return {"us_atr_pct": None, "us_trend": None, "us_chart_date": None, "us_rep": symbol}
+        return {
+            "us_atr_pct": None,
+            "us_trend": None,
+            "us_chart_strength": None,
+            "us_chart_samples": 0,
+            "us_prev_day_return_pct": None,
+            "us_prev_day_range_pct": None,
+            "us_chart_date": None,
+            "us_rep": symbol,
+        }
 
     files = sorted(data_dir.glob(f"{symbol}_*.json"))
     if not files:
-        return {"us_atr_pct": None, "us_trend": None, "us_chart_date": None, "us_rep": symbol}
+        return {
+            "us_atr_pct": None,
+            "us_trend": None,
+            "us_chart_strength": None,
+            "us_chart_samples": 0,
+            "us_prev_day_return_pct": None,
+            "us_prev_day_range_pct": None,
+            "us_chart_date": None,
+            "us_rep": symbol,
+        }
 
     path = files[-1]
     try:
         bars = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return {"us_atr_pct": None, "us_trend": None, "us_chart_date": None, "us_rep": symbol}
+        return {
+            "us_atr_pct": None,
+            "us_trend": None,
+            "us_chart_strength": None,
+            "us_chart_samples": 0,
+            "us_prev_day_return_pct": None,
+            "us_prev_day_range_pct": None,
+            "us_chart_date": None,
+            "us_rep": symbol,
+        }
 
     if not isinstance(bars, list) or len(bars) < 30:
-        return {"us_atr_pct": None, "us_trend": None, "us_chart_date": path.stem.split("_")[-1], "us_rep": symbol}
+        return {
+            "us_atr_pct": None,
+            "us_trend": None,
+            "us_chart_strength": None,
+            "us_chart_samples": 0,
+            "us_prev_day_return_pct": None,
+            "us_prev_day_range_pct": None,
+            "us_chart_date": path.stem.split("_")[-1],
+            "us_rep": symbol,
+        }
 
     closes = [float(b.get("close") or 0) for b in bars if float(b.get("close") or 0) > 0]
     highs = [float(b.get("high") or 0) for b in bars if float(b.get("high") or 0) > 0]
     lows = [float(b.get("low") or 0) for b in bars if float(b.get("low") or 0) > 0]
     if len(closes) < 30:
-        return {"us_atr_pct": None, "us_trend": None, "us_chart_date": path.stem.split("_")[-1], "us_rep": symbol}
+        return {
+            "us_atr_pct": None,
+            "us_trend": None,
+            "us_chart_strength": None,
+            "us_chart_samples": len(closes),
+            "us_prev_day_return_pct": None,
+            "us_prev_day_range_pct": None,
+            "us_chart_date": path.stem.split("_")[-1],
+            "us_rep": symbol,
+        }
 
     a = atr(highs[-60:], lows[-60:], closes[-60:], 14)
     px = closes[-1]
@@ -254,8 +498,20 @@ def _us_chart_metrics(base_dir: Path, symbol: str = "VOO") -> dict:
     e9 = ema(closes[-120:], 9)
     e21 = ema(closes[-120:], 21)
     trend = "UP" if e9 > e21 else "DOWN" if e9 < e21 else "FLAT"
+    prev_ret = ((closes[-1] / closes[-2]) - 1.0) * 100.0 if len(closes) >= 2 and closes[-2] > 0 else None
+    prev_rng = ((highs[-1] - lows[-1]) / px) * 100.0 if px > 0 else None
+    chart_strength = ((e9 - e21) / px) if px > 0 else None
 
-    return {"us_atr_pct": atr_pct, "us_trend": trend, "us_chart_date": path.stem.split("_")[-1], "us_rep": symbol}
+    return {
+        "us_atr_pct": atr_pct,
+        "us_trend": trend,
+        "us_chart_strength": chart_strength,
+        "us_chart_samples": len(closes),
+        "us_prev_day_return_pct": prev_ret,
+        "us_prev_day_range_pct": prev_rng,
+        "us_chart_date": path.stem.split("_")[-1],
+        "us_rep": symbol,
+    }
 
 
 async def main() -> int:
@@ -278,20 +534,10 @@ async def main() -> int:
 
     an = NewsSentimentAnalyzer(max_news_age_hours=24)
 
-    kr_avg = await _avg_kr(an, kr_syms)
-    us_avg = await _avg_us(an, us_syms)
+    kr_news = await _news_kr(an, kr_syms)
+    us_news = await _news_us(an, us_syms)
 
-    # CNN Fear & Greed + VIX regime -> blend into US sentiment.
     fg = await asyncio.to_thread(_cnn_fear_greed)
-    if fg:
-        if "fg_sentiment" in fg:
-            w = float(os.environ.get("FG_BLEND_WEIGHT", "0.25") or 0.25)
-            w = max(0.0, min(0.8, w))
-            us_avg = (1.0 - w) * float(us_avg) + w * float(fg.get("fg_sentiment") or 0.0)
-        if "vix_sentiment" in fg:
-            wv = float(os.environ.get("VIX_BLEND_WEIGHT", "0.20") or 0.20)
-            wv = max(0.0, min(0.8, wv))
-            us_avg = (1.0 - wv) * float(us_avg) + wv * float(fg.get("vix_sentiment") or 0.0)
 
     # IMPORTANT: use hardcoded baselines here to avoid compounding daily adjustments.
     base = Thresholds(
@@ -305,38 +551,113 @@ async def main() -> int:
     kr_rep = "069500"
     kr_chart = _kr_chart_metrics(base_dir, kr_rep)
     us_chart = _us_chart_metrics(base_dir, "VOO")
+    ymd = datetime.now().strftime("%Y%m%d")
 
-    # Small extra adjustment from ATR% (high volatility -> stricter)
-    kr_atr_pct = kr_chart.get("kr_atr_pct")
-    if kr_atr_pct is not None:
-        if kr_atr_pct >= 2.0:
-            kr_avg = kr_avg - 5.0
-        elif kr_atr_pct <= 1.0 and kr_chart.get("kr_trend") == "UP":
-            kr_avg = kr_avg + 3.0
+    vix_block = {"vix_last": (fg or {}).get("vix_last"), "vix_ma50": (fg or {}).get("vix_ma50"), "vix_gap": (fg or {}).get("vix_gap")}
+    fg_block = {"fg_score": (fg or {}).get("fg_score"), "fg_rating": (fg or {}).get("fg_rating"), "fg_ts_utc": (fg or {}).get("fg_ts_utc")}
 
-    us_atr_pct = us_chart.get("us_atr_pct")
-    if us_atr_pct is not None:
-        if us_atr_pct >= 2.5:
-            us_avg = us_avg - 5.0
-        elif us_atr_pct <= 1.4 and us_chart.get("us_trend") == "UP":
-            us_avg = us_avg + 3.0
+    kr_inputs = {
+        "prev_day": {
+            "return_pct": kr_chart.get("kr_prev_day_return_pct"),
+            "range_pct": kr_chart.get("kr_prev_day_range_pct"),
+            "sample_count": kr_chart.get("kr_chart_samples", 0),
+        },
+        "news": {
+            "sentiment_avg": kr_news.get("avg"),
+            "sample_count": kr_news.get("count", 0),
+            "coverage": kr_news.get("coverage", 0.0),
+            "success_rate": kr_news.get("success_rate", 0.0),
+            "std": kr_news.get("std"),
+        },
+        "chart": {
+            "trend": kr_chart.get("kr_trend"),
+            "strength": kr_chart.get("kr_chart_strength"),
+            "sample_count": kr_chart.get("kr_chart_samples", 0),
+        },
+        "vix": vix_block,
+        "fg": fg_block,
+        "atr": {
+            "atr_pct": kr_chart.get("kr_atr_pct"),
+            "sample_count": kr_chart.get("kr_chart_samples", 0),
+        },
+    }
 
-    extras = {**kr_chart, **us_chart, **(fg or {})}
+    us_inputs = {
+        "prev_day": {
+            "return_pct": us_chart.get("us_prev_day_return_pct"),
+            "range_pct": us_chart.get("us_prev_day_range_pct"),
+            "sample_count": us_chart.get("us_chart_samples", 0),
+        },
+        "news": {
+            "sentiment_avg": us_news.get("avg"),
+            "sample_count": us_news.get("count", 0),
+            "coverage": us_news.get("coverage", 0.0),
+            "success_rate": us_news.get("success_rate", 0.0),
+            "std": us_news.get("std"),
+        },
+        "chart": {
+            "trend": us_chart.get("us_trend"),
+            "strength": us_chart.get("us_chart_strength"),
+            "sample_count": us_chart.get("us_chart_samples", 0),
+        },
+        "vix": vix_block,
+        "fg": fg_block,
+        "atr": {
+            "atr_pct": us_chart.get("us_atr_pct"),
+            "sample_count": us_chart.get("us_chart_samples", 0),
+        },
+    }
+
+    kr_inputs = _apply_cached_overrides(
+        base_dir=base_dir,
+        market="KR",
+        ymd=ymd,
+        inputs=kr_inputs,
+        symbols=kr_syms,
+        rep_symbol=kr_rep,
+        news_cap=20,
+    )
+    us_inputs = _apply_cached_overrides(
+        base_dir=base_dir,
+        market="US",
+        ymd=ymd,
+        inputs=us_inputs,
+        symbols=us_syms,
+        rep_symbol=str(us_chart.get("us_rep") or "VOO"),
+        news_cap=10,
+    )
+
+    extras = {
+        "market_inputs_meta": {
+            "kr_rep": kr_rep,
+            "us_rep": us_chart.get("us_rep"),
+            "kr_chart_date": kr_chart.get("kr_chart_date"),
+            "us_chart_date": us_chart.get("us_chart_date"),
+            "kr_chart_tf": kr_chart.get("kr_chart_tf"),
+        }
+    }
 
     out = write_thresholds(
         path=str(base_dir / DEFAULT_PATH),
         base=base,
-        kr_sentiment_avg=kr_avg,
-        us_sentiment_avg=us_avg,
+        kr_inputs=kr_inputs,
+        us_inputs=us_inputs,
         extras=extras,
     )
+
+    scoring = {}
+    try:
+        j = json.loads((base_dir / DEFAULT_PATH).read_text(encoding="utf-8"))
+        scoring = j.get("scoring", {}) if isinstance(j, dict) else {}
+    except Exception:
+        scoring = {}
 
     print(
         json.dumps(
             {
                 "ts_kst": datetime.now().astimezone().isoformat(),
-                "kr_sentiment_avg": kr_avg,
-                "us_sentiment_avg": us_avg,
+                "kr_score": (scoring.get("kr") or {}).get("score"),
+                "us_score": (scoring.get("us") or {}).get("score"),
                 "thresholds": {
                     "kr_scalp": out.kr_scalp,
                     "kr_swing": out.kr_swing,
