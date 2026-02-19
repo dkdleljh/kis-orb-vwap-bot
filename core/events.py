@@ -60,6 +60,10 @@ class Signal:
     """Strategy signal derived from bars/indicators.
 
     This is intentionally minimal; add keys without breaking old logs.
+
+    Added (backward-compatible):
+    - context: optional dict for *explainability* (e.g., close/vwap/rsi/spread/atr).
+      This should never include secrets/PII.
     """
 
     symbol: str
@@ -68,9 +72,10 @@ class Signal:
     reason: str = ""
     model: str = ""
     correlation_id: str = ""
+    context: Optional[Dict[str, Any]] = None
 
     def to_event(self, run_id: Optional[str] = None) -> Event:
-        payload = {
+        payload: Dict[str, Any] = {
             "side": self.side,
             "strength": float(self.strength),
             "reason": self.reason,
@@ -78,6 +83,8 @@ class Signal:
         }
         if self.correlation_id:
             payload["correlation_id"] = self.correlation_id
+        if self.context:
+            payload["context"] = self.context
         return Event.make(
             type="Signal",
             payload=payload,

@@ -1,0 +1,528 @@
+#!/usr/bin/env python3
+"""Generate an end-of-day trading report from logs/events.
+
+Reads
+- logs/events/YYYYMMDD/events.jsonl
+
+Writes
+- reports/trade_report_YYYY-MM-DD.md
+
+Design goals
+- Safe for local + public sharing: never prints account numbers, API keys, tokens.
+- Explainable: includes signal context (if logged), risk-block reasons, and
+  execution slippage estimate (best-effort).
+
+Notes / limitations
+- Realized PnL is computed from matched BUY/SELL fills using FIFO.
+- Unrealized PnL (if open) is estimated using the last Bar1mClosed close.
+- Slippage is estimated by comparing Fill price to the most recent OrderIntent
+  limit_price for the same idempotency_key. Market orders may show N/A.
+- "모듈/소스별" 분류는 correlation_id prefix 기반(best-effort)입니다.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+from collections import Counter, defaultdict, deque
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+@dataclass
+class FillRec:
+    ts: dt.datetime
+    symbol: str
+    side: str
+    qty: int
+    price: float
+    fee: float
+    idempotency_key: str
+    correlation_id: str
+
+
+@dataclass
+class IntentRec:
+    ts: dt.datetime
+    symbol: str
+    side: str
+    qty: int
+    order_type: str
+    limit_price: Optional[float]
+    idempotency_key: str
+    correlation_id: str
+
+
+@dataclass
+class SignalRec:
+    ts: dt.datetime
+    symbol: str
+    side: str
+    strength: float
+    reason: str
+    model: str
+    context: Dict[str, Any]
+
+
+def _parse_ts(s: str) -> dt.datetime:
+    # examples: 2026-02-19T02:07:02.763Z
+    if not s:
+        return dt.datetime.now(dt.timezone.utc)
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    return dt.datetime.fromisoformat(s)
+
+
+def _iter_events(path: Path) -> Iterable[dict]:
+    if not path.exists():
+        return
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except Exception:
+                continue
+
+
+def _kst(dtu: dt.datetime) -> dt.datetime:
+    if dtu.tzinfo is None:
+        return dtu
+    return dtu.astimezone(dt.timezone(dt.timedelta(hours=9)))
+
+
+def _fmt_money_krw(x: float) -> str:
+    return f"{x:,.0f}원"
+
+
+def _fmt_money_usd(x: float) -> str:
+    return f"${x:,.2f}"
+
+
+def _detect_market(symbol: str) -> str:
+    return "KR" if symbol.isdigit() else "US"
+
+
+def _source_from_corr(correlation_id: str) -> str:
+    """Best-effort source tag from correlation_id.
+
+    Examples:
+    - eng_buy_xxx -> eng_buy
+    - kr_entry_xxx -> kr_entry
+    - us_exit_xxx -> us_exit
+    """
+    cid = (correlation_id or "").strip()
+    if not cid:
+        return "unknown"
+    parts = cid.split("_")
+    if len(parts) >= 3:
+        return "_".join(parts[:2])
+    return parts[0]
+
+
+def _fifo_realized_pnl(fills: List[FillRec]) -> Tuple[float, float, Dict[str, Any]]:
+    lots: Deque[Tuple[int, float]] = deque()  # (qty, price)
+    realized = 0.0
+    fees = 0.0
+    buy_qty = sell_qty = 0
+
+    for f in sorted(fills, key=lambda x: x.ts):
+        fees += float(f.fee or 0.0)
+        if f.side.upper() == "BUY":
+            lots.append((f.qty, f.price))
+            buy_qty += f.qty
+        elif f.side.upper() == "SELL":
+            sell_qty += f.qty
+            q = f.qty
+            while q > 0 and lots:
+                lq, lp = lots[0]
+                take = min(q, lq)
+                realized += (f.price - lp) * take
+                lq -= take
+                q -= take
+                if lq <= 0:
+                    lots.popleft()
+                else:
+                    lots[0] = (lq, lp)
+
+    open_qty = sum(q for q, _ in lots)
+    open_avg = (sum(q * p for q, p in lots) / open_qty) if open_qty else 0.0
+
+    return realized, fees, {
+        "buy_qty": buy_qty,
+        "sell_qty": sell_qty,
+        "open_qty": open_qty,
+        "open_avg": open_avg,
+    }
+
+
+def _slippage(intent: Optional[IntentRec], fill: FillRec) -> Optional[float]:
+    """Return signed slippage in price units (best-effort).
+
+    Convention:
+    - BUY: positive means worse (paid higher than intended)
+    - SELL: positive means worse (sold lower than intended)
+    """
+    if intent is None:
+        return None
+    if intent.limit_price is None:
+        return None
+    if fill.side.upper() == "BUY":
+        return float(fill.price) - float(intent.limit_price)
+    if fill.side.upper() == "SELL":
+        return float(intent.limit_price) - float(fill.price)
+    return None
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--date", help="YYYY-MM-DD (KST). default=today", default=None)
+    args = ap.parse_args()
+
+    kst = dt.timezone(dt.timedelta(hours=9))
+    if args.date:
+        day = dt.date.fromisoformat(args.date)
+    else:
+        day = dt.datetime.now(tz=kst).date()
+
+    ymd = day.strftime("%Y%m%d")
+    events_path = ROOT / "logs" / "events" / ymd / "events.jsonl"
+
+    fills_by_symbol: Dict[str, List[FillRec]] = defaultdict(list)
+    fills_by_source: Dict[str, List[FillRec]] = defaultdict(list)
+    intents_by_key: Dict[str, IntentRec] = {}
+    intent_count_by_source: Counter[str] = Counter()
+
+    last_close: Dict[str, float] = {}
+
+    signals: List[SignalRec] = []
+
+    order_submitted = 0
+    order_acks = 0
+
+    risk_allowed = 0
+    risk_blocked = 0
+    risk_block_reasons: Counter[str] = Counter()
+    risk_block_reasons_by_source: Dict[str, Counter[str]] = defaultdict(Counter)
+
+    # --- parse stream ---
+    for ev in _iter_events(events_path):
+        typ = ev.get("type")
+        sym = str(ev.get("symbol") or "").strip()
+        payload = ev.get("payload") or {}
+        ts = _parse_ts(ev.get("ts"))
+
+        if typ == "Bar1mClosed":
+            try:
+                last_close[sym] = float(payload.get("close"))
+            except Exception:
+                pass
+
+        elif typ == "Signal":
+            try:
+                signals.append(
+                    SignalRec(
+                        ts=ts,
+                        symbol=sym,
+                        side=str(payload.get("side") or ""),
+                        strength=float(payload.get("strength") or 0.0),
+                        reason=str(payload.get("reason") or ""),
+                        model=str(payload.get("model") or ""),
+                        context=dict(payload.get("context") or {}),
+                    )
+                )
+            except Exception:
+                pass
+
+        elif typ == "OrderIntent":
+            try:
+                cid = str(payload.get("correlation_id") or "")
+                src = _source_from_corr(cid)
+                intent = IntentRec(
+                    ts=ts,
+                    symbol=sym,
+                    side=str(payload.get("side") or ""),
+                    qty=int(float(payload.get("qty") or 0)),
+                    order_type=str(payload.get("order_type") or ""),
+                    limit_price=(float(payload["limit_price"]) if "limit_price" in payload and payload.get("limit_price") is not None else None),
+                    idempotency_key=str(payload.get("idempotency_key") or ""),
+                    correlation_id=cid,
+                )
+                if intent.idempotency_key:
+                    intents_by_key[intent.idempotency_key] = intent
+                intent_count_by_source[src] += 1
+            except Exception:
+                pass
+
+        elif typ == "RiskDecision":
+            try:
+                allowed = bool(payload.get("allowed"))
+                cid = str(payload.get("correlation_id") or "")
+                src = _source_from_corr(cid)
+                if allowed:
+                    risk_allowed += 1
+                else:
+                    risk_blocked += 1
+                    reason = str(payload.get("reason") or "") or "(empty)"
+                    risk_block_reasons[reason] += 1
+                    risk_block_reasons_by_source[src][reason] += 1
+            except Exception:
+                pass
+
+        elif typ == "OrderSubmitted":
+            order_submitted += 1
+
+        elif typ == "OrderAck":
+            order_acks += 1
+
+        elif typ == "Fill":
+            try:
+                cid = str(payload.get("correlation_id") or "")
+                src = _source_from_corr(cid)
+                fill = FillRec(
+                    ts=ts,
+                    symbol=sym,
+                    side=str(payload.get("side") or ""),
+                    qty=int(float(payload.get("qty") or 0)),
+                    price=float(payload.get("price") or 0),
+                    fee=float(payload.get("fee") or 0),
+                    idempotency_key=str(payload.get("idempotency_key") or ""),
+                    correlation_id=cid,
+                )
+                fills_by_symbol[sym].append(fill)
+                fills_by_source[src].append(fill)
+            except Exception:
+                pass
+
+    # --- build report ---
+    out_dir = ROOT / "reports"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"trade_report_{day.isoformat()}.md"
+
+    traded_symbols = sorted([k for k, v in fills_by_symbol.items() if v])
+
+    lines: List[str] = []
+    lines.append(f"# 일일 거래 리포트 ({day.isoformat()} KST)\n")
+
+    lines.append("## 요약\n")
+    lines.append(f"- Fill(체결) 발생 종목 수: **{len(traded_symbols)}**")
+    lines.append(f"- 주문 의도(OrderIntent): **{sum(intent_count_by_source.values())}**")
+    lines.append(f"- 주문 제출(OrderSubmitted): **{order_submitted}**")
+    lines.append(f"- 주문 접수(OrderAck): **{order_acks}**")
+    lines.append(f"- 리스크 통과/차단: **{risk_allowed} / {risk_blocked}**\n")
+
+    # (1) 소스/모듈별 성과
+    lines.append("## 소스/모듈별 요약(상대 비교용, correlation_id 기반)\n")
+    if not intent_count_by_source and not fills_by_source:
+        lines.append("- (데이터 없음)\n")
+    else:
+        # realized pnl per source (FIFO per symbol inside source)
+        for src in sorted(set(list(intent_count_by_source.keys()) + list(fills_by_source.keys()))):
+            fills = fills_by_source.get(src, [])
+            # group by symbol for fifo
+            realized_total = 0.0
+            fees_total = 0.0
+            symbols = 0
+            for sym in sorted({f.symbol for f in fills}):
+                realized, fees, _ = _fifo_realized_pnl([x for x in fills if x.symbol == sym])
+                realized_total += realized
+                fees_total += fees
+                symbols += 1
+            lines.append(
+                f"- **{src}**: intents={intent_count_by_source.get(src, 0)}, fills={len(fills)}, symbols={symbols}, "
+                f"realized≈{realized_total:,.2f}, fees≈{fees_total:,.2f}"
+            )
+        lines.append("")
+
+    # (2) 리스크 차단 사유 Top N
+    lines.append("## 리스크 차단 사유 TOP (allowed=false)\n")
+    if not risk_block_reasons:
+        lines.append("- (차단 없음)\n")
+    else:
+        for reason, cnt in risk_block_reasons.most_common(10):
+            lines.append(f"- {reason}: **{cnt}**")
+        lines.append("")
+
+    # (3) 실행 품질(슬리피지) 요약
+    lines.append("## 실행 품질(슬리피지) 요약 (Fill vs OrderIntent.limit_price, best-effort)\n")
+    slip_values_kr: List[float] = []
+    slip_values_us: List[float] = []
+    for sym in traded_symbols:
+        for f in fills_by_symbol[sym]:
+            intent = intents_by_key.get(f.idempotency_key)
+            s = _slippage(intent, f)
+            if s is None:
+                continue
+            if _detect_market(sym) == "KR":
+                slip_values_kr.append(float(s))
+            else:
+                slip_values_us.append(float(s))
+
+    def _slip_summary(vals: List[float]) -> str:
+        if not vals:
+            return "N/A"
+        avg = sum(vals) / len(vals)
+        worst = max(vals)
+        best = min(vals)
+        return f"count={len(vals)}, avg={avg:.4f}, best={best:.4f}, worst={worst:.4f}"
+
+    lines.append(f"- KR slippage: { _slip_summary(slip_values_kr) }")
+    lines.append(f"- US slippage: { _slip_summary(slip_values_us) }\n")
+
+    # signals section
+    lines.append("## 시그널 로그(설명 가능한 경우)\n")
+    if not signals:
+        lines.append("- Signal 이벤트가 없습니다.\n")
+    else:
+        # group by symbol and show last few
+        by_sym: Dict[str, List[SignalRec]] = defaultdict(list)
+        for s in signals:
+            by_sym[s.symbol].append(s)
+        for sym in sorted(by_sym.keys()):
+            ss = sorted(by_sym[sym], key=lambda x: x.ts)
+            tail = ss[-5:]
+            lines.append(f"### {sym}\n")
+            for one in tail:
+                t = _kst(one.ts).strftime("%H:%M:%S")
+                ctx = one.context or {}
+                # compact context
+                ctx_keys = ["close", "vwap", "spread_pct", "rsi", "ma20", "ml_score", "atr_percent", "market_regime"]
+                ctx2 = {k: ctx.get(k) for k in ctx_keys if k in ctx}
+                lines.append(f"- {t} {one.side} strength={one.strength:.2f} model={one.model} ctx={ctx2}")
+            lines.append("")
+
+    # Per symbol detail
+    if not traded_symbols:
+        lines.append("## 체결 상세(종목별)\n")
+        lines.append("체결이 없어 상세 내역이 없습니다.\n")
+    else:
+        lines.append("## 체결 상세(종목별)\n")
+        grand_realized_krw = 0.0
+        grand_fees_krw = 0.0
+        grand_realized_usd = 0.0
+        grand_fees_usd = 0.0
+
+        for sym in traded_symbols:
+            fills = fills_by_symbol[sym]
+            market = _detect_market(sym)
+            realized, fees, st = _fifo_realized_pnl(fills)
+
+            open_qty = int(st["open_qty"])
+            open_avg = float(st["open_avg"])
+
+            unreal = 0.0
+            last = last_close.get(sym)
+            if open_qty and last is not None:
+                unreal = (float(last) - open_avg) * open_qty
+
+            if market == "KR":
+                grand_realized_krw += realized
+                grand_fees_krw += fees
+            else:
+                grand_realized_usd += realized
+                grand_fees_usd += fees
+
+            lines.append(f"### {sym} ({market})\n")
+            lines.append(f"- 매수/매도 수량: {st['buy_qty']} / {st['sell_qty']}")
+            lines.append(
+                "- 실현손익(추정, FIFO): "
+                + (_fmt_money_krw(realized) if market == "KR" else _fmt_money_usd(realized))
+            )
+            lines.append(
+                "- 수수료 합계(로그 기준): "
+                + (_fmt_money_krw(fees) if market == "KR" else _fmt_money_usd(fees))
+            )
+
+            if open_qty:
+                if last is None:
+                    lines.append(f"- 미청산 포지션: {open_qty}주(평균 {open_avg:.2f}) / 종가정보 없음")
+                else:
+                    lines.append(
+                        f"- 미청산 포지션: {open_qty}주(평균 {open_avg:.2f}) / 마지막 종가 {last:.2f}"
+                        + " / 미실현손익(추정): "
+                        + (_fmt_money_krw(unreal) if market == "KR" else _fmt_money_usd(unreal))
+                    )
+
+            # slippage per symbol
+            slip_sym: List[float] = []
+            slip_na = 0
+            for f in sorted(fills, key=lambda x: x.ts):
+                intent = intents_by_key.get(f.idempotency_key)
+                s = _slippage(intent, f)
+                if s is None:
+                    slip_na += 1
+                else:
+                    slip_sym.append(float(s))
+            if slip_sym:
+                lines.append(
+                    f"- 슬리피지(추정): count={len(slip_sym)} avg={sum(slip_sym)/len(slip_sym):.4f} best={min(slip_sym):.4f} worst={max(slip_sym):.4f} (N/A {slip_na})"
+                )
+            else:
+                lines.append(f"- 슬리피지(추정): N/A (N/A {slip_na})")
+
+            lines.append("- 체결 타임라인:")
+            for f in sorted(fills, key=lambda x: x.ts):
+                t = _kst(f.ts).strftime("%H:%M:%S")
+                intent = intents_by_key.get(f.idempotency_key)
+                src = _source_from_corr(f.correlation_id)
+                s = _slippage(intent, f)
+                s_txt = "N/A" if s is None else f"{s:+.4f}"
+                lp = None if intent is None else intent.limit_price
+                lp_txt = "-" if lp is None else str(lp)
+                lines.append(
+                    f"  - {t} {f.side.upper()} {f.qty} @ {f.price} fee={f.fee} src={src} intent_lp={lp_txt} slip={s_txt}"
+                )
+            lines.append("")
+
+        lines.append("## 합계\n")
+        lines.append(
+            f"- KR 실현손익(추정): **{_fmt_money_krw(grand_realized_krw)}** / 수수료 **{_fmt_money_krw(grand_fees_krw)}**"
+        )
+        lines.append(
+            f"- US 실현손익(추정): **{_fmt_money_usd(grand_realized_usd)}** / 수수료 **{_fmt_money_usd(grand_fees_usd)}**\n"
+        )
+
+    # quality flags
+    lines.append("## 이상징후(체크)\n")
+    flags: List[str] = []
+
+    # sell-only symbols
+    for sym in traded_symbols:
+        fills = fills_by_symbol[sym]
+        b = sum(f.qty for f in fills if f.side.upper() == "BUY")
+        s = sum(f.qty for f in fills if f.side.upper() == "SELL")
+        if b == 0 and s > 0:
+            flags.append(f"- {sym}: SELL만 존재 (포지션 복구/전일 잔량/로그 누락 가능성 점검)")
+
+    # fee==0 fills
+    zero_fee = 0
+    for sym in traded_symbols:
+        zero_fee += sum(1 for f in fills_by_symbol[sym] if float(f.fee or 0.0) == 0.0)
+    if zero_fee:
+        flags.append(f"- fee=0으로 기록된 Fill이 {zero_fee}건 있음 (수수료 계산/로그 소스 점검)" )
+
+    if flags:
+        lines.extend(flags)
+    else:
+        lines.append("- (특이사항 없음)")
+    lines.append("")
+
+    # tomorrow action (template)
+    lines.append("## 내일 장 대비 액션(템플릿)\n")
+    lines.append("- 리스크 차단 TOP 사유가 'qty=0'이면: 주문가능현금/예산비율/호가 단위/최소수량 확인")
+    lines.append("- 슬리피지가 나쁘면: 지정가/시장가 정책, 호가 스프레드 필터, 재시도 로직 점검")
+    lines.append("- SELL-only 체결이 있으면: 전일 포지션 복구 로직/초기 상태 로딩 점검\n")
+
+    out_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    print(str(out_path))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

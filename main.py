@@ -914,6 +914,17 @@ class TradingEngine:
                             / 100.0,
                             reason="state_machine",
                             model="ml_score_heuristic",
+                            context={
+                                "close": float(bar.close),
+                                "vwap": float(vwap) if vwap is not None else None,
+                                "spread_pct": float(book.spread_pct) if book is not None else None,
+                                "rsi": float(indicators.get("rsi", 0) or 0),
+                                "ma20": float(indicators.get("ma20", 0) or 0),
+                                "ml_score": float(indicators.get("ml_score", 50) or 50),
+                                "atr": float(indicators.get("atr", 0) or 0),
+                                "atr_percent": float(indicators.get("atr_percent", 0) or 0),
+                                "market_regime": str(self.market_regime or ""),
+                            },
                         ).to_event(run_id=self.run_id)
                     )
                 except Exception:
