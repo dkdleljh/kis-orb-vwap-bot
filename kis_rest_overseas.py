@@ -212,7 +212,8 @@ class KISOverseasRestOrders:
             return OrderResult(order_id="", filled_qty=0, status=f"exception: {e}")
 
     async def place_sell_market(self, symbol: str, qty: int) -> OrderResult:
-        return await self.place_sell_order(symbol, qty, price=None, order_type="03")
+        # order_type: 01=market (best-effort; some environments reject 03)
+        return await self.place_sell_order(symbol, qty, price=None, order_type="01")
 
     async def place_sell_order(
         self,
@@ -229,12 +230,11 @@ class KISOverseasRestOrders:
             _validate_positive_number(price, "Price")
 
         url = f"{self.base_url}/uapi/overseas-stock/v1/trading/order"
-        payload = {
+        base_payload = {
             "CANO": self.account.account_no,
             "ACNT_PRDT_CD": self.account.product_code,
             "OVRS_EXCG_CD": self._resolve_exchange(symbol, exchange),
             "PDNO": symbol,
-            "ORD_DVSN": order_type,
             "ORD_QTY": str(qty),
             "OVRS_ORD_UNPR": f"{float(price):.2f}" if price is not None else "0",
             # sell requires SLL_TYPE=00 (legacy sample)
@@ -243,6 +243,12 @@ class KISOverseasRestOrders:
             "MGCO_APTM_ODNO": "",
             "ORD_SVR_DVSN_CD": "0",
         }
+
+        # Some KIS environments accept ORD_DVSN, others expect ORD_DVSN_CD.
+        payload_variants = [
+            {**base_payload, "ORD_DVSN": str(order_type)},
+            {**base_payload, "ORD_DVSN_CD": str(order_type)},
+        ]
 
         headers = await self._auth_headers()
         headers.update({"tr_id": self._get_tr_id("order_sell"), "custtype": "P"})
@@ -253,17 +259,32 @@ class KISOverseasRestOrders:
 
         try:
             session = await self._get_session()
-            body = json.dumps(payload)
-            async with session.post(url, data=body, headers=headers) as resp:
-                data = await resp.json()
 
-            err = self._check_error(data, f"overseas_sell({symbol})")
-            if err:
-                return OrderResult(order_id="", filled_qty=0, status=f"error: {err}")
+            last_err: str | None = None
+            for payload in payload_variants:
+                try:
+                    body = json.dumps(payload)
+                    async with session.post(url, data=body, headers=headers) as resp:
+                        data = await resp.json()
 
-            order_id = (data.get("output", {}) or {}).get("ODNO", "")
-            self.logger.info(f"overseas_sell submitted: {symbol} qty={qty} order_id={order_id}")
-            return OrderResult(order_id=str(order_id), filled_qty=0, status="submitted")
+                    err = self._check_error(data, f"overseas_sell({symbol})")
+                    if err:
+                        last_err = err
+                        # If order-division field name is rejected, try next variant.
+                        if "주문구분" in err or "ORD_DVSN" in err or "INPUT" in err:
+                            continue
+                        return OrderResult(order_id="", filled_qty=0, status=f"error: {err}")
+
+                    order_id = (data.get("output", {}) or {}).get("ODNO", "")
+                    self.logger.info(
+                        f"overseas_sell submitted: {symbol} qty={qty} order_id={order_id}"
+                    )
+                    return OrderResult(order_id=str(order_id), filled_qty=0, status="submitted")
+                except Exception as e:
+                    last_err = str(e)
+                    continue
+
+            return OrderResult(order_id="", filled_qty=0, status=f"error: {last_err or 'Unknown'}")
         except Exception as e:
             self.logger.error(f"overseas_sell exception: {e}")
             return OrderResult(order_id="", filled_qty=0, status=f"exception: {e}")
