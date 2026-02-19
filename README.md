@@ -219,7 +219,42 @@ KRW 기반으로 US 매수여력을 추정하는 모드입니다.
 
 ---
 
-## 12) 주인님 운영 기준(권장 기본 조합)
+## 12) 실전 운영 체크리스트(장 시작 전/중/후)
+
+### 12-1) 장 시작 전(필수)
+- [ ] `STOP_TRADING.flag`가 **의도대로** 설정되어 있는지 확인
+  - 실거래를 막고 싶으면: `touch STOP_TRADING.flag`
+  - 실거래를 허용할 거면: `rm -f STOP_TRADING.flag`
+- [ ] (US) 실주문 게이트 확인
+  - `KIS_US_LIVE_CONFIRM=YES`
+  - `KIS_KILL_SWITCH=0`
+- [ ] 프로세스/로그가 살아있는지 확인
+  - US: `ps -p $(cat .kis_us_pid) -o pid,etime,cmd`
+  - KR: `ps -p $(cat .kis_kr_pid) -o pid,etime,cmd`
+- [ ] 동적 추천 임계값 갱신(권장)
+  - `./venv/bin/python scripts/recommend_thresholds_daily.py`
+  - 결과 파일: `logs/dynamic_thresholds.json`
+- [ ] (선택) 프리장/장전 수집이 정상인지 확인
+  - `data/premarket_us/YYYYMMDD/` / `data/premarket_kr/YYYYMMDD/`
+
+### 12-2) 장중(모니터링)
+- [ ] 주문/시그널 로그 확인
+  - `logs/nohup_us_modules.log` / `logs/nohup_kr_modules.log`
+- [ ] “매수가 안 됨” 상황 점검 순서
+  1) STOP_TRADING.flag
+  2) US 실주문 게이트(US)
+  3) 최대 포지션(`KIS_US_MAX_POSITIONS`)
+  4) 시그널(`US signal`) 존재 여부
+  5) 주문 리젝트/쿨다운 로그
+
+### 12-3) 장 끝/야간(정리)
+- [ ] 필요 시 수동으로 주문 차단(안전)
+  - `touch STOP_TRADING.flag`
+- [ ] 다음 날 대비: `logs/dynamic_thresholds.json` 및 프리장 캐시가 생성되는지 확인
+
+---
+
+## 13) 주인님 운영 기준(권장 기본 조합)
 
 현재 운영(추천값) 기준으로는 아래 조합이 가장 안정적입니다.
 
