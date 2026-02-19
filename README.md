@@ -66,6 +66,7 @@ python main.py
   - 손절/익절
   - 일 손실 한도
   - ATR 기반 스탑/포지션 사이징(설정에 따라)
+  - (추가) **포트폴리오 총 노출 상한**: `trading.max_total_position_pct` (기본 0.60)
 
 ---
 

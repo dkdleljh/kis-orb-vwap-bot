@@ -37,6 +37,7 @@
     "max_consecutive_stop": 3,
     "max_spread_pct": 0.005,
     "entry_retry_limit": 5,
+    "max_total_position_pct": 0.60,
     "use_atr_stops": true,
     "atr_multiplier": 2.0,
     "enable_time_filter": true,

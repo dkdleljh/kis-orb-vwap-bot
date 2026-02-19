@@ -1194,8 +1194,58 @@ class TradingEngine:
                 self.logger.warning("cash query failed (0), using default budget")
                 cash = 1000
 
+            # --- Portfolio-level exposure cap (recommended default: 60%) ---
+            # We approximate total equity as: cash_available_now + current_mark_to_market_exposure.
+            # This is conservative enough for limiting new entries and avoids a separate equity API.
+            max_total_position_pct = 0.60
+            try:
+                max_total_position_pct = float(tcfg.get("max_total_position_pct", 0.60) or 0.60)
+            except Exception:
+                max_total_position_pct = 0.60
+            max_total_position_pct = max(0.05, min(0.95, max_total_position_pct))
+
+            exposure = 0.0
+            try:
+                for p in self._active_positions().values():
+                    px = self.last_price.get(p.symbol)
+                    if not px:
+                        px = float(p.avg_price or 0.0)
+                    exposure += float(px) * int(p.qty)
+            except Exception:
+                exposure = 0.0
+
+            equity_est = float(cash) + float(exposure)
+            cap_amt = float(equity_est) * float(max_total_position_pct)
+            remaining_cap = float(cap_amt) - float(exposure)
+
             budget_pct = self.entry_budget_pct * (0.5 if self.market_regime == "BEAR" else 1.0)
             budget = cash * budget_pct
+
+            # Enforce cap by shrinking budget (or blocking if none left)
+            if remaining_cap <= 0:
+                try:
+                    self.event_store.append(
+                        ievents.RiskDecision(
+                            symbol=symbol,
+                            allowed=False,
+                            reason="portfolio_exposure_cap",
+                            idempotency_key=idempotency_key,
+                            correlation_id=correlation_id,
+                            module="engine_orb_vwap",
+                        ).to_event(run_id=self.run_id)
+                    )
+                except Exception:
+                    pass
+                self.logger.warning(
+                    "entry blocked by portfolio cap: exposure=%.0f cap=%.0f pct=%.2f",
+                    exposure,
+                    cap_amt,
+                    max_total_position_pct,
+                )
+                return
+
+            budget = min(float(budget), float(remaining_cap))
+
             qty = min(int(budget // book.ask), self.max_position_qty)
             if qty <= 0:
                 try:
