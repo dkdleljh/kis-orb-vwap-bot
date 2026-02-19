@@ -28,7 +28,7 @@
   },
 
   "us_trading": {
-    "enabled": false,
+    "enabled": true,
     "timezone": "America/New_York",
     "market_open": "09:30:00",
     "market_close": "16:00:00",
@@ -54,7 +54,7 @@
     "hwanjeon": { "enabled": false },
 
     "us_swing": {
-      "enabled": false,
+      "enabled": true,
       "symbols": ["AAPL", "MSFT", "NVDA", "TSLA", "SCHD"],
       "exchange": "NASD",
       "bar_minutes": 15,
@@ -65,7 +65,7 @@
     },
 
     "mijang": {
-      "enabled": false,
+      "enabled": true,
       "symbols": [],
       "exchange": "NASD",
       "stop_loss_pct": -0.03,
