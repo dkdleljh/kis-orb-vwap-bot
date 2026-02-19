@@ -134,6 +134,8 @@ class KISOverseasRestOrders:
             "nccs": "TTTS3018R" if not is_paper else "VTTS3018R",
             # Reserved order list (US): TTTT3039R
             "resv_list_us": "TTTT3039R" if not is_paper else "VTTT3039R",
+            # Reserved order cancel (US): TTTT3017U
+            "resv_ccnl_us": "TTTT3017U" if not is_paper else "VTTT3017U",
         }
         return tr_id_map.get(endpoint, "TTTP6002E")
 
@@ -462,6 +464,44 @@ class KISOverseasRestOrders:
                 break
 
         return out_rows
+
+    async def order_resv_ccnl_us(
+        self,
+        *,
+        rsvn_ord_rcit_dt: str,
+        ovrs_rsvn_odno: str,
+    ) -> dict:
+        """Cancel US reserved order.
+
+        Endpoint:
+        - /uapi/overseas-stock/v1/trading/order-resv-ccnl
+
+        Required:
+        - RSVN_ORD_RCIT_DT: overseas order receipt date (YYYYMMDD)
+        - OVRS_RSVN_ODNO: reserved order id (ODNO)
+        """
+        url = f"{self.base_url}/uapi/overseas-stock/v1/trading/order-resv-ccnl"
+        payload = {
+            "CANO": self.account.account_no,
+            "ACNT_PRDT_CD": self.account.product_code,
+            "RSVN_ORD_RCIT_DT": str(rsvn_ord_rcit_dt),
+            "OVRS_RSVN_ODNO": str(ovrs_rsvn_odno),
+        }
+
+        headers = await self._auth_headers()
+        headers.update({"tr_id": self._get_tr_id("resv_ccnl_us"), "custtype": "P"})
+        try:
+            headers["hashkey"] = await self.auth.hashkey(payload)
+        except Exception:
+            pass
+
+        session = await self._get_session()
+        async with session.post(url, data=json.dumps(payload), headers=headers) as resp:
+            data = await resp.json()
+
+        # best-effort error logging
+        self._check_error(data, "order_resv_ccnl_us")
+        return data
 
     async def get_day_or_night(self) -> Optional[str]:
         """Return PSBL_YN from dayornight endpoint.
