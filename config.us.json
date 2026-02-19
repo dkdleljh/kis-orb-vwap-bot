@@ -17,6 +17,7 @@
     "max_concurrent_positions": 20,
     "entry_retry_limit": 3,
     "max_total_position_pct": 0.60,
+    "max_symbol_position_pct": 0.08,
     "max_spread_pct": 0.01,
     "scoring": {
       "us_swing_entry_threshold": 68,

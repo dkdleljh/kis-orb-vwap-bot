@@ -28,7 +28,8 @@
     "max_consecutive_stop": 2,
     "max_spread_pct": 0.003,
     "entry_retry_limit": 3,
-    "max_total_position_pct": 0.60
+    "max_total_position_pct": 0.60,
+    "max_symbol_position_pct": 0.08
   },
   "time_rules": {
     "observe_start": "09:05:00",

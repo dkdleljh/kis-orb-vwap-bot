@@ -1246,6 +1246,53 @@ class TradingEngine:
 
             budget = min(float(budget), float(remaining_cap))
 
+            # --- Per-symbol exposure cap (recommended default: 8%) ---
+            # Limit *resulting* symbol exposure after this entry.
+            max_symbol_position_pct = 0.08
+            try:
+                max_symbol_position_pct = float(tcfg.get("max_symbol_position_pct", 0.08) or 0.08)
+            except Exception:
+                max_symbol_position_pct = 0.08
+            max_symbol_position_pct = max(0.01, min(0.50, max_symbol_position_pct))
+
+            existing_sym_exposure = 0.0
+            try:
+                p0 = self.state_machine.get_position(symbol)
+                if p0 is not None:
+                    px0 = self.last_price.get(symbol)
+                    if not px0:
+                        px0 = float(p0.avg_price or 0.0)
+                    existing_sym_exposure = float(px0) * int(p0.qty)
+            except Exception:
+                existing_sym_exposure = 0.0
+
+            sym_cap_amt = float(equity_est) * float(max_symbol_position_pct)
+            sym_remaining = float(sym_cap_amt) - float(existing_sym_exposure)
+            if sym_remaining <= 0:
+                try:
+                    self.event_store.append(
+                        ievents.RiskDecision(
+                            symbol=symbol,
+                            allowed=False,
+                            reason="symbol_exposure_cap",
+                            idempotency_key=idempotency_key,
+                            correlation_id=correlation_id,
+                            module="engine_orb_vwap",
+                        ).to_event(run_id=self.run_id)
+                    )
+                except Exception:
+                    pass
+                self.logger.warning(
+                    "entry blocked by symbol cap: symbol=%s exposure=%.0f cap=%.0f pct=%.2f",
+                    symbol,
+                    existing_sym_exposure,
+                    sym_cap_amt,
+                    max_symbol_position_pct,
+                )
+                return
+
+            budget = min(float(budget), float(sym_remaining))
+
             qty = min(int(budget // book.ask), self.max_position_qty)
             if qty <= 0:
                 try:
