@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import statistics
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,6 +45,7 @@ class FillRec:
     idempotency_key: str
     correlation_id: str
     module: str
+    broker_order_id: str
 
 
 @dataclass
@@ -67,6 +69,17 @@ class SignalRec:
     strength: float
     reason: str
     model: str
+    context: Dict[str, Any]
+
+
+@dataclass
+class RiskDecisionRec:
+    ts: dt.datetime
+    symbol: str
+    allowed: bool
+    reason: str
+    correlation_id: str
+    module: str
     context: Dict[str, Any]
 
 
@@ -241,6 +254,8 @@ def main() -> int:
     risk_blocked = 0
     risk_block_reasons: Counter[str] = Counter()
     risk_block_reasons_by_source: Dict[str, Counter[str]] = defaultdict(Counter)
+    risk_decisions: List[RiskDecisionRec] = []
+    restored_symbols: set[str] = set()
 
     # --- parse stream ---
     for ev in _iter_events(events_path):
@@ -297,6 +312,17 @@ def main() -> int:
                 allowed = bool(payload.get("allowed"))
                 cid = str(payload.get("correlation_id") or "")
                 src = _source_from_corr(cid)
+                risk_decisions.append(
+                    RiskDecisionRec(
+                        ts=ts,
+                        symbol=sym,
+                        allowed=allowed,
+                        reason=str(payload.get("reason") or "") or "(empty)",
+                        correlation_id=cid,
+                        module=str(payload.get("module") or "") or "unknown",
+                        context=dict(payload.get("context") or {}),
+                    )
+                )
                 if allowed:
                     risk_allowed += 1
                 else:
@@ -327,11 +353,25 @@ def main() -> int:
                     idempotency_key=str(payload.get("idempotency_key") or ""),
                     correlation_id=cid,
                     module=str(payload.get("module") or "") or "unknown",
+                    broker_order_id=str(payload.get("broker_order_id") or ""),
                 )
                 fills_by_symbol[sym].append(fill)
                 fills_by_source[src].append(fill)
             except Exception:
                 pass
+
+        elif typ == "PositionSnapshot":
+            try:
+                trigger = str(payload.get("trigger") or "").lower()
+                qty = int(float(payload.get("qty") or 0))
+                if trigger == "restore" and qty > 0 and sym:
+                    restored_symbols.add(sym)
+            except Exception:
+                pass
+
+        elif typ == "PositionRestored":
+            if sym:
+                restored_symbols.add(sym)
 
     # --- build report ---
     out_dir = ROOT / "reports"
@@ -380,6 +420,78 @@ def main() -> int:
     else:
         for reason, cnt in risk_block_reasons.most_common(10):
             lines.append(f"- {reason}: **{cnt}**")
+        lines.append("")
+
+    # (2-1) qty=0 numeric context breakdown
+    lines.append("## qty=0 차단 원인 분해 (RiskDecision.context 기반)\n")
+    qty0_recs = [r for r in risk_decisions if (not r.allowed) and r.reason == "qty=0"]
+    if not qty0_recs:
+        lines.append("- qty=0 차단이 없습니다.\n")
+    else:
+        cause_counter: Counter[str] = Counter()
+        med_fields = [
+            "cash",
+            "equity_est",
+            "exposure",
+            "remaining_cap",
+            "sym_remaining",
+            "reserve_amt",
+            "budget",
+            "ask",
+            "min_score",
+        ]
+        med_vals: Dict[str, List[float]] = {k: [] for k in med_fields}
+
+        for rec in qty0_recs:
+            c = rec.context or {}
+
+            def _f(key: str) -> Optional[float]:
+                try:
+                    v = c.get(key)
+                    if v is None:
+                        return None
+                    return float(v)
+                except Exception:
+                    return None
+
+            remaining_cap = _f("remaining_cap")
+            sym_remaining = _f("sym_remaining")
+            cash = _f("cash")
+            reserve_amt = _f("reserve_amt")
+            budget = _f("budget")
+            ask = _f("ask")
+
+            if remaining_cap is not None and remaining_cap <= 0:
+                cause_counter["remaining_cap<=0"] += 1
+            elif sym_remaining is not None and sym_remaining <= 0:
+                cause_counter["sym_remaining<=0"] += 1
+            elif cash is not None and reserve_amt is not None and cash <= reserve_amt:
+                cause_counter["cash<=reserve_amt"] += 1
+            elif budget is not None and ask is not None and budget < ask:
+                cause_counter["budget<ask"] += 1
+            elif budget is not None and budget <= 0:
+                cause_counter["budget<=0"] += 1
+            elif not c:
+                cause_counter["missing_context"] += 1
+            else:
+                cause_counter["other"] += 1
+
+            for key in med_fields:
+                x = _f(key)
+                if x is not None:
+                    med_vals[key].append(x)
+
+        for k, v in cause_counter.most_common():
+            lines.append(f"- {k}: **{v}**")
+        lines.append("")
+
+        lines.append("| metric | median |")
+        lines.append("|---|---:|")
+        for key in med_fields:
+            vals = med_vals[key]
+            if not vals:
+                continue
+            lines.append(f"| {key} | {statistics.median(vals):,.4f} |")
         lines.append("")
 
     # (3) 실행 품질(슬리피지) 요약
@@ -636,9 +748,23 @@ def main() -> int:
             f"- US 실현손익(추정): **{_fmt_money_usd(grand_realized_usd)}** / 수수료 **{_fmt_money_usd(grand_fees_usd)}**\n"
         )
 
+    # reconciliation
+    lines.append("## 정합성 점검\n")
+    total_fills = sum(len(v) for v in fills_by_symbol.values())
+    total_intents = sum(intent_count_by_source.values())
+    lines.append(
+        f"- 주문/체결 카운트: intents={total_intents}, submitted={order_submitted}, ack={order_acks}, fills={total_fills}"
+    )
+    if order_submitted and order_acks < order_submitted:
+        lines.append("- 경고: OrderAck 수가 OrderSubmitted보다 적습니다(수집 지연/누락 가능성).")
+    if total_intents and total_fills == 0:
+        lines.append("- 경고: OrderIntent는 있으나 Fill이 없습니다(미체결/로그 누락 가능성).")
+    lines.append("")
+
     # quality flags
     lines.append("## 이상징후(체크)\n")
     flags: List[str] = []
+    info_notes: List[str] = []
 
     # sell-only symbols
     for sym in traded_symbols:
@@ -646,19 +772,41 @@ def main() -> int:
         b = sum(f.qty for f in fills if f.side.upper() == "BUY")
         s = sum(f.qty for f in fills if f.side.upper() == "SELL")
         if b == 0 and s > 0:
-            flags.append(f"- {sym}: SELL만 존재 (포지션 복구/전일 잔량/로그 누락 가능성 점검)")
+            if sym in restored_symbols:
+                info_notes.append(
+                    f"- {sym}: SELL만 존재하지만 장시작 포지션 복구 이벤트가 있어 정상 종료 가능성이 높음"
+                )
+            else:
+                flags.append(f"- {sym}: SELL만 존재 (포지션 복구/전일 잔량/로그 누락 가능성 점검)")
 
-    # fee==0 fills
+    # fee==0 fills (paper vs live 분리)
     zero_fee = 0
+    zero_fee_paper = 0
+    zero_fee_live = 0
     for sym in traded_symbols:
-        zero_fee += sum(1 for f in fills_by_symbol[sym] if float(f.fee or 0.0) == 0.0)
+        for f in fills_by_symbol[sym]:
+            if float(f.fee or 0.0) != 0.0:
+                continue
+            zero_fee += 1
+            if str(f.broker_order_id).upper() == "PAPER":
+                zero_fee_paper += 1
+            else:
+                zero_fee_live += 1
     if zero_fee:
-        flags.append(f"- fee=0으로 기록된 Fill이 {zero_fee}건 있음 (수수료 계산/로그 소스 점검)" )
+        info_notes.append(
+            f"- fee=0 Fill: 총 {zero_fee}건 (paper={zero_fee_paper}, live/unknown={zero_fee_live})"
+        )
+    if zero_fee_live:
+        flags.append(f"- live/unknown fee=0 Fill이 {zero_fee_live}건 있음 (수수료 계산/로그 소스 점검)")
 
     if flags:
         lines.extend(flags)
     else:
         lines.append("- (특이사항 없음)")
+    if info_notes:
+        lines.append("")
+        lines.append("참고:")
+        lines.extend(info_notes)
     lines.append("")
 
     # tomorrow action (template)

@@ -388,6 +388,7 @@ class TradingEngine:
         self._exit_inflight: set[str] = set()
         # Entry pacing guardrail: store recent entry timestamps (epoch seconds)
         self._entry_ts = deque(maxlen=5000)
+        self._last_signal_context_by_symbol: Dict[str, Dict[str, Any]] = {}
 
         # Daily baseline capture marker (for daily return reporting)
         self._baseline_written_ymd = ""
@@ -595,10 +596,22 @@ class TradingEngine:
             # [PHASE4] Best-effort snapshot on restore (startup/resume trigger)
             try:
                 for pos in restored.values():
+                    cash = 0.0
                     if self.ledger is not None:
                         lp = self.ledger.get_position(str(pos.symbol))
                         lp.qty = int(pos.qty)
                         lp.avg_price = float(pos.avg_price)
+                        cash = float(self.ledger.cash)
+                    self._append_event(
+                        ievents.PositionRestored(
+                            symbol=str(pos.symbol),
+                            qty=int(pos.qty),
+                            avg_price=float(pos.avg_price),
+                            cash=float(cash),
+                            equity=None,
+                            note="startup_restore",
+                        ).to_event(run_id=self.run_id)
+                    )
                     self._record_position_snapshot(str(pos.symbol), trigger="restore")
             except Exception:
                 pass
@@ -992,6 +1005,25 @@ class TradingEngine:
                 self.logger.info(
                     f"signal {signal.symbol} close={bar.close} vwap={vwap} rsi={indicators.get('rsi', 0):.1f} ma20={indicators.get('ma20', 0):.0f}"
                 )
+                signal_context = {
+                    "module": "engine_orb_vwap",
+                    "idempotency_key": signal_idempotency,
+                    "correlation_id": signal_corr_id,
+                    "close": float(bar.close),
+                    "vwap": float(vwap) if vwap is not None else None,
+                    "spread_pct": float(book.spread_pct) if book is not None else None,
+                    "rsi": float(indicators.get("rsi", 0) or 0),
+                    "ma20": float(indicators.get("ma20", 0) or 0),
+                    "ml_score": float(indicators.get("ml_score", 50) or 50),
+                    "score": float(getattr(signal, "score", 0.0) or 0.0),
+                    "min_score": float(min_score),
+                    "reasons": list(getattr(signal, "reasons", []) or []),
+                    "reason_short": ",".join(list(getattr(signal, "reasons", []) or [])[:6]),
+                    "atr": float(indicators.get("atr", 0) or 0),
+                    "atr_percent": float(indicators.get("atr_percent", 0) or 0),
+                    "market_regime": str(self.market_regime or ""),
+                }
+                self._last_signal_context_by_symbol[signal_symbol] = dict(signal_context)
                 try:
                     self.event_store.append(
                         ievents.Signal(
@@ -1002,24 +1034,7 @@ class TradingEngine:
                             reason="state_machine",
                             model="ml_score_heuristic",
                             correlation_id=signal_corr_id,
-                            context={
-                                "module": "engine_orb_vwap",
-                                "idempotency_key": signal_idempotency,
-                                "correlation_id": signal_corr_id,
-                                "close": float(bar.close),
-                                "vwap": float(vwap) if vwap is not None else None,
-                                "spread_pct": float(book.spread_pct) if book is not None else None,
-                                "rsi": float(indicators.get("rsi", 0) or 0),
-                                "ma20": float(indicators.get("ma20", 0) or 0),
-                                "ml_score": float(indicators.get("ml_score", 50) or 50),
-                                "score": float(getattr(signal, "score", 0.0) or 0.0),
-                                "min_score": float(min_score),
-                                "reasons": list(getattr(signal, "reasons", []) or []),
-                                "reason_short": ",".join(list(getattr(signal, "reasons", []) or [])[:6]),
-                                "atr": float(indicators.get("atr", 0) or 0),
-                                "atr_percent": float(indicators.get("atr_percent", 0) or 0),
-                                "market_regime": str(self.market_regime or ""),
-                            },
+                            context=signal_context,
                         ).to_event(run_id=self.run_id)
                     )
                 except Exception:
@@ -1087,6 +1102,48 @@ class TradingEngine:
             )
         except Exception:
             self._error_counts["snapshot_event"] += 1
+
+    def _build_risk_context(
+        self,
+        *,
+        signal: Signal,
+        book: OrderBookTop,
+        cash: float | None = None,
+        equity_est: float | None = None,
+        exposure: float | None = None,
+        remaining_cap: float | None = None,
+        sym_remaining: float | None = None,
+        reserve_amt: float | None = None,
+        budget_pct: float | None = None,
+        budget: float | None = None,
+        max_total_position_pct: float | None = None,
+        max_symbol_position_pct: float | None = None,
+    ) -> dict[str, Any]:
+        ctx: Dict[str, Any] = {}
+        sig_ctx = self._last_signal_context_by_symbol.get(str(signal.symbol), {})
+        numeric_fields = {
+            "cash": cash,
+            "equity_est": equity_est,
+            "exposure": exposure,
+            "remaining_cap": remaining_cap,
+            "sym_remaining": sym_remaining,
+            "reserve_amt": reserve_amt,
+            "budget_pct": budget_pct,
+            "budget": budget,
+            "ask": float(getattr(book, "ask", 0.0) or 0.0),
+            "max_total_position_pct": max_total_position_pct,
+            "max_symbol_position_pct": max_symbol_position_pct,
+            "cash_reserve_pct": float(self.cash_reserve_pct),
+            "max_new_entries_per_minute": int(self.max_new_entries_per_minute),
+            "min_score": sig_ctx.get("min_score"),
+            "market_regime": str(self.market_regime or ""),
+        }
+        for k, v in numeric_fields.items():
+            if isinstance(v, (int, float)):
+                ctx[k] = float(v) if isinstance(v, float) else int(v)
+            else:
+                ctx[k] = v
+        return ctx
 
     def _make_idempotency_key(
         self, symbol: str, side: str, *, bar_start: datetime | None = None
@@ -1164,6 +1221,18 @@ class TradingEngine:
             self._entry_inflight.add(symbol)
 
         try:
+            tcfg = self.config.get("trading", {}) or {}
+            cash = 0.0
+            exposure = 0.0
+            equity_est = 0.0
+            remaining_cap = 0.0
+            sym_remaining = 0.0
+            reserve_amt = 0.0
+            budget_pct = float(self.entry_budget_pct)
+            budget = 0.0
+            max_total_position_pct = 0.60
+            max_symbol_position_pct = 0.08
+
             # --- Entry pacing guardrail (recommended default: 2 entries/min) ---
             try:
                 now_s = time.time()
@@ -1180,6 +1249,20 @@ class TradingEngine:
                                 idempotency_key=idempotency_key,
                                 correlation_id=correlation_id,
                                 module="engine_orb_vwap",
+                                context=self._build_risk_context(
+                                    signal=signal,
+                                    book=book,
+                                    cash=cash,
+                                    equity_est=equity_est,
+                                    exposure=exposure,
+                                    remaining_cap=remaining_cap,
+                                    sym_remaining=sym_remaining,
+                                    reserve_amt=reserve_amt,
+                                    budget_pct=budget_pct,
+                                    budget=budget,
+                                    max_total_position_pct=max_total_position_pct,
+                                    max_symbol_position_pct=max_symbol_position_pct,
+                                ),
                             ).to_event(run_id=self.run_id)
                         )
                     except Exception:
@@ -1276,6 +1359,20 @@ class TradingEngine:
                             idempotency_key=idempotency_key,
                             correlation_id=correlation_id,
                             module="engine_orb_vwap",
+                            context=self._build_risk_context(
+                                signal=signal,
+                                book=book,
+                                cash=cash,
+                                equity_est=equity_est,
+                                exposure=exposure,
+                                remaining_cap=remaining_cap,
+                                sym_remaining=sym_remaining,
+                                reserve_amt=reserve_amt,
+                                budget_pct=budget_pct,
+                                budget=budget,
+                                max_total_position_pct=max_total_position_pct,
+                                max_symbol_position_pct=max_symbol_position_pct,
+                            ),
                         ).to_event(run_id=self.run_id)
                     )
                 except Exception:
@@ -1301,6 +1398,20 @@ class TradingEngine:
                             idempotency_key=idempotency_key,
                             correlation_id=correlation_id,
                             module="engine_orb_vwap",
+                            context=self._build_risk_context(
+                                signal=signal,
+                                book=book,
+                                cash=cash,
+                                equity_est=equity_est,
+                                exposure=exposure,
+                                remaining_cap=remaining_cap,
+                                sym_remaining=sym_remaining,
+                                reserve_amt=reserve_amt,
+                                budget_pct=budget_pct,
+                                budget=budget,
+                                max_total_position_pct=max_total_position_pct,
+                                max_symbol_position_pct=max_symbol_position_pct,
+                            ),
                         ).to_event(run_id=self.run_id)
                     )
                 except Exception:
@@ -1347,6 +1458,20 @@ class TradingEngine:
                             idempotency_key=idempotency_key,
                             correlation_id=correlation_id,
                             module="engine_orb_vwap",
+                            context=self._build_risk_context(
+                                signal=signal,
+                                book=book,
+                                cash=cash,
+                                equity_est=equity_est,
+                                exposure=exposure,
+                                remaining_cap=remaining_cap,
+                                sym_remaining=sym_remaining,
+                                reserve_amt=reserve_amt,
+                                budget_pct=budget_pct,
+                                budget=budget,
+                                max_total_position_pct=max_total_position_pct,
+                                max_symbol_position_pct=max_symbol_position_pct,
+                            ),
                         ).to_event(run_id=self.run_id)
                     )
                 except Exception:
@@ -1373,6 +1498,20 @@ class TradingEngine:
                             idempotency_key=idempotency_key,
                             correlation_id=correlation_id,
                             module="engine_orb_vwap",
+                            context=self._build_risk_context(
+                                signal=signal,
+                                book=book,
+                                cash=cash,
+                                equity_est=equity_est,
+                                exposure=exposure,
+                                remaining_cap=remaining_cap,
+                                sym_remaining=sym_remaining,
+                                reserve_amt=reserve_amt,
+                                budget_pct=budget_pct,
+                                budget=budget,
+                                max_total_position_pct=max_total_position_pct,
+                                max_symbol_position_pct=max_symbol_position_pct,
+                            ),
                         ).to_event(run_id=self.run_id)
                     )
                 except Exception:

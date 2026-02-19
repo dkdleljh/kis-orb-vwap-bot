@@ -56,6 +56,16 @@ cp .env.example .env
 python main.py
 ```
 
+### KIS Daily Trade Report (cron 예시)
+
+```bash
+python scripts/daily_trade_report.py --date "$(date +%F)"
+python scripts/recommend_next_day.py --date "$(date +%F)"
+python scripts/verify_next_day_prep.py --date "$(date +%F)"
+```
+
+- cron 알림에서는 마지막 줄 `KIS Daily Trade Report Verification: PASS|FAIL ...` 요약 라인을 확인하세요.
+
 ---
 
 ## 2) 주요 개념

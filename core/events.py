@@ -137,6 +137,7 @@ class RiskDecision:
     idempotency_key: str = ""
     correlation_id: str = ""
     module: str = ""  # human-friendly strategy/module tag
+    context: Optional[Dict[str, Any]] = None
 
     def to_event(self, run_id: Optional[str] = None) -> Event:
         payload: Dict[str, Any] = {
@@ -148,6 +149,8 @@ class RiskDecision:
             payload["correlation_id"] = self.correlation_id
         if self.module:
             payload["module"] = self.module
+        if self.context:
+            payload["context"] = self.context
         return Event.make(
             type="RiskDecision",
             payload=payload,
@@ -274,6 +277,37 @@ class PositionSnapshot:
 
         return Event.make(
             type="PositionSnapshot",
+            payload=payload,
+            symbol=self.symbol,
+            run_id=run_id,
+        )
+
+
+@dataclass(frozen=True)
+class PositionRestored:
+    """Broker position restored at startup without synthetic fills."""
+
+    symbol: str
+    qty: int
+    avg_price: float
+    cash: float = 0.0
+    equity: Optional[float] = None
+    note: str = ""
+    correlation_id: str = ""
+
+    def to_event(self, run_id: Optional[str] = None) -> Event:
+        payload: Dict[str, Any] = {
+            "qty": int(self.qty),
+            "avg_price": float(self.avg_price),
+            "cash": float(self.cash),
+            "equity": self.equity,
+        }
+        if self.note:
+            payload["note"] = self.note
+        if self.correlation_id:
+            payload["correlation_id"] = self.correlation_id
+        return Event.make(
+            type="PositionRestored",
             payload=payload,
             symbol=self.symbol,
             run_id=run_id,
