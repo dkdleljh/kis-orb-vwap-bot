@@ -39,6 +39,8 @@
     "entry_retry_limit": 5,
     "max_total_position_pct": 0.60,
     "max_symbol_position_pct": 0.08,
+    "cash_reserve_pct": 0.20,
+    "max_new_entries_per_minute": 2,
     "use_atr_stops": true,
     "atr_multiplier": 2.0,
     "enable_time_filter": true,

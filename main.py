@@ -170,6 +170,12 @@ class TradingEngine:
         )
         self.atr_multiplier_sl = float(tcfg.get("atr_multiplier", 2.0))
 
+        # Portfolio safety (recommended defaults)
+        self.cash_reserve_pct = float(tcfg.get("cash_reserve_pct", 0.20))
+        self.cash_reserve_pct = max(0.0, min(0.80, self.cash_reserve_pct))
+        self.max_new_entries_per_minute = int(tcfg.get("max_new_entries_per_minute", 2))
+        self.max_new_entries_per_minute = max(1, min(60, self.max_new_entries_per_minute))
+
         max_entries = int(tcfg.get("max_entries_per_day", 10))
         daily_loss_limit = float(tcfg.get("daily_loss_limit_pct", -0.05))
         max_consecutive_stop = int(tcfg.get("max_consecutive_stop", 3))
@@ -380,6 +386,8 @@ class TradingEngine:
         self._trade_lock = asyncio.Lock()
         self._entry_inflight: set[str] = set()
         self._exit_inflight: set[str] = set()
+        # Entry pacing guardrail: store recent entry timestamps (epoch seconds)
+        self._entry_ts = deque(maxlen=5000)
         self.logger.info(
             "Execution mode: live_enabled=%s confirmed=%s active_live=%s max_qty=%s max_trades/day=%s max_positions=%s",
             self.live_enabled,
@@ -1152,6 +1160,35 @@ class TradingEngine:
             self._entry_inflight.add(symbol)
 
         try:
+            # --- Entry pacing guardrail (recommended default: 2 entries/min) ---
+            try:
+                now_s = time.time()
+                # purge older than 60s (deque is in time order)
+                while self._entry_ts and (now_s - float(self._entry_ts[0])) > 60.0:
+                    self._entry_ts.popleft()
+                if len(self._entry_ts) >= int(self.max_new_entries_per_minute):
+                    try:
+                        self.event_store.append(
+                            ievents.RiskDecision(
+                                symbol=symbol,
+                                allowed=False,
+                                reason="entry_rate_limit",
+                                idempotency_key=idempotency_key,
+                                correlation_id=correlation_id,
+                                module="engine_orb_vwap",
+                            ).to_event(run_id=self.run_id)
+                        )
+                    except Exception:
+                        pass
+                    self.logger.warning(
+                        "entry blocked by rate limit: %s entries/60s (limit=%s)",
+                        len(self._entry_ts),
+                        self.max_new_entries_per_minute,
+                    )
+                    return
+            except Exception:
+                pass
+
             if symbol != self.symbol_inverse:
                 try:
                     news_result = await asyncio.wait_for(
@@ -1220,6 +1257,34 @@ class TradingEngine:
 
             budget_pct = self.entry_budget_pct * (0.5 if self.market_regime == "BEAR" else 1.0)
             budget = cash * budget_pct
+
+            # --- Cash reserve guardrail (recommended default: 20%) ---
+            # Keep a minimum cash buffer so multi-position mode does not fully deploy capital.
+            reserve_amt = float(equity_est) * float(self.cash_reserve_pct)
+            cash_budget_cap = float(cash) - float(reserve_amt)
+            if cash_budget_cap <= 0:
+                try:
+                    self.event_store.append(
+                        ievents.RiskDecision(
+                            symbol=symbol,
+                            allowed=False,
+                            reason="cash_reserve",
+                            idempotency_key=idempotency_key,
+                            correlation_id=correlation_id,
+                            module="engine_orb_vwap",
+                        ).to_event(run_id=self.run_id)
+                    )
+                except Exception:
+                    pass
+                self.logger.warning(
+                    "entry blocked by cash reserve: cash=%.0f reserve=%.0f pct=%.2f",
+                    cash,
+                    reserve_amt,
+                    self.cash_reserve_pct,
+                )
+                return
+
+            budget = min(float(budget), float(cash_budget_cap))
 
             # Enforce cap by shrinking budget (or blocking if none left)
             if remaining_cap <= 0:
@@ -1407,6 +1472,10 @@ class TradingEngine:
                     self._error_counts["oms_entry"] += 1
 
             self.risk.record_entry()
+            try:
+                self._entry_ts.append(time.time())
+            except Exception:
+                pass
             self.trades_today += 1
             self.trades_today_by_symbol[symbol] += 1
             if is_kr:

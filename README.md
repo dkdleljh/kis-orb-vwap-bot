@@ -68,6 +68,8 @@ python main.py
   - ATR 기반 스탑/포지션 사이징(설정에 따라)
   - (추가) **포트폴리오 총 노출 상한**: `trading.max_total_position_pct` (기본 0.60)
   - (추가) **종목별 노출 상한**: `trading.max_symbol_position_pct` (기본 0.08)
+  - (추가) **현금 최소 보유 비율**: `trading.cash_reserve_pct` (기본 0.20)
+  - (추가) **신규 진입 속도 제한**: `trading.max_new_entries_per_minute` (기본 2)
 
 ---
 
