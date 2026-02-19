@@ -18,7 +18,7 @@ Env overrides:
 
 Safety:
 - Respects STOP_TRADING.flag (killswitch)
-- Only submits one reserved order
+- Avoids repeated submissions by keeping state in data/us_resv_tp_state.json
 """
 
 from __future__ import annotations
@@ -38,11 +38,38 @@ except Exception:  # pragma: no cover
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+STATE_PATH = ROOT / "data" / "us_resv_tp_state.json"
+
 from kis_auth import KISAuth, load_auth_from_env
 from kis_rest_orders import AccountInfo
 from kis_rest_overseas import KISOverseasRestOrders
 from logger import setup_logger
 from core.audit_log import audit_decision
+
+
+def _read_state() -> dict:
+    try:
+        if STATE_PATH.exists():
+            return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return {}
+
+
+def _write_state(state: dict) -> None:
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(STATE_PATH)
+
+
+def _to_int(v) -> int:
+    try:
+        if v is None or v == "":
+            return 0
+        return int(float(v))
+    except Exception:
+        return 0
 
 
 def _load_dotenv_like(path: Path) -> None:
@@ -79,16 +106,23 @@ async def _sleep_until_kst(target_t: time) -> None:
         await asyncio.sleep(min(60.0, (target - now).total_seconds()))
 
 
-async def _get_schd_position(rest: KISOverseasRestOrders) -> tuple[int, float] | None:
-    pos = await rest.get_balance()
-    if not isinstance(pos, list):
+async def _get_schd_position(rest: KISOverseasRestOrders) -> tuple[int, float, str, int] | None:
+    """Return (qty, avg, exchange, ord_psbl_qty) for SCHD best-effort."""
+    raw = await rest.get_balance_raw(exchange=rest.exchange)
+    if not isinstance(raw, dict):
         return None
-    for r in pos:
-        if str(r.get("ovrs_pdno") or "").upper() == "SCHD":
-            qty = int(float(r.get("ovrs_cblc_qty") or 0))
-            avg = float(r.get("pchs_avg_pric") or 0)
-            if qty > 0 and avg > 0:
-                return qty, avg
+    out1 = raw.get("output1")
+    if not isinstance(out1, list):
+        return None
+    for r in out1:
+        if str(r.get("ovrs_pdno") or "").upper() != "SCHD":
+            continue
+        qty = _to_int(r.get("ovrs_cblc_qty"))
+        avg = float(r.get("pchs_avg_pric") or 0)
+        ex = str(r.get("ovrs_excg_cd") or rest.exchange or "").strip().upper()
+        ord_psbl = _to_int(r.get("ord_psbl_qty"))
+        if qty > 0 and avg > 0:
+            return qty, avg, ex, ord_psbl
     return None
 
 
@@ -130,6 +164,7 @@ async def main() -> int:
     _load_dotenv_like(ROOT / ".env")
 
     symbol = os.environ.get("SYMBOL", "SCHD").strip().upper()
+    # Default exchange is best-effort; we will override with the exchange from balance row.
     exchange = os.environ.get("EXCHANGE", "AMEX").strip().upper()
     tp_pct = float(os.environ.get("TP_PCT", "0.015") or 0.015)
 
@@ -149,8 +184,32 @@ async def main() -> int:
         if not pos:
             print("NO_POSITION")
             return 0
-        qty, avg = pos
+        qty, avg, ex_from_row, ord_psbl_qty = pos
+        if ex_from_row:
+            exchange = ex_from_row
+
+        # If ord_psbl_qty is 0, reserved order is likely to fail or be meaningless.
+        if int(ord_psbl_qty) <= 0:
+            print(f"SKIP_NOT_ORDERABLE ord_psbl_qty={ord_psbl_qty} exchange={exchange}")
+            return 0
+
         tp = round(avg * (1.0 + tp_pct) + 1e-9, 2)
+
+        # De-dup submissions: if we've already submitted the same TP today, skip.
+        st = _read_state()
+        today = _now_kst().date().isoformat()
+        last = (st.get("last") or {}) if isinstance(st, dict) else {}
+        if (
+            last.get("date") == today
+            and str(last.get("symbol")) == symbol
+            and str(last.get("exchange")) == exchange
+            and int(last.get("qty") or 0) == int(qty)
+            and float(last.get("tp") or 0.0) == float(tp)
+            and str(last.get("result")) == "submitted"
+        ):
+            print("SKIP_ALREADY_SUBMITTED")
+            return 0
+
         from core.correlation import new_corr
         corr = new_corr("us_exit")
         audit_decision(
@@ -160,9 +219,9 @@ async def main() -> int:
             market="US",
             style="SWING",
             side="SELL",
-            extra={"reason": "take_profit_reserved", "qty": int(qty), "avg": float(avg), "tp": float(tp), "tp_pct": float(tp_pct), "exchange": exchange},
+            extra={"reason": "take_profit_reserved", "qty": int(qty), "avg": float(avg), "tp": float(tp), "tp_pct": float(tp_pct), "exchange": exchange, "ord_psbl_qty": int(ord_psbl_qty)},
         )
-        print(f"POSITION {symbol} qty={qty} avg={avg} -> TP={tp} (tp_pct={tp_pct})")
+        print(f"POSITION {symbol} qty={qty} avg={avg} -> TP={tp} (tp_pct={tp_pct}) exch={exchange} ord_psbl={ord_psbl_qty}")
 
         # Reservation window starts 10:00 KST
         now = _now_kst()
@@ -176,10 +235,32 @@ async def main() -> int:
 
         resp = await _place_resv_sell(auth, account, symbol, exchange, qty, tp)
         odno = None
+        rt_cd = None
         try:
+            rt_cd = str((resp or {}).get("rt_cd"))
             odno = (resp or {}).get("output", {}).get("ODNO")
         except Exception:
             odno = None
+
+        result = "submitted" if rt_cd == "0" else "error"
+        _write_state(
+            {
+                "last": {
+                    "date": _now_kst().date().isoformat(),
+                    "ts": _now_kst().isoformat(),
+                    "symbol": symbol,
+                    "exchange": exchange,
+                    "qty": int(qty),
+                    "avg": float(avg),
+                    "tp": float(tp),
+                    "tp_pct": float(tp_pct),
+                    "ord_psbl_qty": int(ord_psbl_qty),
+                    "result": result,
+                    "odno": odno,
+                }
+            }
+        )
+
         audit_decision(
             symbol=symbol,
             kind="order_result",
