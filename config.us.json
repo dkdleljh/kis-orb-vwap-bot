@@ -14,6 +14,7 @@
   "trading": {
     "entry_budget_pct": 0.12,
     "max_entries_per_day": 10,
+    "max_concurrent_positions": 20,
     "entry_retry_limit": 3,
     "max_spread_pct": 0.01,
     "scoring": {

@@ -91,6 +91,9 @@ class StrategyStateMachine:
 
         self.state: State = State.WAIT_OPEN
         self.or_state: dict[str, ORState] = {}
+        # Multi-position canonical store keyed by symbol.
+        self.positions: dict[str, Position] = {}
+        # Backward-compatible single-position view (first active position).
         self.position: Position | None = None
         self.entry_pending_side: str | None = None
         self.logger: Logger | None = logger
@@ -111,14 +114,46 @@ class StrategyStateMachine:
                 self.logger.info(f"state {self.state.value} -> {new_state.value}")
             self.state = new_state
 
-    def in_position(self) -> bool:
+    def _sync_legacy_position(self) -> None:
+        """Keep legacy ``self.position`` aligned with ``self.positions``."""
+        if self.positions:
+            self.position = next(iter(self.positions.values()))
+        else:
+            self.position = None
+
+    def set_position(self, pos: Position) -> None:
+        """Insert or update a symbol position."""
+        self.positions[str(pos.symbol)] = pos
+        self._sync_legacy_position()
+
+    def get_position(self, symbol: str) -> Position | None:
+        """Return position for symbol when present."""
+        return self.positions.get(str(symbol))
+
+    def remove_position(self, symbol: str) -> Position | None:
+        """Remove and return a symbol position if present."""
+        out = self.positions.pop(str(symbol), None)
+        self._sync_legacy_position()
+        return out
+
+    def active_position_count(self) -> int:
+        """Return number of active positions."""
+        if self.positions:
+            return len(self.positions)
+        return 1 if self.position is not None else 0
+
+    def in_position(self, symbol: str | None = None) -> bool:
         """Check whether strategy currently holds an active position.
 
         Returns:
-            bool: True when state is IN_POSITION and position data exists.
+            bool: True when any position (or the requested symbol) exists.
         """
-
-        return self.state == State.IN_POSITION and self.position is not None
+        if symbol is not None:
+            sym = str(symbol)
+            if sym in self.positions:
+                return True
+            return bool(self.position is not None and str(self.position.symbol) == sym)
+        return self.active_position_count() > 0
 
     def update_or(self, symbol: str, bar: Bar1m) -> None:
         """Update opening range data for a symbol.
@@ -332,8 +367,10 @@ class StrategyStateMachine:
                 )
 
         # [Pyramiding Logic] 불타기
-        if self.in_position() and cast(Position, self.position).symbol == book.symbol:
+        position = self.get_position(book.symbol)
+        if position is None and self.position is not None and str(self.position.symbol) == book.symbol:
             position = cast(Position, self.position)
+        if position is not None:
             pnl_pct = (last_price - position.avg_price) / position.avg_price
             if pnl_pct >= 0.02 and news_score >= 20 and position.adds < 1:
                 if self.logger:

@@ -76,6 +76,16 @@ python main.py
 
 ---
 
+## 3-1) 멀티 포지션 설계 메모
+
+- 엔진은 단일 `position` 대신 심볼별 `positions` 맵을 기준으로 동작합니다.
+- 기본 동시 보유 한도는 `trading.max_concurrent_positions`(기본값 `20`)이며, 활성 포지션 수가 한도에 도달하면 신규 진입을 차단합니다.
+- TP/SL/ATR/퀵익절/프로핏락/트레일링/브레이크이븐 로직은 심볼별 포지션 상태(`tp1_done`, `profit_locked`, `peak_pnl`)를 독립적으로 평가합니다.
+- 시간 기반 청산(`early_exit`/`force_exit`/`emergency`)은 모든 오픈 포지션에 대해 일괄 청산을 수행합니다.
+- `health_status.json`에는 기존 `position`(호환용)과 함께 `positions`, `active_positions_count`, `max_concurrent_positions`가 기록됩니다.
+
+---
+
 ## 4) 릴리즈(태그) 자동화
 
 이 저장소는 `release-please` 기반으로 태그/릴리즈를 자동화합니다.

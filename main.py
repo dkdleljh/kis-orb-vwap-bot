@@ -162,6 +162,13 @@ class TradingEngine:
         )
         self.entry_retry_limit = int(tcfg.get("entry_retry_limit", 5))
         self.max_spread_pct = float(tcfg.get("max_spread_pct", 0.005))
+        self.max_concurrent_positions = max(
+            1, int(tcfg.get("max_concurrent_positions", 20))
+        )
+        self.max_trades_per_symbol = max(
+            1, int(tcfg.get("max_trades_per_symbol", 3))
+        )
+        self.atr_multiplier_sl = float(tcfg.get("atr_multiplier", 2.0))
 
         max_entries = int(tcfg.get("max_entries_per_day", 10))
         daily_loss_limit = float(tcfg.get("daily_loss_limit_pct", -0.05))
@@ -366,19 +373,26 @@ class TradingEngine:
         self.trades_today = 0  # backward-compat total
         self.trades_today_kr = 0
         self.trades_today_us = 0
+        self.trades_today_by_symbol: Dict[str, int] = defaultdict(int)
         self._trade_counter_ymd = now_local(self.tz).strftime("%Y%m%d")
 
         # Concurrency guards (idempotency-lite)
         self._trade_lock = asyncio.Lock()
         self._entry_inflight: set[str] = set()
+        self._exit_inflight: set[str] = set()
         self.logger.info(
-            "Execution mode: live_enabled=%s confirmed=%s active_live=%s max_qty=%s max_trades/day=%s",
+            "Execution mode: live_enabled=%s confirmed=%s active_live=%s max_qty=%s max_trades/day=%s max_positions=%s",
             self.live_enabled,
             self.live_confirmed,
             self.live_ordering_enabled(),
             self.max_position_qty,
             self.max_trades_per_day,
+            self.max_concurrent_positions,
         )
+
+    def _active_positions(self) -> dict[str, Position]:
+        """Return a copy of currently tracked open positions."""
+        return dict(self.state_machine.positions)
 
     def _write_fill_alert(self, data: dict) -> None:
         """Append a fill alert to the queue for external notification (OpenClaw)."""
@@ -540,31 +554,49 @@ class TradingEngine:
             None: Updates state-machine position cache in place.
         """
         # Broker endpoints can rate-limit (EGW00201). Retry a few times on startup.
-        pos = None
+        restored: dict[str, Position] = {}
         for attempt in range(3):
-            pos = await self.rest.get_positions()
-            if pos:
+            pos_map = await self.rest.get_all_positions()
+            if pos_map:
+                for sym, info in pos_map.items():
+                    qty = int(float((info or {}).get("qty", 0) or 0))
+                    avg = float((info or {}).get("avg_price", 0.0) or 0.0)
+                    if qty > 0 and avg > 0:
+                        restored[str(sym)] = Position(
+                            symbol=str(sym), qty=qty, avg_price=avg
+                        )
                 break
             # best-effort: short backoff (avoid hammering)
             await asyncio.sleep(0.5 * (attempt + 1))
 
-        if pos:
-            self.state_machine.position = pos
-            self.state_machine.set_state(State.IN_POSITION)
-
+        self.state_machine.positions.clear()
+        if restored:
+            for sym, pos in restored.items():
+                self.state_machine.set_position(pos)
+                self.peak_pnl_pct[sym] = -0.01
+            if len(restored) > self.max_concurrent_positions:
+                self.logger.warning(
+                    "Restored positions exceed configured max_concurrent_positions: %s > %s",
+                    len(restored),
+                    self.max_concurrent_positions,
+                )
             # [PHASE4] Best-effort snapshot on restore (startup/resume trigger)
             try:
-                if self.ledger is not None:
-                    lp = self.ledger.get_position(str(pos.symbol))
-                    lp.qty = int(pos.qty)
-                    lp.avg_price = float(pos.avg_price)
-                self._record_position_snapshot(str(pos.symbol), trigger="restore")
+                for pos in restored.values():
+                    if self.ledger is not None:
+                        lp = self.ledger.get_position(str(pos.symbol))
+                        lp.qty = int(pos.qty)
+                        lp.avg_price = float(pos.avg_price)
+                    self._record_position_snapshot(str(pos.symbol), trigger="restore")
             except Exception:
                 pass
             self.logger.info(
-                f"restored position: {pos.symbol} qty={pos.qty} avg={pos.avg_price}"
+                "restored positions: count=%s symbols=%s",
+                len(restored),
+                list(restored.keys()),
             )
         else:
+            self.state_machine.positions.clear()
             self.state_machine.position = None
 
     def _maybe_init_fallback_or(self) -> None:
@@ -574,10 +606,6 @@ class TradingEngine:
             None: Mutates fallback OR timestamps and strategy state when needed.
         """
         now_dt = now_local(self.tz)
-
-        # 포지션 보유 중이면 OR/시간상태 전환은 건드리지 않음 (국장 포지션 자동관리 우선)
-        if self.state_machine.state == State.IN_POSITION:
-            return
 
         # 이미 OR이 구축되어 있으면 불필요
         if self.state_machine.or_state:
@@ -593,9 +621,7 @@ class TradingEngine:
 
         self._fallback_or_start = start
         self._fallback_or_end = end
-        # only set BUILD_OR when not in position
-        if self.state_machine.state != State.IN_POSITION:
-            self.state_machine.set_state(State.BUILD_OR)
+        self.state_machine.set_state(State.BUILD_OR)
         self.logger.info(f"fallback OR enabled: {start.time()} ~ {end.time()}")
 
     def on_ws_status(self, connected: bool) -> None:
@@ -789,6 +815,18 @@ class TradingEngine:
             self.state_machine.set_state(State.DONE_TODAY)
             return
 
+        if self.state_machine.in_position(symbol):
+            self.logger.debug("[Entry] skipped: already in position symbol=%s", symbol)
+            return
+
+        if self.state_machine.active_position_count() >= self.max_concurrent_positions:
+            self.logger.debug(
+                "[Entry] skipped: max_concurrent_positions reached (%s/%s)",
+                self.state_machine.active_position_count(),
+                self.max_concurrent_positions,
+            )
+            return
+
         last_price = self.last_price.get(symbol)
         book = self.last_book.get(symbol)
         vwap_calc = self.vwap_by_symbol.get(symbol)
@@ -933,6 +971,12 @@ class TradingEngine:
                 min_score=min_score,
             )
             if signal.side:
+                signal_symbol = str(signal.symbol or symbol)
+                signal_side = str(signal.side or "BUY")
+                signal_corr_id = self._make_correlation_id(signal_symbol, signal_side)
+                signal_idempotency = self._make_idempotency_key(
+                    signal_symbol, signal_side, bar_start=bar.start
+                )
                 self.logger.info(
                     f"signal {signal.symbol} close={bar.close} vwap={vwap} rsi={indicators.get('rsi', 0):.1f} ma20={indicators.get('ma20', 0):.0f}"
                 )
@@ -945,8 +989,11 @@ class TradingEngine:
                             / 100.0,
                             reason="state_machine",
                             model="ml_score_heuristic",
+                            correlation_id=signal_corr_id,
                             context={
                                 "module": "engine_orb_vwap",
+                                "idempotency_key": signal_idempotency,
+                                "correlation_id": signal_corr_id,
                                 "close": float(bar.close),
                                 "vwap": float(vwap) if vwap is not None else None,
                                 "spread_pct": float(book.spread_pct) if book is not None else None,
@@ -1006,8 +1053,8 @@ class TradingEngine:
                 self._error_counts["ledger_snapshot"] += 1
         else:
             try:
-                pos2 = self.state_machine.position
-                if pos2 and pos2.symbol == symbol:
+                pos2 = self.state_machine.get_position(symbol)
+                if pos2:
                     qty = int(pos2.qty)
                     avg = float(pos2.avg_price)
             except Exception:
@@ -1079,17 +1126,24 @@ class TradingEngine:
             return
 
         symbol = cast(str, signal.symbol)
+        side = str(signal.side or "BUY")
 
-        idempotency_key = self._make_idempotency_key(
-            symbol, str(signal.side or "BUY"), bar_start=bar_start
-        )
-        correlation_id = self._make_correlation_id(symbol, str(signal.side or "BUY"))
+        if self.kill_switch_on():
+            self.logger.info("[Entry] blocked by kill switch symbol=%s", symbol)
+            return
+        if self.state_machine.in_position(symbol):
+            self.logger.info("[Entry] skipped; symbol already held symbol=%s", symbol)
+            return
+        if self.state_machine.active_position_count() >= self.max_concurrent_positions:
+            self.logger.info(
+                "[Entry] blocked by max_concurrent_positions (%s/%s)",
+                self.state_machine.active_position_count(),
+                self.max_concurrent_positions,
+            )
+            return
 
-        # Concurrency guard: prevent duplicate concurrent entries per symbol
-        if not hasattr(self, "_trade_lock"):
-            self._trade_lock = asyncio.Lock()
-        if not hasattr(self, "_entry_inflight"):
-            self._entry_inflight = set()
+        idempotency_key = self._make_idempotency_key(symbol, side, bar_start=bar_start)
+        correlation_id = self._make_correlation_id(symbol, side)
 
         async with self._trade_lock:
             if symbol in self._entry_inflight:
@@ -1098,11 +1152,8 @@ class TradingEngine:
             self._entry_inflight.add(symbol)
 
         try:
-            # --- 뉴스 필터 체크 (여기서 비동기 호출) ---
-            # 인버스는 헷징/하락 베팅이므로 뉴스 필터 생략 (악재가 곧 호재)
             if symbol != self.symbol_inverse:
                 try:
-                    # 3초 타임아웃을 걸고 뉴스 점수 확인
                     news_result = await asyncio.wait_for(
                         self.state_machine.news_analyzer.get_sentiment_score(symbol),
                         timeout=3.0,
@@ -1111,25 +1162,15 @@ class TradingEngine:
                     self.logger.info(
                         f"[News Filter] {symbol} Score: {score} ({news_result.get('summary')})"
                     )
-
                     if score < -20:
                         self.logger.warning(
                             f"[News Filter] BLOCKED: Sentiment is too negative ({score})"
                         )
-                        # 진입 취소 (State 유지)
                         return
-
-                    if score >= 50:
-                        self.logger.info(
-                            f"[News Filter] STRONG BUY SIGNAL: Score {score}"
-                        )
                 except Exception as e:
                     self.logger.warning(
                         f"[News Filter] Check failed, proceeding with technical only: {e}"
                     )
-            # ------------------------------------------
-
-            self.state_machine.set_state(State.ENTRY_PENDING)
 
             if book.ask <= 0:
                 try:
@@ -1143,36 +1184,19 @@ class TradingEngine:
                             module="engine_orb_vwap",
                         ).to_event(run_id=self.run_id)
                     )
-                    if self.oms is not None:
-                        self.oms.mark_risk(
-                            idempotency_key=idempotency_key, allowed=False
-                        )
                 except Exception:
                     pass
                 self.logger.info("entry skipped: ask=0")
-                self.state_machine.set_state(State.WAIT_SIGNAL)
                 return
 
             cash = await self.rest.get_cash_available(symbol, book.ask)
-
             if cash <= 0:
                 self.logger.warning("cash query failed (0), using default budget")
-                cash = 1000  # 최소 1,000원으로 저가 주식도 매수 가능
+                cash = 1000
 
-            budget_pct = self.entry_budget_pct
-            if self.market_regime == "BEAR":
-                budget_pct = self.entry_budget_pct * 0.5
-                self.logger.info(
-                    f"[Position Sizing] Bear market - reduced to {budget_pct:.1%}"
-                )
-            elif self.market_regime == "BULL":
-                budget_pct = self.entry_budget_pct * 1.0
-
+            budget_pct = self.entry_budget_pct * (0.5 if self.market_regime == "BEAR" else 1.0)
             budget = cash * budget_pct
-            qty = int(budget // book.ask)
-            qty = min(qty, self.max_position_qty)
-
-            # qty=0 원인을 로그로 남겨서 즉시 진단 가능하게
+            qty = min(int(budget // book.ask), self.max_position_qty)
             if qty <= 0:
                 try:
                     self.event_store.append(
@@ -1185,50 +1209,68 @@ class TradingEngine:
                             module="engine_orb_vwap",
                         ).to_event(run_id=self.run_id)
                     )
-                    if self.oms is not None:
-                        self.oms.mark_risk(
-                            idempotency_key=idempotency_key, allowed=False
-                        )
                 except Exception:
                     pass
                 self.logger.info(
-                    f"entry skipped: qty=0 cash={cash:.0f} budget={budget:.0f} pct={self.entry_budget_pct:.3f} ask={book.ask:.0f}"
+                    "entry skipped: qty=0 cash=%.0f budget=%.0f pct=%.3f ask=%.0f",
+                    cash,
+                    budget,
+                    self.entry_budget_pct,
+                    book.ask,
                 )
-                self.state_machine.set_state(State.WAIT_SIGNAL)
                 return
 
-            # Per-market daily trade guardrail (KR/US split).
             is_kr = bool(str(symbol).isdigit())
             trades_mkt = self.trades_today_kr if is_kr else self.trades_today_us
             max_mkt = self.max_trades_per_day_kr if is_kr else self.max_trades_per_day_us
-
             if trades_mkt >= max_mkt:
-                try:
-                    self.event_store.append(
-                        ievents.RiskDecision(
-                            symbol=symbol,
-                            allowed=False,
-                            reason="max_trades_per_day_mkt",
-                            idempotency_key=idempotency_key,
-                            correlation_id=correlation_id,
-                            module="engine_orb_vwap",
-                        ).to_event(run_id=self.run_id)
-                    )
-                    if self.oms is not None:
-                        self.oms.mark_risk(idempotency_key=idempotency_key, allowed=False)
-                except Exception:
-                    pass
                 self.logger.warning(
                     "entry blocked by max trades/day guardrail (%s %s/%s)",
                     "KR" if is_kr else "US",
                     trades_mkt,
                     max_mkt,
                 )
-                # Do NOT set DONE_TODAY globally; just skip this entry.
-                self.state_machine.set_state(State.WAIT_SIGNAL)
                 return
 
-            # 여기부터가 '실제 진입 시도'
+            symbol_trades = int(self.trades_today_by_symbol.get(symbol, 0) or 0)
+            if symbol_trades >= self.max_trades_per_symbol:
+                try:
+                    self.event_store.append(
+                        ievents.RiskDecision(
+                            symbol=symbol,
+                            allowed=False,
+                            reason="max_trades_per_symbol",
+                            idempotency_key=idempotency_key,
+                            correlation_id=correlation_id,
+                            module="engine_orb_vwap",
+                        ).to_event(run_id=self.run_id)
+                    )
+                except Exception:
+                    pass
+                self.logger.warning(
+                    "entry blocked by max_trades_per_symbol (%s %s/%s)",
+                    symbol,
+                    symbol_trades,
+                    self.max_trades_per_symbol,
+                )
+                return
+
+            if self.state_machine.active_position_count() >= self.max_concurrent_positions:
+                try:
+                    self.event_store.append(
+                        ievents.RiskDecision(
+                            symbol=symbol,
+                            allowed=False,
+                            reason="max_concurrent_positions",
+                            idempotency_key=idempotency_key,
+                            correlation_id=correlation_id,
+                            module="engine_orb_vwap",
+                        ).to_event(run_id=self.run_id)
+                    )
+                except Exception:
+                    pass
+                return
+
             try:
                 self.event_store.append(
                     ievents.OrderIntent(
@@ -1237,6 +1279,16 @@ class TradingEngine:
                         qty=int(qty),
                         order_type="LMT",
                         limit_price=float(book.ask),
+                        idempotency_key=idempotency_key,
+                        correlation_id=correlation_id,
+                        module="engine_orb_vwap",
+                    ).to_event(run_id=self.run_id)
+                )
+                self.event_store.append(
+                    ievents.RiskDecision(
+                        symbol=symbol,
+                        allowed=True,
+                        reason="ok",
                         idempotency_key=idempotency_key,
                         correlation_id=correlation_id,
                         module="engine_orb_vwap",
@@ -1253,40 +1305,26 @@ class TradingEngine:
                         qty=int(qty),
                         idempotency_key=idempotency_key,
                     )
-                except Exception:
-                    self._error_counts["oms_register_intent"] += 1
-
-            try:
-                self.event_store.append(
-                    ievents.RiskDecision(
-                        symbol=symbol,
-                        allowed=True,
-                        reason="ok",
-                        idempotency_key=idempotency_key,
-                        correlation_id=correlation_id,
-                        module="engine_orb_vwap",
-                    ).to_event(run_id=self.run_id)
-                )
-                if self.oms is not None:
                     self.oms.mark_risk(idempotency_key=idempotency_key, allowed=True)
-            except Exception:
-                pass
+                except Exception:
+                    self._error_counts["oms_entry"] += 1
 
             self.risk.record_entry()
             self.trades_today += 1
-            if str(symbol).isdigit():
+            self.trades_today_by_symbol[symbol] += 1
+            if is_kr:
                 self.trades_today_kr += 1
             else:
                 self.trades_today_us += 1
 
             if not self.live_ordering_enabled():
-                self.state_machine.position = Position(
+                pos = Position(
                     symbol=symbol,
                     qty=qty,
                     avg_price=float(book.ask),
                     entry_time=now_local(self.tz),
                 )
-                self.state_machine.set_state(State.IN_POSITION)
+                self.state_machine.set_position(pos)
                 self.logger.info(
                     "[PAPER] entry simulated %s qty=%s price=%s", symbol, qty, book.ask
                 )
@@ -1321,19 +1359,6 @@ class TradingEngine:
                             module="engine_orb_vwap",
                         ).to_event(run_id=self.run_id)
                     )
-
-                    if self.ledger is not None:
-                        self.ledger.apply_fill(
-                            symbol=symbol,
-                            side="BUY",
-                            qty=int(qty),
-                            price=float(book.ask),
-                            fee=0.0,
-                        )
-                    if self.oms is not None:
-                        self.oms.apply_fill(
-                            idempotency_key=idempotency_key, fill_qty=int(qty)
-                        )
                     self._record_position_snapshot(
                         symbol,
                         trigger="fill",
@@ -1345,12 +1370,12 @@ class TradingEngine:
                 self.peak_pnl_pct[symbol] = -0.01
                 return
 
-            for i in range(self.entry_retry_limit):
+            for _ in range(self.entry_retry_limit):
                 if self.kill_switch_on():
                     break
                 order = await self.rest.place_buy_limit(symbol, qty, book.ask)
                 self.logger.info(
-                    f"entry order submitted {symbol} qty={qty} id={order.order_id}"
+                    "entry order submitted %s qty=%s id=%s", symbol, qty, order.order_id
                 )
                 try:
                     broker_order_id = str(order.order_id or "")
@@ -1362,11 +1387,6 @@ class TradingEngine:
                             correlation_id=correlation_id,
                         ).to_event(run_id=self.run_id)
                     )
-                    if self.oms is not None:
-                        self.oms.mark_submitted(
-                            idempotency_key=idempotency_key,
-                            broker_order_id=broker_order_id,
-                        )
                     if broker_order_id:
                         self.event_store.append(
                             ievents.OrderAck(
@@ -1377,27 +1397,30 @@ class TradingEngine:
                                 correlation_id=correlation_id,
                             ).to_event(run_id=self.run_id)
                         )
-                        if self.oms is not None:
-                            self.oms.mark_acked(
-                                idempotency_key=idempotency_key,
-                                broker_order_id=broker_order_id,
-                            )
                 except Exception:
                     pass
+
                 await asyncio.sleep(2)
-                pos = await self.rest.get_positions()
-                if pos and pos.symbol == symbol and pos.qty >= qty:
-                    pos.entry_time = now_local(self.tz)
-                    self.state_machine.position = pos
-                    self.state_machine.set_state(State.IN_POSITION)
+                pos_map = await self.rest.get_all_positions()
+                info = (pos_map or {}).get(symbol)
+                qty_after = int(float((info or {}).get("qty", 0) or 0))
+                avg_after = float((info or {}).get("avg_price", 0.0) or 0.0)
+                if qty_after >= qty and avg_after > 0:
+                    pos = Position(
+                        symbol=symbol,
+                        qty=qty_after,
+                        avg_price=avg_after,
+                        entry_time=now_local(self.tz),
+                    )
+                    self.state_machine.set_position(pos)
                     self.logger.info(
-                        f"entry filled {symbol} qty={pos.qty} avg={pos.avg_price}"
+                        "entry filled %s qty=%s avg=%s", symbol, pos.qty, pos.avg_price
                     )
                     try:
                         broker_order_id = str(order.order_id or "")
-                        # Estimate entry costs for logging
-                        costs = self.fee_calculator.calculate_entry_cost(float(pos.avg_price), int(pos.qty))
-                        
+                        costs = self.fee_calculator.calculate_entry_cost(
+                            float(pos.avg_price), int(pos.qty)
+                        )
                         self.event_store.append(
                             ievents.Fill(
                                 symbol=symbol,
@@ -1406,271 +1429,214 @@ class TradingEngine:
                                 price=float(pos.avg_price),
                                 broker_order_id=broker_order_id,
                                 idempotency_key=idempotency_key,
-                                fee=costs.commission + costs.tax,  # Log actual fee+tax (slippage is implicit in price)
+                                fee=costs.commission + costs.tax,
                                 correlation_id=correlation_id,
                                 module="engine_orb_vwap",
                             ).to_event(run_id=self.run_id)
                         )
-                        if self.ledger is not None:
-                            self.ledger.apply_fill(
-                                symbol=symbol,
-                                side="BUY",
-                                qty=int(pos.qty),
-                                price=float(pos.avg_price),
-                                fee=costs.commission + costs.tax,
-                            )
-                        if self.oms is not None:
-                            self.oms.apply_fill(
-                                idempotency_key=idempotency_key, fill_qty=int(pos.qty)
-                            )
                         self._record_position_snapshot(
                             symbol,
                             trigger="fill",
                             note="live_entry",
                             correlation_id=correlation_id,
                         )
-                        # [NEW] 알림 기록
-                        self._write_fill_alert({
-                            "type": "BUY",
-                            "symbol": symbol,
-                            "qty": int(pos.qty),
-                            "price": float(pos.avg_price),
-                            "reason": getattr(signal, "reasons", []) or "Signal",
-                            "pnl": 0.0,
-                            "revenue": 0.0
-                        })
                     except Exception:
                         pass
-                    # 진입 성공 시 Peak PnL 초기화
                     self.peak_pnl_pct[symbol] = -0.01
                     return
                 if order.order_id:
                     await self.rest.cancel_order(order.order_id, symbol, qty)
-                    self.logger.info(f"entry cancel {order.order_id}")
 
-            # 진입 실패 시 (예: 증거금 부족, 통신 오류 등)
-            self.state_machine.set_state(State.WAIT_SIGNAL)
             self.logger.info("entry failed after retries")
-
-            # 쿨다운 적용: 실패 직후 동일 신호로 무한 재진입 방지 (30초 대기)
-            self.logger.info("cooling down for 30s to prevent spamming...")
             await asyncio.sleep(30)
-
         finally:
             self._entry_inflight.discard(symbol)
 
-    async def handle_exit(self, reason: str, use_market: bool = True) -> None:
+    async def handle_exit(
+        self, reason: str, *, symbol: str | None = None, use_market: bool = True
+    ) -> None:
         """Attempt to close the current position using configured exit logic.
 
         Args:
             reason: Human-readable reason for the exit attempt.
+            symbol: Optional symbol to exit. ``None`` means exit all open symbols.
             use_market: Exit preference flag kept for interface compatibility.
 
         Returns:
             None: Updates position/risk state after execution attempts.
         """
-        if self.state_machine.state not in (State.IN_POSITION, State.EXIT_PENDING):
+        if symbol is None:
+            symbols = list(self._active_positions().keys())
+            for sym in symbols:
+                await self.handle_exit(reason, symbol=sym, use_market=use_market)
             return
-        pos = self.state_machine.position
+        sym = str(symbol)
+        pos = self.state_machine.get_position(sym)
         if not pos:
             return
-        self.state_machine.set_state(State.EXIT_PENDING)
+        if sym in self._exit_inflight:
+            return
+        self._exit_inflight.add(sym)
 
-        symbol = str(pos.symbol)
-        idempotency_key = self._make_idempotency_key(symbol, "SELL")
-        correlation_id = self._make_correlation_id(symbol, "SELL")
+        idempotency_key = self._make_idempotency_key(sym, "SELL")
+        correlation_id = self._make_correlation_id(sym, "SELL")
         try:
             self.event_store.append(
                 ievents.OrderIntent(
-                    symbol=symbol,
+                    symbol=sym,
                     side="SELL",
                     qty=int(pos.qty),
                     order_type="MKT" if use_market else "LMT",
                     limit_price=None,
                     idempotency_key=idempotency_key,
                     correlation_id=correlation_id,
+                    module="engine_orb_vwap",
                 ).to_event(run_id=self.run_id)
             )
-        except Exception:
-            pass
 
-        if not self.live_ordering_enabled():
-            exit_price = self.last_price.get(pos.symbol, pos.avg_price)
-            gross_pnl_pct = (
-                (exit_price - pos.avg_price) / pos.avg_price if pos.avg_price else 0.0
-            )
-            net_pnl_pct = self.fee_calculator.get_net_pnl_percent(
-                pos.avg_price, exit_price
-            )
-            pnl_pct = net_pnl_pct
-            is_stop = pnl_pct <= self.stop_loss_pct
-            self.risk.record_exit(pnl_pct, is_stop)
-            self.state_machine.position = None
-            self.state_machine.set_state(State.WAIT_SIGNAL)
-            self.logger.info(
-                "[PAPER] exit simulated reason=%s pnl=%.4f(gross=%.4f, net=%.4f)",
-                reason,
-                pnl_pct,
-                gross_pnl_pct,
-                net_pnl_pct,
-            )
-
-            try:
-                self.event_store.append(
-                    ievents.OrderSubmitted(
-                        symbol=symbol,
-                        idempotency_key=idempotency_key,
-                        broker_order_id="PAPER",
-                        correlation_id=correlation_id,
-                    ).to_event(run_id=self.run_id)
+            if not self.live_ordering_enabled():
+                exit_price = self.last_price.get(sym, pos.avg_price)
+                gross_pnl_pct = (
+                    (exit_price - pos.avg_price) / pos.avg_price if pos.avg_price else 0.0
                 )
-                self.event_store.append(
-                    ievents.OrderAck(
-                        symbol=symbol,
-                        idempotency_key=idempotency_key,
-                        broker_order_id="PAPER",
-                        status="ACK",
-                        correlation_id=correlation_id,
-                    ).to_event(run_id=self.run_id)
+                net_pnl_pct = self.fee_calculator.get_net_pnl_percent(
+                    pos.avg_price, exit_price
                 )
-                self.event_store.append(
-                    ievents.Fill(
-                        symbol=symbol,
-                        side="SELL",
-                        qty=int(pos.qty),
-                        price=float(exit_price),
-                        broker_order_id="PAPER",
-                        idempotency_key=idempotency_key,
-                        fee=0.0,
-                        correlation_id=correlation_id,
-                        module="engine_orb_vwap",
-                    ).to_event(run_id=self.run_id)
-                )
-                if self.ledger is not None:
-                    self.ledger.apply_fill(
-                        symbol=symbol,
-                        side="SELL",
-                        qty=int(pos.qty),
-                        price=float(exit_price),
-                        fee=0.0,
+                pnl_pct = net_pnl_pct
+                self.risk.record_exit(pnl_pct, pnl_pct <= self.stop_loss_pct)
+                self.state_machine.remove_position(sym)
+                self.peak_pnl_pct.pop(sym, None)
+                try:
+                    self.event_store.append(
+                        ievents.OrderSubmitted(
+                            symbol=sym,
+                            idempotency_key=idempotency_key,
+                            broker_order_id="PAPER",
+                            correlation_id=correlation_id,
+                        ).to_event(run_id=self.run_id)
                     )
-                if self.oms is not None:
-                    self.oms.apply_fill(
-                        idempotency_key=idempotency_key, fill_qty=int(pos.qty)
+                    self.event_store.append(
+                        ievents.OrderAck(
+                            symbol=sym,
+                            idempotency_key=idempotency_key,
+                            broker_order_id="PAPER",
+                            status="ACK",
+                            correlation_id=correlation_id,
+                        ).to_event(run_id=self.run_id)
                     )
-                self._record_position_snapshot(
-                    symbol,
-                    trigger="fill",
-                    note=f"paper_exit:{reason}",
-                    correlation_id=correlation_id,
-                )
-            except Exception:
-                pass
-
-            return
-
-        # Smart Market Order: 무조건 시장가가 아니라, 최우선 매수호가(bid)에 지정가 매도
-        # 호가 정보가 없으면 어쩔 수 없이 시장가 사용
-        current_book = self.last_book.get(pos.symbol)
-
-        if current_book and current_book.bid > 0:
-            # 매수 1호가에 던짐 (시장가와 체결 효과는 같으나, 급락 시 안전장치)
-            price = current_book.bid
-            order = await self.rest.place_sell_limit(pos.symbol, pos.qty, price)
-            self.logger.info(
-                f"exit order(SmartLimit) {reason} price={price} id={order.order_id}"
-            )
-        else:
-            # 호가 정보 없으면 시장가
-            order = await self.rest.place_sell_market(pos.symbol, pos.qty)
-            self.logger.info(f"exit order(Market) {reason} id={order.order_id}")
-
-        try:
-            broker_order_id = str(order.order_id or "")
-            self.event_store.append(
-                ievents.OrderSubmitted(
-                    symbol=symbol,
-                    idempotency_key=idempotency_key,
-                    broker_order_id=broker_order_id,
-                    correlation_id=correlation_id,
-                ).to_event(run_id=self.run_id)
-            )
-            if broker_order_id:
-                self.event_store.append(
-                    ievents.OrderAck(
-                        symbol=symbol,
-                        idempotency_key=idempotency_key,
-                        broker_order_id=broker_order_id,
-                        status="ACK",
+                    self.event_store.append(
+                        ievents.Fill(
+                            symbol=sym,
+                            side="SELL",
+                            qty=int(pos.qty),
+                            price=float(exit_price),
+                            broker_order_id="PAPER",
+                            idempotency_key=idempotency_key,
+                            fee=0.0,
+                            correlation_id=correlation_id,
+                            module="engine_orb_vwap",
+                        ).to_event(run_id=self.run_id)
+                    )
+                    self._record_position_snapshot(
+                        sym,
+                        trigger="fill",
+                        note=f"paper_exit:{reason}",
                         correlation_id=correlation_id,
-                    ).to_event(run_id=self.run_id)
+                    )
+                except Exception:
+                    pass
+                self.logger.info(
+                    "[PAPER] exit simulated symbol=%s reason=%s pnl=%.4f(gross=%.4f, net=%.4f)",
+                    sym,
+                    reason,
+                    pnl_pct,
+                    gross_pnl_pct,
+                    net_pnl_pct,
                 )
-        except Exception:
-            pass
+                return
 
-        await asyncio.sleep(2)
-        pos_after = await self.rest.get_positions()
-        if not pos_after:
-            exit_price = self.last_price.get("_last", pos.avg_price)
-            pnl_pct = (exit_price - pos.avg_price) / pos.avg_price
-            is_stop = pnl_pct <= self.stop_loss_pct
-            self.risk.record_exit(pnl_pct, is_stop)
-
+            current_book = self.last_book.get(sym)
+            if current_book and current_book.bid > 0:
+                order = await self.rest.place_sell_limit(sym, pos.qty, current_book.bid)
+                self.logger.info(
+                    "exit order(SmartLimit) symbol=%s reason=%s price=%s id=%s",
+                    sym,
+                    reason,
+                    current_book.bid,
+                    order.order_id,
+                )
+            else:
+                order = await self.rest.place_sell_market(sym, pos.qty)
+                self.logger.info(
+                    "exit order(Market) symbol=%s reason=%s id=%s",
+                    sym,
+                    reason,
+                    order.order_id,
+                )
             try:
                 broker_order_id = str(order.order_id or "")
-                # Estimate exit costs for logging
-                costs = self.fee_calculator.calculate_exit_cost(float(exit_price), int(pos.qty))
-
                 self.event_store.append(
-                    ievents.Fill(
-                        symbol=symbol,
-                        side="SELL",
-                        qty=int(pos.qty),
-                        price=float(exit_price),
-                        broker_order_id=broker_order_id,
+                    ievents.OrderSubmitted(
+                        symbol=sym,
                         idempotency_key=idempotency_key,
-                        fee=costs.commission + costs.tax,
+                        broker_order_id=broker_order_id,
                         correlation_id=correlation_id,
-                        module="engine_orb_vwap",
                     ).to_event(run_id=self.run_id)
                 )
-                if self.ledger is not None:
-                    self.ledger.apply_fill(
-                        symbol=symbol,
-                        side="SELL",
-                        qty=int(pos.qty),
-                        price=float(exit_price),
-                        fee=costs.commission + costs.tax,
+                if broker_order_id:
+                    self.event_store.append(
+                        ievents.OrderAck(
+                            symbol=sym,
+                            idempotency_key=idempotency_key,
+                            broker_order_id=broker_order_id,
+                            status="ACK",
+                            correlation_id=correlation_id,
+                        ).to_event(run_id=self.run_id)
                     )
-                if self.oms is not None:
-                    self.oms.apply_fill(
-                        idempotency_key=idempotency_key, fill_qty=int(pos.qty)
-                    )
-                self._record_position_snapshot(
-                    symbol,
-                    trigger="fill",
-                    note=f"live_exit:{reason}",
-                    correlation_id=correlation_id,
-                )
-                # [NEW] 알림 기록
-                revenue = (float(exit_price) - float(pos.avg_price)) * int(pos.qty)
-                self._write_fill_alert({
-                    "type": "SELL",
-                    "symbol": symbol,
-                    "qty": int(pos.qty),
-                    "price": float(exit_price),
-                    "reason": reason,
-                    "pnl": pnl_pct,
-                    "revenue": revenue
-                })
             except Exception:
                 pass
 
-            self.state_machine.position = None
-            self.state_machine.set_state(State.WAIT_SIGNAL)
-            self.logger.info(f"exit done pnl={pnl_pct:.4f}")
-        else:
-            self.logger.info("exit pending; will retry monitoring")
+            await asyncio.sleep(2)
+            pos_map = await self.rest.get_all_positions()
+            info = (pos_map or {}).get(sym)
+            qty_after = int(float((info or {}).get("qty", 0) or 0))
+            if qty_after <= 0:
+                exit_price = self.last_price.get(sym, pos.avg_price)
+                pnl_pct = self.fee_calculator.get_net_pnl_percent(pos.avg_price, exit_price)
+                self.risk.record_exit(pnl_pct, pnl_pct <= self.stop_loss_pct)
+                self.state_machine.remove_position(sym)
+                self.peak_pnl_pct.pop(sym, None)
+                try:
+                    broker_order_id = str(order.order_id or "")
+                    costs = self.fee_calculator.calculate_exit_cost(
+                        float(exit_price), int(pos.qty)
+                    )
+                    self.event_store.append(
+                        ievents.Fill(
+                            symbol=sym,
+                            side="SELL",
+                            qty=int(pos.qty),
+                            price=float(exit_price),
+                            broker_order_id=broker_order_id,
+                            idempotency_key=idempotency_key,
+                            fee=costs.commission + costs.tax,
+                            correlation_id=correlation_id,
+                            module="engine_orb_vwap",
+                        ).to_event(run_id=self.run_id)
+                    )
+                    self._record_position_snapshot(
+                        sym,
+                        trigger="fill",
+                        note=f"live_exit:{reason}",
+                        correlation_id=correlation_id,
+                    )
+                except Exception:
+                    pass
+                self.logger.info("exit done symbol=%s reason=%s pnl=%.4f", sym, reason, pnl_pct)
+        finally:
+            if self.state_machine.state != State.DONE_TODAY:
+                self.state_machine.set_state(State.WAIT_SIGNAL)
+            self._exit_inflight.discard(sym)
 
     async def monitor_time_loop(self) -> None:
         """Continuously update time-based state transitions.
@@ -1698,14 +1664,16 @@ class TradingEngine:
         final_kill_time = force_exit_time.replace(minute=18)
 
         if is_after(final_kill_time, now_dt):
-            if self.state_machine.in_position():
+            if self.state_machine.active_position_count() > 0:
                 # 15:18 넘으면 묻지도 따지지도 않고 시장가 청산
                 self.logger.warning(
                     "🚨 EMERGENCY EXIT (Market Close): Dumping all positions!"
                 )
                 # 비동기로 던져버림 (fire and forget 스타일)
                 asyncio.create_task(
-                    self.handle_exit("emergency_market_close", use_market=True)
+                    self.handle_exit(
+                        "emergency_market_close", symbol=None, use_market=True
+                    )
                 )
 
             if self.state_machine.state != State.DONE_TODAY:
@@ -1714,37 +1682,27 @@ class TradingEngine:
 
         # 0-1) 조기 청산 (15:00): 수익 여부와 관계없이 무조건 청산
         if is_after(self.early_exit, now_dt):
-            if self.state_machine.in_position():
-                pos = self.state_machine.position
-                pnl_pct = 0.0
-                if pos:
-                    last_price = self.last_price.get(pos.symbol)
-                    if last_price:
-                        pnl_pct = (last_price - pos.avg_price) / pos.avg_price
+            if self.state_machine.active_position_count() > 0:
                 self.logger.warning(
-                    f" EARLY EXIT (15:00): Closing all positions! PnL={pnl_pct:.2%}"
+                    " EARLY EXIT (15:00): Closing all positions! count=%s",
+                    self.state_machine.active_position_count(),
                 )
-                asyncio.create_task(self.handle_exit("early_exit_15_00"))
+                asyncio.create_task(self.handle_exit("early_exit_15_00", symbol=None))
 
             if self.state_machine.state != State.DONE_TODAY:
                 self.state_machine.set_state(State.DONE_TODAY)
             return
 
         if is_after(force_exit_time, now_dt):
-            if self.state_machine.in_position():
+            if self.state_machine.active_position_count() > 0:
                 # 15:15 ~ 15:18: 일반적인 강제 청산 시도
-                asyncio.create_task(self.handle_exit("force_exit"))
+                asyncio.create_task(self.handle_exit("force_exit", symbol=None))
 
             if self.state_machine.state != State.DONE_TODAY:
                 self.state_machine.set_state(State.DONE_TODAY)
             return
 
         if self.state_machine.state == State.DONE_TODAY:
-            return
-
-        # Keep IN_POSITION stable: do not let OR/entry-state transitions override it.
-        # Exit logic is handled above (early/force/emergency) and in monitor_position_loop.
-        if self.state_machine.in_position():
             return
 
         # 2) 대체 OR 윈도우(늦게 실행된 경우) 처리
@@ -1804,24 +1762,19 @@ class TradingEngine:
         """
         now_dt = now_local(self.tz)
 
-        if self.state_machine.in_position():
+        if self.state_machine.active_position_count() > 0:
             # 조기 청산 (15:00): 수익 여부와 관계없이 무조건 청산
             if is_after(self.early_exit, now_dt):
-                pnl_pct = 0.0
-                pos = self.state_machine.position
-                if pos:
-                    last_price = self.last_price.get(pos.symbol)
-                    if last_price:
-                        pnl_pct = (last_price - pos.avg_price) / pos.avg_price
                 self.logger.warning(
-                    f" EARLY EXIT (15:00): Closing all positions! PnL={pnl_pct:.2%}"
+                    " EARLY EXIT (15:00): Closing all positions! count=%s",
+                    self.state_machine.active_position_count(),
                 )
-                await self.handle_exit("early_exit_15_00")
+                await self.handle_exit("early_exit_15_00", symbol=None)
                 return
 
             # 강제 청산 (15:15)
             if is_after(self.time_rules.force_exit, now_dt):
-                await self.handle_exit("force_exit")
+                await self.handle_exit("force_exit", symbol=None)
 
     async def check_tp_sl(self) -> None:
         """Evaluate advanced take-profit and stop-loss exit conditions.
@@ -1829,10 +1782,16 @@ class TradingEngine:
         Returns:
             None: May trigger partial or full position exits.
         """
-        if not self.state_machine.in_position():
+        positions = list(self._active_positions().values())
+        if not positions:
             return
-        pos = self.state_machine.position
-        if not pos:
+
+        for pos in positions:
+            await self._check_tp_sl_for_symbol(pos)
+
+    async def _check_tp_sl_for_symbol(self, pos: Position) -> None:
+        """Evaluate TP/SL rules for one symbol-specific open position."""
+        if not self.state_machine.in_position(pos.symbol):
             return
 
         last_price = self.last_price.get(pos.symbol)
@@ -1879,7 +1838,7 @@ class TradingEngine:
                     # 익절은 보통 손절폭의 1.5~2배로 설정 (Risk:Reward 비율 고려)
                     
                     # 손절: ATR * 2.0 (기본값)
-                    atr_multiplier_sl = float(tcfg.get("atr_multiplier", 2.0))
+                    atr_multiplier_sl = float(self.atr_multiplier_sl)
                     
                     # 익절: ATR * 3.0 (변동성이 클 때는 더 크게 먹고, 작을 때는 작게 먹음)
                     # 혹은 손절폭 대비 1.5배 설정
@@ -1894,11 +1853,11 @@ class TradingEngine:
                     
                     if pnl_pct >= dynamic_take_profit_pct:
                         self.logger.info(f"🎯 SMART PROFIT (ATR): {pos.symbol} PnL={pnl_pct:.2%} Target={dynamic_take_profit_pct:.2%}")
-                        await self.handle_exit("take_profit (ATR)")
+                        await self.handle_exit("take_profit (ATR)", symbol=pos.symbol)
                         return
                     elif pnl_pct <= dynamic_stop_loss_pct:
                         self.logger.info(f"🛡 SMART STOP (ATR): {pos.symbol} PnL={pnl_pct:.2%} Limit={dynamic_stop_loss_pct:.2%}")
-                        await self.handle_exit("stop_loss (ATR)")
+                        await self.handle_exit("stop_loss (ATR)", symbol=pos.symbol)
                         return
 
         # --- 고급 청산 로직 (Advanced Exit) ---
@@ -1911,6 +1870,13 @@ class TradingEngine:
         if pnl_pct >= self.quick_profit_pct and not pos.tp1_done and pos.qty > 1:
             half_qty = int(pos.qty * 0.5)
             if half_qty > 0:
+                if self.kill_switch_on():
+                    self.logger.warning(
+                        "TP1 skipped by kill switch symbol=%s qty=%s",
+                        pos.symbol,
+                        half_qty,
+                    )
+                    return
                 self.logger.info(
                     f"💰 TP1 (Scale-out): {pos.symbol} PnL={pnl_pct:.2%} Qty={half_qty}"
                 )
@@ -1927,7 +1893,7 @@ class TradingEngine:
                 f" PROFIT TARGET🎯 QUICK REACHED: {pos.symbol} PnL={pnl_pct:.2%}"
             )
             pos.profit_locked = True
-            await self.handle_exit("quick_profit_1pct")
+            await self.handle_exit("quick_profit_1pct", symbol=pos.symbol)
             return
 
         # 3. Profit Lock: +1% 달성 후 수익이 다시 꺾이면 청산하여 이익 보호
@@ -1935,7 +1901,7 @@ class TradingEngine:
             self.logger.info(
                 f"🔒 PROFIT LOCKED - Protecting gains: {pos.symbol} PnL={pnl_pct:.2%}"
             )
-            await self.handle_exit("profit_lock_protection")
+            await self.handle_exit("profit_lock_protection", symbol=pos.symbol)
             return
 
         # 2. 고점 수익률 갱신 (Trailing Stop용)
@@ -1948,20 +1914,22 @@ class TradingEngine:
 
         # 3. 본전 스탑 (Breakeven): 수익이 +1.2% 이상 났다가 +0.3% 미만으로 떨어지면 즉시 청산
         if peak_pnl >= 0.012 and pnl_pct < 0.003:
-            await self.handle_exit("breakeven_stop")
+            await self.handle_exit("breakeven_stop", symbol=pos.symbol)
             return
 
         # 4. 트레일링 스탑 (Trailing): 수익이 +3.0% 이상 났다가, 고점 대비 -1.0% 하락하면 익절
         if peak_pnl >= 0.030 and (peak_pnl - pnl_pct) >= 0.010:
-            await self.handle_exit(f"trailing_stop (peak={peak_pnl:.2%})")
+            await self.handle_exit(
+                f"trailing_stop (peak={peak_pnl:.2%})", symbol=pos.symbol
+            )
             return
 
         # 5. 동적 TP/SL (ATR 기반) 또는 고정 TP/SL
         # (위에서 이미 처리했으므로 여기서는 제거하거나 고정 TP/SL만 남김)
         if pnl_pct >= self.take_profit_pct:
-            await self.handle_exit("take_profit")
+            await self.handle_exit("take_profit", symbol=pos.symbol)
         elif pnl_pct <= self.stop_loss_pct:
-            await self.handle_exit("stop_loss")
+            await self.handle_exit("stop_loss", symbol=pos.symbol)
 
     def kill_switch_on(self) -> bool:
         """Check whether trading should stop via environment or flag file.
@@ -1996,6 +1964,7 @@ class TradingEngine:
             self.trades_today = 0
             self.trades_today_kr = 0
             self.trades_today_us = 0
+            self.trades_today_by_symbol.clear()
 
     def get_health_status(self) -> dict[str, object]:
         """Build a serializable snapshot of current engine health state.
@@ -2003,7 +1972,9 @@ class TradingEngine:
         Returns:
             dict[str, object]: Health metadata for monitoring and diagnostics.
         """
-        pos = self.state_machine.position
+        positions = list(self._active_positions().values())
+        pos = positions[0] if positions else None
+        positions_payload = [p.to_dict() for p in positions]
         # [PHASE1] health payload should include event store hints for ops/debug.
         events_dir = getattr(self.event_store, "base_dir", None)
         try:
@@ -2037,7 +2008,11 @@ class TradingEngine:
             "max_trades_per_day_kr": int(getattr(self, "max_trades_per_day_kr", self.max_trades_per_day) or self.max_trades_per_day),
             "max_trades_per_day_us": int(getattr(self, "max_trades_per_day_us", self.max_trades_per_day) or self.max_trades_per_day),
             "max_position_qty": int(self.max_position_qty),
+            "max_concurrent_positions": int(self.max_concurrent_positions),
+            "active_positions_count": int(len(positions_payload)),
             "position": pos.to_dict() if pos else None,
+            "positions": positions_payload,
+            "trades_today_by_symbol": dict(self.trades_today_by_symbol),
             "symbols": list(self.target_symbols),
             "universe": universe_summary,
             "institutional": {
@@ -2105,8 +2080,7 @@ class TradingEngine:
         interval = float(self.position_snapshot_interval_sec)
         while True:
             try:
-                pos = self.state_machine.position
-                if pos:
+                for pos in self._active_positions().values():
                     self._record_position_snapshot(str(pos.symbol), trigger="periodic")
             except Exception:
                 try:

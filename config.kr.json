@@ -21,6 +21,7 @@
   "trading": {
     "entry_budget_pct": 0.17,
     "max_entries_per_day": 10,
+    "max_concurrent_positions": 20,
     "stop_loss_pct": -0.015,
     "take_profit_pct": 0.03,
     "quick_profit_pct": 0.01,

@@ -57,7 +57,7 @@ async def main() -> int:
 
     # KR
     kr = KISRestOrders(base_url, auth, account, logger)
-    kr_pos = await kr.get_positions()
+    kr_map = await kr.get_all_positions()
 
     # US (try NASD + AMEX buckets; holdings may be tagged AMEX)
     us_nasd = KISOverseasRestOrders(base_url, auth, account, logger, exchange="NASD")
@@ -73,10 +73,14 @@ async def main() -> int:
         by_sym[p.symbol] = p
 
     print("== KR POSITIONS ==")
-    if not kr_pos:
+    if not kr_map:
         print("(none)")
     else:
-        print(f"- {kr_pos.symbol} qty={kr_pos.qty} avg={_fmt_money(kr_pos.avg_price)}")
+        for sym in sorted(kr_map.keys()):
+            info = kr_map[sym] or {}
+            print(
+                f"- {sym} qty={int(info.get('qty', 0) or 0)} avg={_fmt_money(info.get('avg_price'))}"
+            )
 
     print("\n== US POSITIONS ==")
     if not by_sym:
