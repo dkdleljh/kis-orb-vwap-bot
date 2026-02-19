@@ -1,0 +1,80 @@
+{
+  "env": "local",
+  "timezone": "Asia/Seoul",
+  "account": {
+    "account_no": "YOUR_ACCOUNT_NO",
+    "account_product_code": "01"
+  },
+  "rest": {
+    "base_url": "https://openapi.koreainvestment.com:9443",
+    "mock": false
+  },
+  "logging": { "dir": "logs" },
+
+  "trading": {
+    "entry_budget_pct": 0.12,
+    "max_entries_per_day": 10,
+    "entry_retry_limit": 3,
+    "max_spread_pct": 0.01,
+    "scoring": {
+      "us_swing_entry_threshold": 68,
+      "us_scalp_entry_threshold": 75
+    }
+  },
+
+  "us_trading": {
+    "enabled": false,
+    "timezone": "America/New_York",
+    "market_open": "09:30:00",
+    "market_close": "16:00:00",
+    "early_exit": "15:30:00",
+    "force_exit": "15:45:00",
+    "same_day_trading": true
+  },
+
+  "automation": {
+    "retry": {
+      "max_attempts": 5,
+      "base_delay_sec": 1,
+      "max_delay_sec": 60,
+      "jitter": true,
+      "rate_limit_cooldown_sec": 65
+    },
+    "healthcheck": { "enabled": true, "interval_sec": 60 }
+  },
+
+  "modules": {
+    "kukjang": { "enabled": false },
+    "kr_swing": { "enabled": false },
+    "hwanjeon": { "enabled": false },
+
+    "us_swing": {
+      "enabled": false,
+      "symbols": ["AAPL", "MSFT", "NVDA", "TSLA", "SCHD"],
+      "exchange": "NASD",
+      "bar_minutes": 15,
+      "entry_budget_pct": 0.12,
+      "stop_loss_pct": -0.03,
+      "take_profit_pct": 0.06,
+      "entry_retry_limit": 3
+    },
+
+    "mijang": {
+      "enabled": false,
+      "symbols": [],
+      "exchange": "NASD",
+      "stop_loss_pct": -0.03,
+      "take_profit_pct": 0.05,
+      "force_exit": "04:00:00",
+      "dynamic_universe": {
+        "enabled": true,
+        "scan_interval_sec": 300,
+        "source": "popular_list",
+        "top_n": 50,
+        "max_symbols": 60,
+        "min_price_usd": 5,
+        "exchanges": ["NASD", "NYSE", "AMEX"]
+      }
+    }
+  }
+}

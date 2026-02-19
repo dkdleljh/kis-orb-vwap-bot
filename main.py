@@ -12,7 +12,7 @@ import fcntl
 
 from bars_vwap import BarBuilder1m, VwapCalculator
 from config import load_config
-from indicators import rsi, sma, bollinger_bands, envelope, ema, macd
+from indicators import rsi, sma, bollinger_bands, envelope, ema, macd, atr
 from kis_auth import KISAuth, load_auth_from_env
 from kis_rest_orders import AccountInfo, KISRestOrders
 from kis_ws_marketdata import KISWebSocket
@@ -47,6 +47,10 @@ class TradingEngine:
     This engine wires configuration, authentication, market-data streams,
     state transitions, entry/exit execution, and risk guardrails into one
     long-running service process.
+
+    Notes:
+    - This process owns long-lived aiohttp sessions (REST clients). Always close
+      them on shutdown to avoid `Unclosed client session` warnings and resource leaks.
     """
 
     def __init__(self, base_dir: str) -> None:
@@ -88,12 +92,51 @@ class TradingEngine:
 
         self.auth = KISAuth(rest_base_url, app_key, app_secret, self.logger)
 
-        acct_no = str(self.config.get("account.account_no", ""))
-        acct_prdt = str(self.config.get("account.account_product_code", ""))
-        if not acct_no or not acct_prdt:
+        acct_no_raw = str(self.config.get("account.account_no", ""))
+        acct_prdt_raw = str(self.config.get("account.account_product_code", ""))
+
+        # Allow env override to avoid storing sensitive account number in config.json
+        env_acct_no = os.getenv("KIS_ACCOUNT_NO", "").strip()
+        env_acct_prdt = os.getenv("KIS_ACCOUNT_PRODUCT_CODE", "").strip()
+        if (not acct_no_raw) or (acct_no_raw.upper() == "YOUR_ACCOUNT_NO"):
+            if env_acct_no:
+                acct_no_raw = env_acct_no
+        if (not acct_prdt_raw) or (acct_prdt_raw.upper() in {"YOUR_ACCOUNT_PRODUCT_CODE", ""}):
+            if env_acct_prdt:
+                acct_prdt_raw = env_acct_prdt
+        if not acct_no_raw or not acct_prdt_raw:
             raise RuntimeError(
                 "config.json: account.account_no / account.account_product_code 누락"
             )
+
+        # Normalize account number: KIS expects CANO to be digits (typically 8).
+        acct_no = "".join(ch for ch in acct_no_raw if ch.isdigit())
+        acct_prdt = "".join(ch for ch in acct_prdt_raw if ch.isdigit())
+
+        # If user put something like 12345678-01 in account_no, split it best-effort.
+        if len(acct_no) > 8 and not acct_prdt:
+            acct_prdt = acct_no[8:10]
+            acct_no = acct_no[:8]
+
+        invalid_account = False
+        if len(acct_no) != 8:
+            invalid_account = True
+            self.logger.error(f"account_no(CANO) length unexpected: raw={acct_no_raw!r} norm={acct_no!r}")
+        if len(acct_prdt) != 2:
+            invalid_account = True
+            self.logger.error(f"account_product_code length unexpected: raw={acct_prdt_raw!r} norm={acct_prdt!r}")
+
+        if invalid_account:
+            # Safety: when account identifiers are invalid, force kill switch ON to prevent live orders.
+            os.environ["KIS_KILL_SWITCH"] = "1"
+            try:
+                flag = os.path.join(base_dir, "STOP_TRADING.flag")
+                with open(flag, "w", encoding="utf-8") as fh:
+                    fh.write("AUTO: invalid account config (CANO/ACNT_PRDT_CD). Set KIS_ACCOUNT_NO/KIS_ACCOUNT_PRODUCT_CODE or fix config.json\n")
+            except Exception:
+                pass
+            self.logger.critical("Invalid account identifiers -> kill switch forced ON (no live orders will be placed)")
+
         account = AccountInfo(account_no=acct_no, product_code=acct_prdt)
         self.rest = KISRestOrders(rest_base_url, self.auth, account, self.logger)
 
@@ -126,11 +169,12 @@ class TradingEngine:
         self.risk = RiskManager(max_entries, daily_loss_limit, max_consecutive_stop)
 
         # [NEW] Fee Calculator for real-time profit calculation
+        fees_cfg = tcfg.get("fees", {})
         self.fee_calculator = FeeCalculator(
-            commission_rate=0.00015,
-            commission_min=1000,
-            slippage_rate=0.001,
-            tax_rate=0.002,
+            commission_rate=float(fees_cfg.get("commission_rate", 0.00015)),
+            commission_min=float(fees_cfg.get("commission_min", 0)),
+            slippage_rate=float(fees_cfg.get("slippage_rate", 0.001)),
+            tax_rate=float(fees_cfg.get("tax_rate", 0.002)),
             is_overseas=False,
             min_commission_check=True,
         )
@@ -150,7 +194,8 @@ class TradingEngine:
         # [NEW] 스캐너
         self.scanner = KisScanner(self.auth, rest_base_url)
 
-        self.base_universe = [
+        # Base universe (KR symbols). Filter out any non-6-digit codes (e.g., '02850K').
+        raw_universe = [
             self.symbol_lever,
             self.symbol_inverse,
             "251340",
@@ -207,854 +252,17 @@ class TradingEngine:
             "002410",
             "002620",
             "003030",
-            "003490",
-            "004170",
-            "004250",
-            "004370",
-            "004540",
-            "004800",
-            "005300",
-            "005690",
-            "005940",
-            "005960",
-            "006120",
-            "006200",
-            "006280",
-            "006800",
-            "007070",
-            "007810",
-            "008770",
-            "009420",
-            "009970",
-            "010120",
-            "010130",
-            "010140",
-            "010400",
-            "010600",
-            "011150",
-            "011170",
-            "011790",
-            "011980",
-            "012030",
-            "012450",
-            "012470",
-            "012630",
-            "013360",
-            "017800",
-            "018880",
-            "019170",
-            "019680",
-            "020150",
-            "021240",
-            "023590",
-            "024070",
-            "026890",
-            "026960",
-            "027050",
-            "028260",
-            "02850K",
-            "029530",
-            "030200",
-            "030610",
-            "032190",
-            "032350",
-            "032830",
-            "033180",
-            "033250",
-            "034220",
-            "034730",
-            "034830",
-            "035150",
-            "035420",
-            "035890",
-            "036010",
-            "036460",
-            "036570",
-            "037400",
-            "037460",
-            "037710",
-            "037720",
-            "037730",
-            "037830",
-            "038540",
-            "038670",
-            "038975",
-            "039290",
-            "039570",
-            "040160",
-            "040610",
-            "041190",
-            "041830",
-            "041960",
-            "042300",
-            "042660",
-            "042700",
-            "042820",
-            "043150",
-            "043200",
-            "043380",
-            "043650",
-            "044480",
-            "044490",
-            "044810",
-            "045520",
-            "045890",
-            "046070",
-            "046120",
-            "046180",
-            "046210",
-            "046310",
-            "046890",
-            "047050",
-            "047080",
-            "047560",
-            "047810",
-            "047920",
-            "048410",
-            "048430",
-            "048470",
-            "048530",
-            "048550",
-            "048660",
-            "048800",
-            "049120",
-            "049180",
-            "049550",
-            "050320",
-            "050540",
-            "050610",
-            "050890",
-            "050960",
-            "051210",
-            "051380",
-            "051390",
-            "051600",
-            "051630",
-            "051900",
-            "051910",
-            "051960",
-            "052060",
-            "052300",
-            "052690",
-            "053050",
-            "053080",
-            "053210",
-            "053260",
-            "053370",
-            "053430",
-            "053450",
-            "053460",
-            "053520",
-            "053590",
-            "053610",
-            "053690",
-            "053700",
-            "053950",
-            "054050",
-            "054220",
-            "054410",
-            "054450",
-            "054620",
-            "054950",
-            "055360",
-            "055550",
-            "055590",
-            "055810",
-            "056080",
-            "056730",
-            "057050",
-            "057680",
-            "058110",
-            "058470",
-            "058650",
-            "058860",
-            "059090",
-            "060250",
-            "060280",
-            "060310",
-            "060980",
-            "061970",
-            "063170",
-            "064160",
-            "064450",
-            "065350",
-            "066570",
-            "066970",
-            "068270",
-            "068290",
-            "069500",
-            "069510",
-            "069640",
-            "069680",
-            "070960",
-            "071050",
-            "071200",
-            "072470",
-            "072720",
-            "073010",
-            "074110",
-            "075580",
-            "076180",
-            "077500",
-            "078590",
-            "078720",
-            "078920",
-            "079160",
-            "079550",
-            "079940",
-            "080220",
-            "080440",
-            "081000",
-            "081660",
-            "082740",
-            "082900",
-            "083450",
-            "083550",
-            "084010",
-            "084680",
-            "084900",
-            "085310",
-            "085620",
-            "085720",
-            "086450",
-            "086520",
-            "086900",
-            "087010",
-            "088130",
-            "088280",
-            "088350",
-            "089030",
-            "089470",
-            "090350",
-            "090370",
-            "090430",
-            "090710",
-            "090960",
-            "091120",
-            "091590",
-            "091700",
-            "091990",
-            "092220",
-            "092300",
-            "092530",
-            "092780",
-            "093050",
-            "093320",
-            "093370",
-            "093640",
-            "093920",
-            "094170",
-            "094480",
-            "094820",
-            "095340",
-            "095660",
-            "095700",
-            "095720",
-            "096300",
-            "096690",
-            "097080",
-            "097230",
-            "097520",
-            "097870",
-            "098120",
-            "098360",
-            "099140",
-            "099320",
-            "099430",
-            "099520",
-            "100130",
-            "100220",
-            "100590",
-            "100660",
-            "100750",
-            "101170",
-            "101240",
-            "101530",
-            "101790",
-            "102120",
-            "102280",
-            "102460",
-            "102940",
-            "103140",
-            "103230",
-            "103380",
-            "104120",
-            "104520",
-            "104620",
-            "105010",
-            "105550",
-            "105600",
-            "105740",
-            "105840",
-            "106010",
-            "106240",
-            "106520",
-            "107390",
-            "108450",
-            "108670",
-            "108790",
-            "108860",
-            "109070",
-            "109960",
-            "110310",
-            "110790",
-            "111110",
-            "111120",
-            "111380",
-            "111770",
-            "112040",
-            "112190",
-            "112610",
-            "113810",
-            "114090",
-            "114450",
-            "115570",
-            "115580",
-            "115730",
-            "115800",
-            "115960",
-            "116100",
-            "117670",
-            "117910",
-            "118000",
-            "118170",
-            "118990",
-            "119500",
-            "119610",
-            "120030",
-            "120260",
-            "120350",
-            "120500",
-            "121440",
-            "121800",
-            "122090",
-            "122350",
-            "122630",
-            "122640",
-            "122830",
-            "123010",
-            "123020",
-            "123330",
-            "123700",
-            "123860",
-            "124560",
-            "124830",
-            "124840",
-            "124970",
-            "125040",
-            "125210",
-            "125320",
-            "125440",
-            "125450",
-            "126090",
-            "126340",
-            "126600",
-            "126700",
-            "126880",
-            "127980",
-            "128030",
-            "128090",
-            "128360",
-            "128390",
-            "128535",
-            "128640",
-            "128660",
-            "128940",
-            "129480",
-            "129530",
-            "129890",
-            "130310",
-            "130500",
-            "130680",
-            "130910",
-            "131010",
-            "131180",
-            "131220",
-            "131290",
-            "131760",
-            "131970",
-            "132030",
-            "132350",
-            "132450",
-            "133690",
-            "133750",
-            "134060",
-            "134380",
-            "134560",
-            "134780",
-            "135080",
-            "135380",
-            "135440",
-            "136420",
-            "136480",
-            "136510",
-            "137400",
-            "138030",
-            "138250",
-            "138260",
-            "138580",
-            "139130",
-            "140070",
-            "140090",
-            "140130",
-            "140480",
-            "141080",
-            "141210",
-            "142280",
-            "142760",
-            "143210",
-            "143250",
-            "144510",
-            "144600",
-            "144950",
-            "145210",
-            "145670",
-            "146320",
-            "146980",
-            "148070",
-            "148780",
-            "149200",
-            "149950",
-            "150050",
-            "150090",
-            "150400",
-            "151190",
-            "151340",
-            "151860",
-            "152250",
-            "152380",
-            "153360",
-            "153600",
-            "154030",
-            "154050",
-            "155390",
-            "156080",
-            "157060",
-            "157510",
-            "157700",
-            "158300",
-            "158430",
-            "158900",
-            "159010",
-            "159580",
-            "159650",
-            "159720",
-            "159910",
-            "161000",
-            "161030",
-            "161120",
-            "161390",
-            "161890",
-            "162120",
-            "162480",
-            "163520",
-            "163560",
-            "163700",
-            "163810",
-            "163860",
-            "164060",
-            "164090",
-            "164400",
-            "165980",
-            "166090",
-            "166400",
-            "166420",
-            "167810",
-            "168330",
-            "169330",
-            "169740",
-            "170030",
-            "170790",
-            "170900",
-            "171090",
-            "171120",
-            "171800",
-            "171970",
-            "172080",
-            "172190",
-            "172440",
-            "173360",
-            "174350",
-            "175180",
-            "175250",
-            "175300",
-            "176440",
-            "177350",
-            "177540",
-            "177830",
-            "178780",
-            "178920",
-            "179600",
-            "179720",
-            "180060",
-            "180400",
-            "180640",
-            "180690",
-            "180800",
-            "181090",
-            "181560",
-            "182360",
-            "182400",
-            "182480",
-            "182560",
-            "182720",
-            "183190",
-            "183490",
-            "183710",
-            "184230",
-            "184350",
-            "184450",
-            "184630",
-            "185190",
-            "185730",
-            "185850",
-            "186170",
-            "186300",
-            "186380",
-            "186630",
-            "186700",
-            "186860",
-            "187010",
-            "187670",
-            "187870",
-            "188350",
-            "188460",
-            "188520",
-            "188560",
-            "188830",
-            "189010",
-            "189330",
-            "189340",
-            "189400",
-            "189460",
-            "189580",
-            "189660",
-            "189680",
-            "189720",
-            "189860",
-            "189900",
-            "190410",
-            "190650",
-            "190680",
-            "190780",
-            "190900",
-            "191410",
-            "191600",
-            "192080",
-            "192390",
-            "192650",
-            "193250",
-            "193750",
-            "194700",
-            "195030",
-            "195360",
-            "195940",
-            "196170",
-            "196700",
-            "197140",
-            "197200",
-            "197660",
-            "197750",
-            "197850",
-            "198080",
-            "198440",
-            "198670",
-            "198790",
-            "199400",
-            "199420",
-            "199910",
-            "200110",
-            "200250",
-            "200470",
-            "200580",
-            "200700",
-            "200800",
-            "200860",
-            "200920",
-            "201230",
-            "201490",
-            "201810",
-            "202270",
-            "202280",
-            "202320",
-            "202680",
-            "202940",
-            "203000",
-            "203230",
-            "203450",
-            "203580",
-            "203750",
-            "204320",
-            "204620",
-            "204780",
-            "205100",
-            "205290",
-            "205720",
-            "205920",
-            "206400",
-            "207810",
-            "208140",
-            "208350",
-            "208640",
-            "209380",
-            "209650",
-            "210540",
-            "210780",
-            "211270",
-            "211600",
-            "211790",
-            "212010",
-            "212180",
-            "212630",
-            "212710",
-            "212750",
-            "213090",
-            "213500",
-            "214430",
-            "214520",
-            "214680",
-            "215000",
-            "215050",
-            "215200",
-            "215380",
-            "215790",
-            "215900",
-            "216200",
-            "216280",
-            "216470",
-            "216580",
-            "216720",
-            "217730",
-            "217800",
-            "218150",
-            "218410",
-            "218500",
-            "218600",
-            "219010",
-            "219110",
-            "219420",
-            "219650",
-            "220100",
-            "220180",
-            "220250",
-            "220360",
-            "220970",
-            "221200",
-            "221600",
-            "222110",
-            "222230",
-            "222310",
-            "222450",
-            "222800",
-            "222870",
-            "223310",
-            "223600",
-            "223720",
-            "223950",
-            "224090",
-            "224400",
-            "224760",
-            "224970",
-            "225190",
-            "225220",
-            "225650",
-            "225770",
-            "225930",
-            "226100",
-            "226320",
-            "226350",
-            "226440",
-            "226490",
-            "226950",
-            "227420",
-            "227610",
-            "227630",
-            "227830",
-            "228340",
-            "228670",
-            "229200",
-            "229500",
-            "229730",
-            "230240",
-            "230400",
-            "230980",
-            "231300",
-            "231310",
-            "231920",
-            "232430",
-            "232580",
-            "232750",
-            "233800",
-            "234080",
-            "234340",
-            "234690",
-            "235070",
-            "235420",
-            "235500",
-            "235690",
-            "236030",
-            "236200",
-            "236360",
-            "237450",
-            "237690",
-            "238090",
-            "238200",
-            "238810",
-            "239610",
-            "240520",
-            "241620",
-            "241830",
-            "242040",
-            "242310",
-            "242510",
-            "242560",
-            "242570",
-            "242580",
-            "242610",
-            "242640",
-            "242650",
-            "242800",
-            "242820",
-            "242830",
-            "242850",
-            "242880",
-            "242970",
-            "243070",
-            "243120",
-            "243240",
-            "243310",
-            "243350",
-            "243420",
-            "243590",
-            "243760",
-            "244030",
-            "244170",
-            "244280",
-            "244520",
-            "244850",
-            "245170",
-            "245340",
-            "245380",
-            "245450",
-            "245540",
-            "245620",
-            "245990",
-            "246010",
-            "246050",
-            "246200",
-            "246250",
-            "246320",
-            "246440",
-            "246450",
-            "246690",
-            "246980",
-            "247540",
-            "247560",
-            "247740",
-            "248070",
-            "248250",
-            "248540",
-            "248600",
-            "248850",
-            "249000",
-            "249420",
-            "249480",
-            "249630",
-            "250000",
-            "250060",
-            "250220",
-            "250680",
-            "250950",
-            "251280",
-            "251290",
-            "251340",
-            "251370",
-            "251420",
-            "251620",
-            "251780",
-            "252010",
-            "252020",
-            "252140",
-            "252160",
-            "252300",
-            "252500",
-            "252650",
-            "252670",
-            "252770",
-            "253180",
-            "253250",
-            "253310",
-            "253440",
-            "253590",
-            "253720",
-            "254120",
-            "254400",
-            "254450",
-            "254560",
-            "254790",
-            "255200",
-            "255220",
-            "255440",
-            "255720",
-            "256050",
-            "256150",
-            "256250",
-            "256280",
-            "256630",
-            "257020",
-            "257150",
-            "257190",
-            "257370",
-            "257720",
-            "258010",
-            "258200",
-            "258470",
-            "258610",
-            "258970",
-            "259100",
-            "259170",
-            "259450",
-            "259630",
-            "259960",
-            "260210",
-            "260630",
-            "260720",
-            "261080",
-            "261130",
-            "261220",
-            "261240",
-            "261380",
-            "261720",
-            "261780",
-            "262050",
-            "262470",
-            "262980",
-            "263050",
-            "263810",
-            "264200",
-            "264450",
-            "264700",
-            "264900",
-            "265150",
-            "265520",
-            "265590",
-            "265720",
-            "266080",
-            "266150",
-            "266730",
-            "267060",
-            "267260",
-            "267290",
-            "267440",
-            "267850",
-            "268060",
-            "268300",
-            "268420",
-            "268600",
-            "269200",
-            "269480",
-            "270660",
         ]
+
+        def _is_kr_symbol(sym: str) -> bool:
+            s = str(sym or "")
+            return s.isdigit() and len(s) == 6
+
+        self.base_universe = [s for s in raw_universe if _is_kr_symbol(s)]
+        dropped = [s for s in raw_universe if s not in self.base_universe]
+        if dropped:
+            self.logger.warning(f"Dropped invalid symbols from base_universe: {dropped}")
+
         self.target_symbols = list(dict.fromkeys(self.base_universe))
 
         # 8) 웹소켓
@@ -1078,7 +286,12 @@ class TradingEngine:
         self.last_price: Dict[str, float] = {}
         self.last_book: Dict[str, OrderBookTop] = {}
         self.bar_history: Dict[str, Dict[str, Any]] = defaultdict(
-            lambda: {"closes": deque(maxlen=600), "volumes": deque(maxlen=600)}
+            lambda: {
+                "closes": deque(maxlen=600),
+                "volumes": deque(maxlen=600),
+                "highs": deque(maxlen=600),
+                "lows": deque(maxlen=600),
+            }
         )
 
         # 10) 캐시/기타
@@ -1132,8 +345,16 @@ class TradingEngine:
         self.max_position_qty = max(
             1, int(os.environ.get("KIS_MAX_POSITION_QTY", "200"))
         )
-        self.max_trades_per_day = max(
-            1, int(os.environ.get("KIS_MAX_TRADES_PER_DAY", "5"))
+        # Max trades per day: allow per-market split.
+        # Defaults:
+        # - KIS_MAX_TRADES_PER_DAY (global fallback)
+        # - KIS_MAX_TRADES_PER_DAY_KR / _US (preferred)
+        self.max_trades_per_day = max(1, int(os.environ.get("KIS_MAX_TRADES_PER_DAY", "5")))
+        self.max_trades_per_day_kr = max(
+            1, int(os.environ.get("KIS_MAX_TRADES_PER_DAY_KR", str(self.max_trades_per_day)))
+        )
+        self.max_trades_per_day_us = max(
+            1, int(os.environ.get("KIS_MAX_TRADES_PER_DAY_US", str(self.max_trades_per_day)))
         )
         self.healthcheck_interval_sec = max(
             10, int(os.environ.get("KIS_HEALTHCHECK_INTERVAL_SEC", "60"))
@@ -1142,7 +363,9 @@ class TradingEngine:
             0, int(os.environ.get("KIS_POSITION_SNAPSHOT_INTERVAL_SEC", "0") or 0)
         )
         self.status_path = os.path.join(self.base_dir, "logs", "health_status.json")
-        self.trades_today = 0
+        self.trades_today = 0  # backward-compat total
+        self.trades_today_kr = 0
+        self.trades_today_us = 0
         self._trade_counter_ymd = now_local(self.tz).strftime("%Y%m%d")
 
         # Concurrency guards (idempotency-lite)
@@ -1156,6 +379,33 @@ class TradingEngine:
             self.max_position_qty,
             self.max_trades_per_day,
         )
+
+    def _write_fill_alert(self, data: dict) -> None:
+        """Append a fill alert to the queue for external notification (OpenClaw)."""
+        import json
+        from datetime import datetime
+        
+        try:
+            alert_path = os.path.join(self.base_dir, "logs", "fill_alerts.jsonl")
+            entry = {
+                "ts": datetime.now().isoformat(),
+                **data
+            }
+            with open(alert_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception as e:
+            self.logger.warning(f"Failed to write fill alert: {e}")
+
+    async def aclose(self) -> None:
+        """Close internally-owned resources (best-effort).
+
+        This is safe to call multiple times.
+        """
+        try:
+            if hasattr(self, "rest") and self.rest is not None:
+                await self.rest.aclose()
+        except Exception:
+            pass
 
     async def start(self) -> None:
         """Initialize external dependencies and start background loops.
@@ -1204,6 +454,13 @@ class TradingEngine:
                 break
             except Exception as e:
                 msg = str(e)
+                if "Refusing to use dummy approval_key" in msg:
+                    # Outside market hours, WS approval key may be unnecessary.
+                    # Do not crash the engine; continue in REST-only mode.
+                    self.logger.warning(
+                        f"ApprovalKey unavailable outside market window (REST-only): {e}"
+                    )
+                    break
                 if "EGW00133" in msg or "1분당 1회" in msg:
                     self.logger.warning(
                         f"ApprovalKey rate limit(EGW00133). retry in 65s: {e}"
@@ -1282,7 +539,15 @@ class TradingEngine:
         Returns:
             None: Updates state-machine position cache in place.
         """
-        pos = await self.rest.get_positions()
+        # Broker endpoints can rate-limit (EGW00201). Retry a few times on startup.
+        pos = None
+        for attempt in range(3):
+            pos = await self.rest.get_positions()
+            if pos:
+                break
+            # best-effort: short backoff (avoid hammering)
+            await asyncio.sleep(0.5 * (attempt + 1))
+
         if pos:
             self.state_machine.position = pos
             self.state_machine.set_state(State.IN_POSITION)
@@ -1310,6 +575,10 @@ class TradingEngine:
         """
         now_dt = now_local(self.tz)
 
+        # 포지션 보유 중이면 OR/시간상태 전환은 건드리지 않음 (국장 포지션 자동관리 우선)
+        if self.state_machine.state == State.IN_POSITION:
+            return
+
         # 이미 OR이 구축되어 있으면 불필요
         if self.state_machine.or_state:
             return
@@ -1324,7 +593,9 @@ class TradingEngine:
 
         self._fallback_or_start = start
         self._fallback_or_end = end
-        self.state_machine.set_state(State.BUILD_OR)
+        # only set BUILD_OR when not in position
+        if self.state_machine.state != State.IN_POSITION:
+            self.state_machine.set_state(State.BUILD_OR)
         self.logger.info(f"fallback OR enabled: {start.time()} ~ {end.time()}")
 
     def on_ws_status(self, connected: bool) -> None:
@@ -1429,6 +700,8 @@ class TradingEngine:
         # 히스토리 업데이트
         self.bar_history[symbol]["closes"].append(bar.close)
         self.bar_history[symbol]["volumes"].append(bar.volume)
+        self.bar_history[symbol]["highs"].append(bar.high)
+        self.bar_history[symbol]["lows"].append(bar.low)
 
         # [NEW] 전일/당일/세션별 봉(프리/본/애프터/나이트) 집계
         try:
@@ -1448,14 +721,34 @@ class TradingEngine:
         # 시장 지표(KODEX 레버리지) 추세 업데이트
         if symbol == self.symbol_lever:
             closes = list(self.bar_history[symbol]["closes"])
+            highs = list(self.bar_history[symbol]["highs"])
+            lows = list(self.bar_history[symbol]["lows"])
+
             if len(closes) >= 60:
                 ma60 = sma(closes, 60)
-                if bar.close > ma60:
+                ma20 = sma(closes, 20) if len(closes) >= 20 else ma60
+
+                price = bar.close
+                above_ma20 = price > ma20
+                above_ma60 = price > ma60
+                ma20_above_ma60 = ma20 > ma60
+
+                rsi_val = 50
+                if len(closes) >= 15:
+                    rsi_val = rsi(closes, 14)
+
+                rsi_bullish = rsi_val > 55
+                rsi_bearish = rsi_val < 45
+
+                if above_ma20 and above_ma60 and ma20_above_ma60 and rsi_bullish:
                     self.market_regime = "BULL"
-                else:
+                elif (not above_ma20 or not above_ma60) and rsi_bearish:
                     self.market_regime = "BEAR"
+                else:
+                    self.market_regime = "NEUTRAL"
+
                 self.logger.info(
-                    f"[Market Regime] {self.market_regime} (Price={bar.close} MA60={ma60:.1f})"
+                    f"[Market Regime] {self.market_regime} (Price={price:.0f} MA20={ma20:.0f} MA60={ma60:.0f} RSI={rsi_val:.1f})"
                 )
 
         now_dt = now_local(self.tz)
@@ -1512,6 +805,8 @@ class TradingEngine:
         # --- 보조지표 계산 ---
         closes = list(self.bar_history[symbol]["closes"])
         volumes = list(self.bar_history[symbol]["volumes"])
+        highs = list(self.bar_history[symbol]["highs"])
+        lows = list(self.bar_history[symbol]["lows"])
 
         indicators = {}
 
@@ -1577,6 +872,12 @@ class TradingEngine:
             except Exception:
                 pass
 
+            if len(highs) >= 15 and len(lows) >= 15 and len(closes) >= 15:
+                atr_value = atr(highs, lows, closes, 14)
+                indicators["atr"] = atr_value
+                if last_price > 0:
+                    indicators["atr_percent"] = (atr_value / last_price) * 100.0
+
             indicators["ml_score"] = calculate_ml_score(indicators, last_price, vwap)
 
         except Exception as e:
@@ -1636,7 +937,7 @@ class TradingEngine:
                 pass
 
     def _record_position_snapshot(
-        self, symbol: str, *, trigger: str, note: str = ""
+        self, symbol: str, *, trigger: str, note: str = "", correlation_id: str = ""
     ) -> None:
         """Best-effort PositionSnapshot logging.
 
@@ -1675,6 +976,7 @@ class TradingEngine:
                     equity=None,
                     trigger=trigger,
                     note=note,
+                    correlation_id=correlation_id,
                 ).to_event(run_id=self.run_id)
             )
         except Exception:
@@ -1707,6 +1009,13 @@ class TradingEngine:
         ts = dt_utc.strftime("%Y%m%dT%H%MZ")
         return f"{self.run_id}:{symbol}:{side}:{ts}"
 
+    def _make_correlation_id(self, symbol: str, side: str) -> str:
+        # Use unified correlation id generator across engine/modules/scripts.
+        from core.correlation import new_corr
+
+        s = (side or "").strip().upper() or "X"
+        return new_corr(f"eng_{s.lower()}")
+
     async def handle_entry(
         self, signal: Signal, book: OrderBookTop, *, bar_start: datetime | None = None
     ) -> None:
@@ -1727,6 +1036,7 @@ class TradingEngine:
         idempotency_key = self._make_idempotency_key(
             symbol, str(signal.side or "BUY"), bar_start=bar_start
         )
+        correlation_id = self._make_correlation_id(symbol, str(signal.side or "BUY"))
 
         # Concurrency guard: prevent duplicate concurrent entries per symbol
         if not hasattr(self, "_trade_lock"):
@@ -1782,6 +1092,7 @@ class TradingEngine:
                             allowed=False,
                             reason="ask=0",
                             idempotency_key=idempotency_key,
+                            correlation_id=correlation_id,
                         ).to_event(run_id=self.run_id)
                     )
                     if self.oms is not None:
@@ -1800,7 +1111,16 @@ class TradingEngine:
                 self.logger.warning("cash query failed (0), using default budget")
                 cash = 1000  # 최소 1,000원으로 저가 주식도 매수 가능
 
-            budget = cash * self.entry_budget_pct
+            budget_pct = self.entry_budget_pct
+            if self.market_regime == "BEAR":
+                budget_pct = self.entry_budget_pct * 0.5
+                self.logger.info(
+                    f"[Position Sizing] Bear market - reduced to {budget_pct:.1%}"
+                )
+            elif self.market_regime == "BULL":
+                budget_pct = self.entry_budget_pct * 1.0
+
+            budget = cash * budget_pct
             qty = int(budget // book.ask)
             qty = min(qty, self.max_position_qty)
 
@@ -1813,6 +1133,7 @@ class TradingEngine:
                             allowed=False,
                             reason="qty=0",
                             idempotency_key=idempotency_key,
+                            correlation_id=correlation_id,
                         ).to_event(run_id=self.run_id)
                     )
                     if self.oms is not None:
@@ -1827,28 +1148,34 @@ class TradingEngine:
                 self.state_machine.set_state(State.WAIT_SIGNAL)
                 return
 
-            if self.trades_today >= self.max_trades_per_day:
+            # Per-market daily trade guardrail (KR/US split).
+            is_kr = bool(str(symbol).isdigit())
+            trades_mkt = self.trades_today_kr if is_kr else self.trades_today_us
+            max_mkt = self.max_trades_per_day_kr if is_kr else self.max_trades_per_day_us
+
+            if trades_mkt >= max_mkt:
                 try:
                     self.event_store.append(
                         ievents.RiskDecision(
                             symbol=symbol,
                             allowed=False,
-                            reason="max_trades_per_day",
+                            reason="max_trades_per_day_mkt",
                             idempotency_key=idempotency_key,
+                            correlation_id=correlation_id,
                         ).to_event(run_id=self.run_id)
                     )
                     if self.oms is not None:
-                        self.oms.mark_risk(
-                            idempotency_key=idempotency_key, allowed=False
-                        )
+                        self.oms.mark_risk(idempotency_key=idempotency_key, allowed=False)
                 except Exception:
                     pass
                 self.logger.warning(
-                    "entry blocked by max trades/day guardrail (%s/%s)",
-                    self.trades_today,
-                    self.max_trades_per_day,
+                    "entry blocked by max trades/day guardrail (%s %s/%s)",
+                    "KR" if is_kr else "US",
+                    trades_mkt,
+                    max_mkt,
                 )
-                self.state_machine.set_state(State.DONE_TODAY)
+                # Do NOT set DONE_TODAY globally; just skip this entry.
+                self.state_machine.set_state(State.WAIT_SIGNAL)
                 return
 
             # 여기부터가 '실제 진입 시도'
@@ -1861,6 +1188,7 @@ class TradingEngine:
                         order_type="LMT",
                         limit_price=float(book.ask),
                         idempotency_key=idempotency_key,
+                        correlation_id=correlation_id,
                     ).to_event(run_id=self.run_id)
                 )
             except Exception:
@@ -1884,6 +1212,7 @@ class TradingEngine:
                         allowed=True,
                         reason="ok",
                         idempotency_key=idempotency_key,
+                        correlation_id=correlation_id,
                     ).to_event(run_id=self.run_id)
                 )
                 if self.oms is not None:
@@ -1893,6 +1222,10 @@ class TradingEngine:
 
             self.risk.record_entry()
             self.trades_today += 1
+            if str(symbol).isdigit():
+                self.trades_today_kr += 1
+            else:
+                self.trades_today_us += 1
 
             if not self.live_ordering_enabled():
                 self.state_machine.position = Position(
@@ -1911,6 +1244,7 @@ class TradingEngine:
                             symbol=symbol,
                             idempotency_key=idempotency_key,
                             broker_order_id="PAPER",
+                            correlation_id=correlation_id,
                         ).to_event(run_id=self.run_id)
                     )
                     self.event_store.append(
@@ -1919,6 +1253,7 @@ class TradingEngine:
                             idempotency_key=idempotency_key,
                             broker_order_id="PAPER",
                             status="ACK",
+                            correlation_id=correlation_id,
                         ).to_event(run_id=self.run_id)
                     )
                     self.event_store.append(
@@ -1930,6 +1265,7 @@ class TradingEngine:
                             broker_order_id="PAPER",
                             idempotency_key=idempotency_key,
                             fee=0.0,
+                            correlation_id=correlation_id,
                         ).to_event(run_id=self.run_id)
                     )
 
@@ -1946,7 +1282,10 @@ class TradingEngine:
                             idempotency_key=idempotency_key, fill_qty=int(qty)
                         )
                     self._record_position_snapshot(
-                        symbol, trigger="fill", note="paper_entry"
+                        symbol,
+                        trigger="fill",
+                        note="paper_entry",
+                        correlation_id=correlation_id,
                     )
                 except Exception:
                     pass
@@ -1967,6 +1306,7 @@ class TradingEngine:
                             symbol=symbol,
                             idempotency_key=idempotency_key,
                             broker_order_id=broker_order_id,
+                            correlation_id=correlation_id,
                         ).to_event(run_id=self.run_id)
                     )
                     if self.oms is not None:
@@ -1981,6 +1321,7 @@ class TradingEngine:
                                 idempotency_key=idempotency_key,
                                 broker_order_id=broker_order_id,
                                 status="ACK",
+                                correlation_id=correlation_id,
                             ).to_event(run_id=self.run_id)
                         )
                         if self.oms is not None:
@@ -2001,6 +1342,9 @@ class TradingEngine:
                     )
                     try:
                         broker_order_id = str(order.order_id or "")
+                        # Estimate entry costs for logging
+                        costs = self.fee_calculator.calculate_entry_cost(float(pos.avg_price), int(pos.qty))
+                        
                         self.event_store.append(
                             ievents.Fill(
                                 symbol=symbol,
@@ -2009,7 +1353,8 @@ class TradingEngine:
                                 price=float(pos.avg_price),
                                 broker_order_id=broker_order_id,
                                 idempotency_key=idempotency_key,
-                                fee=0.0,
+                                fee=costs.commission + costs.tax,  # Log actual fee+tax (slippage is implicit in price)
+                                correlation_id=correlation_id,
                             ).to_event(run_id=self.run_id)
                         )
                         if self.ledger is not None:
@@ -2018,15 +1363,28 @@ class TradingEngine:
                                 side="BUY",
                                 qty=int(pos.qty),
                                 price=float(pos.avg_price),
-                                fee=0.0,
+                                fee=costs.commission + costs.tax,
                             )
                         if self.oms is not None:
                             self.oms.apply_fill(
                                 idempotency_key=idempotency_key, fill_qty=int(pos.qty)
                             )
                         self._record_position_snapshot(
-                            symbol, trigger="fill", note="live_entry"
+                            symbol,
+                            trigger="fill",
+                            note="live_entry",
+                            correlation_id=correlation_id,
                         )
+                        # [NEW] 알림 기록
+                        self._write_fill_alert({
+                            "type": "BUY",
+                            "symbol": symbol,
+                            "qty": int(pos.qty),
+                            "price": float(pos.avg_price),
+                            "reason": getattr(signal, "reasons", []) or "Signal",
+                            "pnl": 0.0,
+                            "revenue": 0.0
+                        })
                     except Exception:
                         pass
                     # 진입 성공 시 Peak PnL 초기화
@@ -2066,6 +1424,7 @@ class TradingEngine:
 
         symbol = str(pos.symbol)
         idempotency_key = self._make_idempotency_key(symbol, "SELL")
+        correlation_id = self._make_correlation_id(symbol, "SELL")
         try:
             self.event_store.append(
                 ievents.OrderIntent(
@@ -2075,6 +1434,7 @@ class TradingEngine:
                     order_type="MKT" if use_market else "LMT",
                     limit_price=None,
                     idempotency_key=idempotency_key,
+                    correlation_id=correlation_id,
                 ).to_event(run_id=self.run_id)
             )
         except Exception:
@@ -2107,6 +1467,7 @@ class TradingEngine:
                         symbol=symbol,
                         idempotency_key=idempotency_key,
                         broker_order_id="PAPER",
+                        correlation_id=correlation_id,
                     ).to_event(run_id=self.run_id)
                 )
                 self.event_store.append(
@@ -2115,6 +1476,7 @@ class TradingEngine:
                         idempotency_key=idempotency_key,
                         broker_order_id="PAPER",
                         status="ACK",
+                        correlation_id=correlation_id,
                     ).to_event(run_id=self.run_id)
                 )
                 self.event_store.append(
@@ -2126,6 +1488,7 @@ class TradingEngine:
                         broker_order_id="PAPER",
                         idempotency_key=idempotency_key,
                         fee=0.0,
+                        correlation_id=correlation_id,
                     ).to_event(run_id=self.run_id)
                 )
                 if self.ledger is not None:
@@ -2141,7 +1504,10 @@ class TradingEngine:
                         idempotency_key=idempotency_key, fill_qty=int(pos.qty)
                     )
                 self._record_position_snapshot(
-                    symbol, trigger="fill", note=f"paper_exit:{reason}"
+                    symbol,
+                    trigger="fill",
+                    note=f"paper_exit:{reason}",
+                    correlation_id=correlation_id,
                 )
             except Exception:
                 pass
@@ -2171,6 +1537,7 @@ class TradingEngine:
                     symbol=symbol,
                     idempotency_key=idempotency_key,
                     broker_order_id=broker_order_id,
+                    correlation_id=correlation_id,
                 ).to_event(run_id=self.run_id)
             )
             if broker_order_id:
@@ -2180,6 +1547,7 @@ class TradingEngine:
                         idempotency_key=idempotency_key,
                         broker_order_id=broker_order_id,
                         status="ACK",
+                        correlation_id=correlation_id,
                     ).to_event(run_id=self.run_id)
                 )
         except Exception:
@@ -2195,6 +1563,9 @@ class TradingEngine:
 
             try:
                 broker_order_id = str(order.order_id or "")
+                # Estimate exit costs for logging
+                costs = self.fee_calculator.calculate_exit_cost(float(exit_price), int(pos.qty))
+
                 self.event_store.append(
                     ievents.Fill(
                         symbol=symbol,
@@ -2203,7 +1574,8 @@ class TradingEngine:
                         price=float(exit_price),
                         broker_order_id=broker_order_id,
                         idempotency_key=idempotency_key,
-                        fee=0.0,
+                        fee=costs.commission + costs.tax,
+                        correlation_id=correlation_id,
                     ).to_event(run_id=self.run_id)
                 )
                 if self.ledger is not None:
@@ -2212,15 +1584,29 @@ class TradingEngine:
                         side="SELL",
                         qty=int(pos.qty),
                         price=float(exit_price),
-                        fee=0.0,
+                        fee=costs.commission + costs.tax,
                     )
                 if self.oms is not None:
                     self.oms.apply_fill(
                         idempotency_key=idempotency_key, fill_qty=int(pos.qty)
                     )
                 self._record_position_snapshot(
-                    symbol, trigger="fill", note=f"live_exit:{reason}"
+                    symbol,
+                    trigger="fill",
+                    note=f"live_exit:{reason}",
+                    correlation_id=correlation_id,
                 )
+                # [NEW] 알림 기록
+                revenue = (float(exit_price) - float(pos.avg_price)) * int(pos.qty)
+                self._write_fill_alert({
+                    "type": "SELL",
+                    "symbol": symbol,
+                    "qty": int(pos.qty),
+                    "price": float(exit_price),
+                    "reason": reason,
+                    "pnl": pnl_pct,
+                    "revenue": revenue
+                })
             except Exception:
                 pass
 
@@ -2298,6 +1684,11 @@ class TradingEngine:
             return
 
         if self.state_machine.state == State.DONE_TODAY:
+            return
+
+        # Keep IN_POSITION stable: do not let OR/entry-state transitions override it.
+        # Exit logic is handled above (early/force/emergency) and in monitor_position_loop.
+        if self.state_machine.in_position():
             return
 
         # 2) 대체 OR 윈도우(늦게 실행된 경우) 처리
@@ -2417,7 +1808,45 @@ class TradingEngine:
 
         # --- 1% 수익 달성 로직 (핵심) ---
 
+        # [MODIFIED] 동적 TP/SL (ATR 기반) 먼저 체크
+        # 스마트 변동 익절: 시장 상황(ATR)에 맞춰 유연하게 익절/손절
+        bar_hist = self.bar_history.get(pos.symbol)
+        if bar_hist:
+            highs = list(bar_hist.get("highs", []))
+            lows = list(bar_hist.get("lows", []))
+            closes_for_atr = list(bar_hist.get("closes", []))
+            if len(highs) >= 15 and len(lows) >= 15 and len(closes_for_atr) >= 15:
+                latest_atr = atr(highs, lows, closes_for_atr, 14)
+                if latest_atr > 0 and pos.avg_price > 0:
+                    # ATR 배수 설정 (config에서 가져오거나 기본값 사용)
+                    # 현재 config.kr.json의 atr_multiplier는 2.0 (손절용)
+                    # 익절은 보통 손절폭의 1.5~2배로 설정 (Risk:Reward 비율 고려)
+                    
+                    # 손절: ATR * 2.0 (기본값)
+                    atr_multiplier_sl = float(tcfg.get("atr_multiplier", 2.0))
+                    
+                    # 익절: ATR * 3.0 (변동성이 클 때는 더 크게 먹고, 작을 때는 작게 먹음)
+                    # 혹은 손절폭 대비 1.5배 설정
+                    atr_multiplier_tp = atr_multiplier_sl * 1.5 
+
+                    dynamic_stop_loss_pct = (
+                        -(latest_atr / pos.avg_price) * atr_multiplier_sl
+                    )
+                    dynamic_take_profit_pct = (
+                        latest_atr / pos.avg_price
+                    ) * atr_multiplier_tp
+                    
+                    if pnl_pct >= dynamic_take_profit_pct:
+                        self.logger.info(f"🎯 SMART PROFIT (ATR): {pos.symbol} PnL={pnl_pct:.2%} Target={dynamic_take_profit_pct:.2%}")
+                        await self.handle_exit("take_profit (ATR)")
+                        return
+                    elif pnl_pct <= dynamic_stop_loss_pct:
+                        self.logger.info(f"🛡 SMART STOP (ATR): {pos.symbol} PnL={pnl_pct:.2%} Limit={dynamic_stop_loss_pct:.2%}")
+                        await self.handle_exit("stop_loss (ATR)")
+                        return
+
         # 0. Quick Profit (1%): 수익 1% 이상 시 즉시 전량 익절
+        # (ATR 기반 익절이 먼저 작동하므로, ATR 조건이 충족되지 않았을 때만 여기로 옴)
         if pnl_pct >= self.quick_profit_pct and not pos.profit_locked:
             self.logger.info(
                 f" PROFIT TARGET🎯 QUICK REACHED: {pos.symbol} PnL={pnl_pct:.2%}"
@@ -2467,7 +1896,8 @@ class TradingEngine:
             await self.handle_exit(f"trailing_stop (peak={peak_pnl:.2%})")
             return
 
-        # 5. 기존 TP/SL (전량 청산)
+        # 5. 동적 TP/SL (ATR 기반) 또는 고정 TP/SL
+        # (위에서 이미 처리했으므로 여기서는 제거하거나 고정 TP/SL만 남김)
         if pnl_pct >= self.take_profit_pct:
             await self.handle_exit("take_profit")
         elif pnl_pct <= self.stop_loss_pct:
@@ -2486,10 +1916,13 @@ class TradingEngine:
     def live_ordering_enabled(self) -> bool:
         """Check whether live order placement is currently allowed.
 
+        Notes:
+        - Kill switch should always override live flags.
+
         Returns:
-            bool: True when live mode and confirmation gate are both enabled.
+            bool: True when live mode + confirmation are enabled and kill switch is OFF.
         """
-        return self.live_enabled and self.live_confirmed
+        return bool(self.live_enabled and self.live_confirmed and (not self.kill_switch_on()))
 
     def _reset_daily_counters_if_needed(self) -> None:
         """Reset per-day trade counters when date boundary changes.
@@ -2501,6 +1934,8 @@ class TradingEngine:
         if ymd != self._trade_counter_ymd:
             self._trade_counter_ymd = ymd
             self.trades_today = 0
+            self.trades_today_kr = 0
+            self.trades_today_us = 0
 
     def get_health_status(self) -> dict[str, object]:
         """Build a serializable snapshot of current engine health state.
@@ -2536,7 +1971,11 @@ class TradingEngine:
             "live_confirmed": bool(self.live_confirmed),
             "live_ordering_active": bool(self.live_ordering_enabled()),
             "trades_today": int(self.trades_today),
+            "trades_today_kr": int(getattr(self, "trades_today_kr", 0) or 0),
+            "trades_today_us": int(getattr(self, "trades_today_us", 0) or 0),
             "max_trades_per_day": int(self.max_trades_per_day),
+            "max_trades_per_day_kr": int(getattr(self, "max_trades_per_day_kr", self.max_trades_per_day) or self.max_trades_per_day),
+            "max_trades_per_day_us": int(getattr(self, "max_trades_per_day_us", self.max_trades_per_day) or self.max_trades_per_day),
             "max_position_qty": int(self.max_position_qty),
             "position": pos.to_dict() if pos else None,
             "symbols": list(self.target_symbols),
@@ -2583,13 +2022,15 @@ class TradingEngine:
             except Exception as e:
                 self.logger.warning(f"healthcheck write failed: {e}")
             self.logger.info(
-                "health state=%s ws=%s live=%s kill=%s trades=%s/%s",
+                "health state=%s ws=%s live=%s kill=%s trades(KR)=%s/%s trades(US)=%s/%s",
                 status["state"],
                 status["ws_connected"],
                 status["live_ordering_active"],
                 status["kill_switch"],
-                status["trades_today"],
-                status["max_trades_per_day"],
+                status.get("trades_today_kr", 0),
+                status.get("max_trades_per_day_kr", status.get("max_trades_per_day", 0)),
+                status.get("trades_today_us", 0),
+                status.get("max_trades_per_day_us", status.get("max_trades_per_day", 0)),
             )
             await asyncio.sleep(self.healthcheck_interval_sec)
 
@@ -2868,7 +2309,8 @@ def _acquire_singleton_lock(base_dir: str) -> IO[str]:
     Returns:
         IO[str]: Open lock-file handle that must stay alive while running.
     """
-    lock_path = os.path.join(base_dir, ".kis_bot.lock")
+    lock_name = os.environ.get("KIS_LOCK_FILE", ".kis_bot.lock").strip() or ".kis_bot.lock"
+    lock_path = os.path.join(base_dir, lock_name)
 
     # [Self-Healing] 락 파일이 있는데 프로세스가 없으면 삭제 (좀비 락 정리)
     if os.path.exists(lock_path):
@@ -2958,6 +2400,8 @@ async def run_module_system(base_dir: str) -> None:
     """
     from modules.base import ModuleContext
     from modules.kukjang import KukjangModule
+    from modules.kr_swing import KRSwingModule
+    from modules.us_swing import USSwingModule
     from modules.hwanjeon import HwanjeonModule
     from modules.mijang import MijangModule
     from modules import base
@@ -2980,8 +2424,22 @@ async def run_module_system(base_dir: str) -> None:
     rest_base_url = config.get("rest.base_url")
     auth = KISAuth(rest_base_url, app_key, app_secret, logger)
 
-    acct_no = str(config.get("account.account_no", ""))
-    acct_prdt = str(config.get("account.account_product_code", ""))
+    acct_no_raw = str(config.get("account.account_no", ""))
+    acct_prdt_raw = str(config.get("account.account_product_code", ""))
+
+    env_acct_no = os.getenv("KIS_ACCOUNT_NO", "").strip()
+    env_acct_prdt = os.getenv("KIS_ACCOUNT_PRODUCT_CODE", "").strip()
+    if (not acct_no_raw) or (str(acct_no_raw).upper() == "YOUR_ACCOUNT_NO"):
+        if env_acct_no:
+            acct_no_raw = env_acct_no
+    if (not acct_prdt_raw) or (str(acct_prdt_raw).upper() in {"YOUR_ACCOUNT_PRODUCT_CODE", ""}):
+        if env_acct_prdt:
+            acct_prdt_raw = env_acct_prdt
+    acct_no = "".join(ch for ch in acct_no_raw if ch.isdigit())
+    acct_prdt = "".join(ch for ch in acct_prdt_raw if ch.isdigit())
+    if len(acct_no) > 8 and not acct_prdt:
+        acct_prdt = acct_no[8:10]
+        acct_no = acct_no[:8]
     account = AccountInfo(account_no=acct_no, product_code=acct_prdt)
 
     await auth.fetch_token()
@@ -3019,6 +2477,49 @@ async def run_module_system(base_dir: str) -> None:
         kukjang.set_scanner(scanner)
         modules["kukjang"] = kukjang
         logger.info("Kukjang module loaded")
+
+    kr_swing_cfg = modules_config.get("kr_swing", {})
+    if kr_swing_cfg.get("enabled", False):
+        logger.info("Loading KR Swing module...")
+
+        rest_client = KISRestOrders(rest_base_url, auth, account, logger)
+
+        ctx = ModuleContext(
+            name="kr_swing",
+            enabled=True,
+            supports_trading=True,
+            symbols=kr_swing_cfg.get("symbols", []),
+            config=kr_swing_cfg,
+        )
+
+        kr_swing = KRSwingModule(ctx, logger, rest_client, config.get("trading", {}))
+        modules["kr_swing"] = kr_swing
+        logger.info("KR Swing module loaded")
+
+    us_swing_cfg = modules_config.get("us_swing", {})
+    if us_swing_cfg.get("enabled", False):
+        logger.info("Loading US Swing module...")
+
+        overseas_client = KISOverseasRestOrders(
+            rest_base_url,
+            auth,
+            account,
+            logger,
+            exchange=us_swing_cfg.get("exchange", "NASD"),
+        )
+
+        ctx = ModuleContext(
+            name="us_swing",
+            enabled=True,
+            supports_trading=True,
+            symbols=us_swing_cfg.get("symbols", ["AAPL", "MSFT"]),
+            exchange=us_swing_cfg.get("exchange", "NASD"),
+            config=us_swing_cfg,
+        )
+
+        us_swing = USSwingModule(ctx, logger, overseas_client, config.get("trading", {}))
+        modules["us_swing"] = us_swing
+        logger.info("US Swing module loaded")
 
     hwanjeon_cfg = modules_config.get("hwanjeon", {})
     if hwanjeon_cfg.get("enabled", False):
@@ -3131,12 +2632,19 @@ def main_original() -> None:
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, _sigterm_handler)
+    engine: Optional[TradingEngine] = None
     try:
         engine = TradingEngine(base_dir)
         asyncio.run(engine.start())
     except KeyboardInterrupt:
         pass
     finally:
+        # Ensure aiohttp sessions are closed to avoid resource leaks.
+        if engine is not None:
+            try:
+                asyncio.run(engine.aclose())
+            except Exception:
+                pass
         signal.signal(signal.SIGTERM, prev_term_handler)
         try:
             fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)

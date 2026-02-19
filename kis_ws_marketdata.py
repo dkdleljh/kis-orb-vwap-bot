@@ -303,8 +303,17 @@ class KISWebSocket:
                         self._reset_appkey_backoff()
 
                         async for raw in ws:
-                            # 수신된 모든 메시지 로깅 (디버깅용)
-                            self.logger.info(f"recv raw: {str(raw)[:200]}")
+                            # 수신된 모든 메시지를 info로 찍으면 로그가 폭주할 수 있음.
+                            # 기본은 샘플링된 debug 로그로만 남긴다.
+                            try:
+                                interval = int(os.environ.get("KIS_WS_RAW_LOG_INTERVAL_SEC", "60"))
+                            except Exception:
+                                interval = 60
+                            now_ts = time.time()
+                            last = getattr(self, "_last_raw_log_at", 0.0)
+                            if now_ts - last >= max(5, interval):
+                                setattr(self, "_last_raw_log_at", now_ts)
+                                self.logger.debug(f"recv raw(sampled): {str(raw)[:200]}")
 
                             msg = self._parse_message(str(raw))
                             mtype = msg.get("type")

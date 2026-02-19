@@ -34,6 +34,8 @@ class KisScanner:
             "FID_DIV_CLS_CODE": "0",
             "FID_BLNG_CLS_CODE": "0",
             "FID_TRGT_CLS_CODE": "111111111",  # 필터링 (ETF/ETN/스팩 등 포함여부)
+            # KIS 문서/계정/환경에 따라 키가 EXLS vs EXCLS 로 갈리는 케이스가 있어 둘 다 넣음.
+            "FID_TRGT_EXLS_CLS_CODE": "0000000000",
             "FID_TRGT_EXCLS_CLS_CODE": "0000000000",
             "FID_INPUT_PRICE_1": "",
             "FID_INPUT_PRICE_2": "",

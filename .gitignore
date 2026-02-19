@@ -1,15 +1,19 @@
-# Local-only
+# Local-only secrets / env
 .env
-.env.production
+.env.*
+
+# Python env/caches
 venv/
 __pycache__/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Runtime artifacts / locks / pids
 logs/
-# Generated reports (keep generator scripts tracked)
-reports/*.md
-reports/*.json
-reports/*.csv
 *.log
 *.pid
+*.lock
 .kis_*
 
 # Runtime state / results (may contain PnL, equity, trades)
@@ -17,6 +21,19 @@ session_state.json
 tuning_results.json
 health_status.json
 
+# Data snapshots / market data caches (can be large + may contain runtime state)
+data/
+
+# Generated reports (keep generator scripts tracked)
+reports/*.md
+reports/*.json
+reports/*.csv
+
 # Frontend dependencies
 /dashboard/node_modules/
 /dashboard/build/
+
+# Editor OS junk
+.DS_Store
+.vscode/
+.idea/

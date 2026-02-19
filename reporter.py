@@ -197,6 +197,108 @@ class KisReporter:
 
         return report_path, {"total_trades": total_trades, "total_pnl": total_pnl}
 
+    def generate_monthly_report(self, months_ago: int = 0) -> tuple:
+        """월간 리포트 생성"""
+        end_date = datetime.now() - timedelta(days=months_ago * 30)
+        start_date = end_date - timedelta(days=30)
+
+        all_trades = []
+        daily_summaries = []
+
+        for i in range(31):
+            date = start_date + timedelta(days=i)
+            date_str = date.strftime("%Y-%m-%d")
+            try:
+                _, analysis = self.generate_daily_report(date_str)
+                all_trades.append(analysis)
+                daily_summaries.append(
+                    {
+                        "date": date_str,
+                        "trades": analysis["total_trades"],
+                        "pnl": analysis["total_pnl"],
+                        "wins": analysis["wins"],
+                        "losses": analysis["losses"],
+                    }
+                )
+            except Exception:
+                pass
+
+        month_start = start_date.strftime("%Y-%m-%d")
+        month_end = end_date.strftime("%Y-%m-%d")
+        report_path = os.path.join(self.report_dir, f"KIS_Monthly_{month_start}.md")
+
+        total_pnl = sum(d["total_pnl"] for d in all_trades)
+        total_trades = sum(d["total_trades"] for d in all_trades)
+        total_wins = sum(d["wins"] for d in all_trades)
+        total_losses = sum(d["losses"] for d in all_trades)
+        win_rate = (total_wins / total_trades * 100) if total_trades > 0 else 0
+
+        total_wins_pnl = sum(
+            d["avg_win"] * d["wins"] for d in all_trades if d["wins"] > 0
+        )
+        total_losses_pnl = sum(
+            d["avg_loss"] * d["losses"] for d in all_trades if d["losses"] > 0
+        )
+        profit_factor = (
+            abs(total_wins_pnl / total_losses_pnl) if total_losses_pnl != 0 else 0
+        )
+
+        best_day = (
+            max(daily_summaries, key=lambda x: x["pnl"])
+            if daily_summaries
+            else {"date": "N/A", "pnl": 0}
+        )
+        worst_day = (
+            min(daily_summaries, key=lambda x: x["pnl"])
+            if daily_summaries
+            else {"date": "N/A", "pnl": 0}
+        )
+
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write("# 📈 KIS Monthly Report\n")
+            f.write(f"## {month_start} ~ {month_end}\n\n")
+
+            f.write("## 📊 Monthly Summary\n")
+            f.write("| Metric | Value |\n")
+            f.write("| --- | --- |\n")
+            f.write(f"| Total Trades | {total_trades} |\n")
+            f.write(f"| Wins | {total_wins} |\n")
+            f.write(f"| Losses | {total_losses} |\n")
+            f.write(f"| Win Rate | {win_rate:.1f}% |\n")
+            f.write(f"| Total PnL | {total_pnl * 100:.2f}% |\n")
+            f.write(f"| Profit Factor | {profit_factor:.2f} |\n")
+            f.write(
+                f"| Best Day | {best_day['date']} ({best_day['pnl'] * 100:+.2f}%) |\n"
+            )
+            f.write(
+                f"| Worst Day | {worst_day['date']} ({worst_day['pnl'] * 100:+.2f}%) |\n\n"
+            )
+
+            f.write("## 📅 Daily Breakdown\n")
+            f.write("| Date | Trades | PnL | Wins | Losses |\n")
+            f.write("| --- | --- | --- | --- | --- |\n")
+            for d in daily_summaries:
+                pnl_icon = "🟢" if d["pnl"] > 0 else "🔴"
+                f.write(
+                    f"| {d['date']} | {d['trades']} | {pnl_icon} {d['pnl'] * 100:+.2f}% | {d['wins']} | {d['losses']} |\n"
+                )
+
+            f.write("\n## 📈 Performance Analysis\n")
+            f.write(
+                f"- Average trades per day: {total_trades / max(len([d for d in daily_summaries if d['trades'] > 0]), 1):.1f}\n"
+            )
+            f.write(
+                f"- Profitable days: {len([d for d in daily_summaries if d['pnl'] > 0])} / {len(daily_summaries)}\n"
+            )
+            f.write(f"- Win rate: {win_rate:.1f}%\n")
+
+        return report_path, {
+            "total_trades": total_trades,
+            "total_pnl": total_pnl,
+            "win_rate": win_rate,
+            "profit_factor": profit_factor,
+        }
+
 
 # 호환성 유지용 함수
 def generate_daily_report(base_dir: str) -> str:

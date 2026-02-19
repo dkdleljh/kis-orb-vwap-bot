@@ -34,7 +34,20 @@ class Config:
 
 
 def load_config(base_dir: str) -> Config:
+    """Load configuration.
+
+    Default: <base_dir>/config.json
+    Override: env KIS_CONFIG_PATH (absolute or relative to base_dir)
+    """
     _load_env(os.path.join(base_dir, ".env"))
-    with open(os.path.join(base_dir, "config.json"), "r", encoding="utf-8") as f:
+
+    cfg_path = os.environ.get("KIS_CONFIG_PATH", "").strip()
+    if cfg_path:
+        if not os.path.isabs(cfg_path):
+            cfg_path = os.path.join(base_dir, cfg_path)
+    else:
+        cfg_path = os.path.join(base_dir, "config.json")
+
+    with open(cfg_path, "r", encoding="utf-8") as f:
         data = json.load(f)
     return Config(data)

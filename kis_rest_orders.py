@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Dict, Optional
 
 import aiohttp
+import asyncio
 
 from models import OrderResult, Position
 
@@ -237,17 +238,31 @@ class KISRestOrders:
             "CANO": self.account.account_no,
             "ACNT_PRDT_CD": self.account.product_code,
         }
-        headers = await self._auth_headers()
-        headers.update({"tr_id": "TTTC8434R", "custtype": "P"})
 
+        # Retry on rate-limit (EGW00201)
         try:
             session = await self._get_session()
-            async with session.get(url, params=params, headers=headers) as resp:
-                data = await resp.json()
+            for attempt in range(4):
+                headers = await self._auth_headers()
+                headers.update({"tr_id": "TTTC8434R", "custtype": "P"})
 
-            err = self._check_error(data, "get_positions")
-            if err:
-                self.logger.error(f"get_positions failed: {err}")
+                async with session.get(url, params=params, headers=headers) as resp:
+                    data = await resp.json()
+
+                err = self._check_error(data, "get_positions")
+                if err:
+                    if "EGW00201" in err or "초당" in err:
+                        # backoff: 1s,2s,4s
+                        wait = 1 * (2**attempt)
+                        self.logger.warning(f"get_positions rate-limited. retry in {wait}s: {err}")
+                        await asyncio.sleep(wait)
+                        continue
+                    self.logger.error(f"get_positions failed: {err}")
+                    return None
+
+                # success
+                break
+            else:
                 return None
 
             outputs = data.get("output1", [])
@@ -364,20 +379,44 @@ class KISRestOrders:
             last_err = None
             for key_name, params in params_variants:
                 try:
-                    async with session.get(url, params=params, headers=headers) as resp:
-                        try:
-                            data = await resp.json()
-                        except Exception:
-                            text = await resp.text()
-                            self.logger.error(
-                                f"get_cash_available({key_name}) non-json resp: status={resp.status} text={text[:200]}"
-                            )
+                    # Retry on rate-limit (EGW00201)
+                    for attempt in range(4):
+                        async with session.get(url, params=params, headers=headers) as resp:
+                            try:
+                                data = await resp.json()
+                            except Exception:
+                                text = await resp.text()
+                                self.logger.error(
+                                    f"get_cash_available({key_name}) non-json resp: status={resp.status} text={text[:200]}"
+                                )
+                                data = None
+
+                        if not isinstance(data, dict):
+                            break
+
+                        rt_cd = str(data.get("rt_cd", "1"))
+                        if rt_cd == "0":
+                            return await _parse_cash(data)
+
+                        msg_cd = str(data.get("msg_cd", "") or "")
+                        msg1 = str(data.get("msg1", "") or "")
+                        msg = msg1 or msg_cd or "Unknown"
+                        err = f"rt_cd={rt_cd} msg_cd={msg_cd} msg={msg}"
+
+                        if "EGW00201" in err or "초당" in err:
+                            wait = 1 * (2**attempt)
+                            self.logger.warning(f"get_cash_available rate-limited. retry in {wait}s: {err}")
+                            await asyncio.sleep(wait)
                             continue
 
-                    rt_cd = str(data.get("rt_cd", "1"))
-                    if rt_cd == "0":
-                        return await _parse_cash(data)
+                        # fallthrough to variant handling
+                        break
 
+                    # if we reached here, data contains an error that wasn't rate-limit handled
+                    if not isinstance(data, dict):
+                        continue
+
+                    rt_cd = str(data.get("rt_cd", "1"))
                     msg_cd = str(data.get("msg_cd", "") or "")
                     msg1 = str(data.get("msg1", "") or "")
                     msg = msg1 or msg_cd or "Unknown"
@@ -474,3 +513,119 @@ class KISRestOrders:
         except Exception as e:
             self.logger.warning(f"get_open_orders exception: {e}")
             return []
+
+    async def get_fills(
+        self,
+        symbol: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        page: int = 1,
+    ) -> list[dict]:
+        """Get execution/fill history from broker.
+
+        Phase5 LED-01: Fill source for ledger reconciliation.
+
+        Args:
+            symbol: Optional stock code (6 digits). If None, returns all symbols.
+            start_date: Start date in YYYYMMDD format
+            end_date: End date in YYYYMMDD format
+            page: Page number for pagination
+
+        Returns:
+            List of fill records with fields:
+            - fill_id: Unique execution ID
+            - order_id: Related order ID
+            - symbol: Stock code
+            - side: BUY/SELL
+            - qty: Executed quantity
+            - price: Execution price
+            - ts: Execution timestamp
+            - fee: Commission (if available)
+        """
+        url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-ccnl"
+        headers = await self._auth_headers()
+        headers.update({"tr_id": "TTTC8001R", "custtype": "P"})
+
+        from datetime import datetime, timedelta
+
+        if not end_date:
+            end_date = datetime.now().strftime("%Y%m%d")
+        if not start_date:
+            start_date = (datetime.now() - timedelta(days=7)).strftime("%Y%m%d")
+
+        params = {
+            "CANO": self.account.account_no,
+            "ACNT_PRDT_CD": self.account.product_code,
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+            "INQR_DVSN_1": "0",
+            "INQR_DVSN_2": "0",
+            "INQR_STRT_DT": start_date,
+            "INQR_END_DT": end_date,
+            "SLL_BUY_DVSN_CD": "00",
+            "CASH_MGN_DVSN_CD": "00",
+            "PRCS_DVSN_CD": "00",
+            "OFL_YN": "",
+            "page": str(page),
+        }
+
+        if symbol:
+            params["PDNO"] = symbol
+
+        try:
+            session = await self._get_session()
+            async with session.get(url, params=params, headers=headers) as resp:
+                try:
+                    data = await resp.json()
+                except Exception:
+                    # Some broker outages return non-json/empty content-type; treat as no fills.
+                    return []
+
+            err = self._check_error(data, "get_fills")
+            if err:
+                self.logger.warning(f"get_fills failed: {err}")
+                return []
+
+            fills = []
+            out = data.get("output")
+            if isinstance(out, list):
+                for item in out:
+                    fill_id = (
+                        item.get("orgn_odno")
+                        or item.get("odno")
+                        or f"{item.get('cncl_cntr')}@{item.get('exec_prc')}@{item.get('exec_qty')}"
+                    )
+
+                    side_map = {"1": "BUY", "2": "SELL", "买入": "BUY", "卖出": "SELL"}
+                    raw_side = item.get("sll_buy_dvsn_cd") or item.get("ord_dt")
+                    side = side_map.get(str(raw_side), "BUY")
+
+                    fills.append(
+                        {
+                            "fill_id": str(fill_id),
+                            "order_id": str(item.get("odno", "")),
+                            "symbol": str(item.get("pdno", symbol or "")),
+                            "side": side,
+                            "qty": int(item.get("exec_qty", 0)),
+                            "price": float(item.get("exec_prc", 0)),
+                            "ts": item.get("exec_dt") + item.get("exec_tm", ""),
+                            "fee": float(item.get("comm_tax", 0)),
+                            "broker_order_id": str(item.get("orgn_odno", "")),
+                        }
+                    )
+
+            return fills
+
+        except Exception as e:
+            self.logger.warning(f"get_fills exception: {e}")
+            return []
+
+    def _generate_fill_id(self, order_id: str, price: float, qty: int, ts: str) -> str:
+        """Generate deterministic fill ID if broker doesn't provide one.
+
+        Used as fallback when broker execution ID is not available.
+        """
+        import hashlib
+
+        raw = f"{order_id}:{price}:{qty}:{ts}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]

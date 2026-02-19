@@ -1,0 +1,11 @@
+# Optional ML stack (may be heavy / platform-specific)
+# Install only if you actually use ML modules.
+
+scikit-learn==1.3.2
+joblib==1.3.2
+xgboost==2.0.2
+lightgbm==4.1.0
+
+# Torch wheels vary by platform/Python; keep unpinned or pin to a known-good set per machine.
+# torch
+# torchvision

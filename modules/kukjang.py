@@ -2,9 +2,15 @@
 Kukjang Module - 국내주식/ETF trading module.
 
 기존 main.py의 국내주식 거래 로직을 모듈화합니다.
+
+Live gate:
+- KIS_LIVE_ENABLED=1
+- KIS_LIVE_CONFIRM=YES
+- KIS_KILL_SWITCH=0 and STOP_TRADING.flag absent
 """
 
 import asyncio
+import os
 from collections import defaultdict, deque
 from datetime import datetime
 from typing import Optional, Dict, Any, List
@@ -98,9 +104,13 @@ class KukjangModule(BaseTradingModule):
             is_overseas=False,
         )
 
+        # scoring threshold (recommended)
+        scoring_cfg = (config.get("scoring", {}) or {})
+        kr_scalp_th = int(scoring_cfg.get("kr_scalp_entry_threshold", 72))
+
         self.perfect_strategy = Perfect100Strategy(
             logger=self.logger,
-            min_score=60,
+            min_score=kr_scalp_th,
             max_spread_pct=self.max_spread_pct,
             min_bid_ask_ratio=0.8,
             min_win_rate=0.55,
@@ -289,7 +299,23 @@ class KukjangModule(BaseTradingModule):
                 market_regime=self.market_regime,
             )
             if signal.side:
-                self.log_info(f"Signal: {signal.symbol} score OK")
+                # standardized score line
+                from scoring import ScoreBreakdown, SignalScore
+                from core.audit_log import audit_decision
+
+                bd = ScoreBreakdown({"MQ": 25, "MOMO": 25, "VWAP": 20, "OR": 20, "RR": 10})
+                out = SignalScore(
+                    symbol=str(signal.symbol),
+                    side=str(signal.side),
+                    score=float(getattr(signal, "score", bd.total) or bd.total),
+                    threshold=float(self.perfect_strategy.min_score),
+                    market="KR",
+                    style="SCALP",
+                    risk_grade="B",
+                    breakdown=bd,
+                    reasons=list(signal.reasons or []),
+                )
+                self.log_info(out.to_line())
                 await self._handle_entry(signal, book)
         except Exception as e:
             self.log_error(f"Entry evaluation failed: {e}")
@@ -359,8 +385,22 @@ class KukjangModule(BaseTradingModule):
             self.log_error(f"Indicator calculation failed: {e}")
             return None
 
+    def _live_allowed(self) -> bool:
+        # KR live gate
+        if os.environ.get("KIS_KILL_SWITCH", "0").strip() == "1":
+            return False
+        if os.path.exists(os.path.join(os.path.dirname(__file__), "..", "STOP_TRADING.flag")):
+            return False
+        if os.environ.get("KIS_LIVE_ENABLED", "0").strip() != "1":
+            return False
+        return os.environ.get("KIS_LIVE_CONFIRM", "").strip().upper() == "YES"
+
     async def _handle_entry(self, signal: PerfectSignal, book: OrderBookTop) -> None:
         if self.perfect_strategy.state != State.WAIT_SIGNAL:
+            return
+
+        if not self._live_allowed():
+            self.log_warning("KR live ordering suppressed (set KIS_LIVE_ENABLED=1 and KIS_LIVE_CONFIRM=YES; ensure kill switch OFF)")
             return
 
         symbol: str = signal.symbol if signal.symbol else ""
@@ -452,7 +492,27 @@ class KukjangModule(BaseTradingModule):
                 self.log_info(
                     f"TP1 Scale-out: {pos.symbol} PnL={net_pnl_pct:.2%} (gross={gross_pnl_pct:.2%})"
                 )
-                await self.rest.place_sell_market(pos.symbol, half_qty)
+                from core.correlation import new_corr
+                corr = new_corr("kr_exit")
+                audit_decision(
+                    symbol=pos.symbol,
+                    kind="exit_plan",
+                    correlation_id=corr,
+                    market="KR",
+                    style="SCALP",
+                    side="SELL",
+                    extra={"reason": "tp1_scale_out", "qty": int(half_qty)},
+                )
+                r = await self.rest.place_sell_market(pos.symbol, half_qty)
+                audit_decision(
+                    symbol=pos.symbol,
+                    kind="order_result",
+                    correlation_id=corr,
+                    market="KR",
+                    style="SCALP",
+                    side="SELL",
+                    extra={"reason": "tp1_scale_out", "odno": getattr(r, 'order_id', None), "order": getattr(r, '__dict__', None) or str(r)},
+                )
                 pos.qty -= half_qty
                 pos.tp1_done = True
 
@@ -500,11 +560,51 @@ class KukjangModule(BaseTradingModule):
 
         if current_book and current_book.bid > 0:
             exit_price = current_book.bid
-            await self.rest.place_sell_limit(pos.symbol, pos.qty, current_book.bid)
+            from core.correlation import new_corr
+            corr = new_corr("kr_exit")
+            audit_decision(
+                symbol=pos.symbol,
+                kind="exit_plan",
+                correlation_id=corr,
+                market="KR",
+                style="SCALP",
+                side="SELL",
+                extra={"reason": reason, "qty": int(pos.qty), "limit_price": float(current_book.bid)},
+            )
+            r = await self.rest.place_sell_limit(pos.symbol, pos.qty, current_book.bid)
+            audit_decision(
+                symbol=pos.symbol,
+                kind="order_result",
+                correlation_id=corr,
+                market="KR",
+                style="SCALP",
+                side="SELL",
+                extra={"reason": reason, "odno": getattr(r, 'order_id', None), "order": getattr(r, '__dict__', None) or str(r)},
+            )
             self.log_info(f"Exit order: {reason} price={current_book.bid}")
         else:
             exit_price = self.last_price.get(pos.symbol, pos.avg_price)
-            await self.rest.place_sell_market(pos.symbol, pos.qty)
+            from core.correlation import new_corr
+            corr = new_corr("kr_exit")
+            audit_decision(
+                symbol=pos.symbol,
+                kind="exit_plan",
+                correlation_id=corr,
+                market="KR",
+                style="SCALP",
+                side="SELL",
+                extra={"reason": reason, "qty": int(pos.qty), "order_type": "MKT"},
+            )
+            r = await self.rest.place_sell_market(pos.symbol, pos.qty)
+            audit_decision(
+                symbol=pos.symbol,
+                kind="order_result",
+                correlation_id=corr,
+                market="KR",
+                style="SCALP",
+                side="SELL",
+                extra={"reason": reason, "odno": getattr(r, 'order_id', None), "order": getattr(r, '__dict__', None) or str(r)},
+            )
             self.log_info(f"Exit order (market): {reason}")
 
         await asyncio.sleep(2)

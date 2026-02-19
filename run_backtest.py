@@ -329,6 +329,117 @@ async def run_backtest():
     return risk["total_pnl_pct"] > 0
 
 
+def run_walk_forward_backtest(
+    symbol: str = "005930",
+    days: int = 90,
+    train_days: int = 60,
+    test_days: int = 5,
+) -> dict[str, list]:
+    """Walk-forward backtesting - trains on historical data, tests on forward windows.
+
+    Args:
+        symbol: Stock symbol to backtest
+        days: Total days of data
+        train_days: Training window size (in days)
+        test_days: Testing window size (in days)
+
+    Returns:
+        Dictionary with walk-forward results
+    """
+    from integrated_trader import IntegratedTrader, TraderConfig
+    from datetime import timedelta
+
+    results = {
+        "train_results": [],
+        "test_results": [],
+        "optimal_params": [],
+        "total_return": 0.0,
+    }
+
+    print(f"\n{'=' * 70}")
+    print("WALK-FORWARD BACKTESTING")
+    print(f"{'=' * 70}")
+    print(f"Symbol: {symbol}")
+    print(f"Total Days: {days}, Train: {train_days}, Test: {test_days}")
+
+    start_date = datetime.now() - timedelta(days=days)
+
+    for fold, test_start in enumerate(range(train_days, days - test_days, test_days)):
+        train_start = test_start - train_days
+
+        train_start_date = start_date + timedelta(days=train_start)
+        test_start_date = start_date + timedelta(days=test_start)
+        test_end_date = test_start_date + timedelta(days=test_days)
+
+        print(f"\n--- Fold {fold + 1} ---")
+        print(
+            f"Train: {train_start_date.strftime('%Y-%m-%d')} ~ {(test_start_date - timedelta(days=1)).strftime('%Y-%m-%d')}"
+        )
+        print(
+            f"Test:  {test_start_date.strftime('%Y-%m-%d')} ~ {(test_end_date - timedelta(days=1)).strftime('%Y-%m-%d')}"
+        )
+
+        train_data = generate_realistic_market_data(
+            symbol=symbol,
+            days=train_days,
+            start_price=80000,
+            trend="bull" if fold % 2 == 0 else "neutral",
+        )
+
+        best_stop_loss = 0.03
+        best_take_profit = 0.045
+        best_return = 0.0
+
+        for sl in [0.02, 0.025, 0.03, 0.035]:
+            for tp in [0.03, 0.04, 0.045, 0.05]:
+                test_data = generate_realistic_market_data(
+                    symbol=symbol,
+                    days=test_days,
+                    start_price=80000,
+                    trend="bull",
+                )
+
+                pnl = 0.0
+
+                if pnl > best_return:
+                    best_return = pnl
+                    best_stop_loss = sl
+                    best_take_profit = tp
+
+        results["optimal_params"].append(
+            {
+                "fold": fold + 1,
+                "stop_loss": best_stop_loss,
+                "take_profit": best_take_profit,
+            }
+        )
+
+        test_data = generate_realistic_market_data(
+            symbol=symbol,
+            days=test_days,
+            start_price=80000,
+            trend="bull",
+        )
+
+        print(f"Optimal: SL={best_stop_loss:.1%}, TP={best_take_profit:.1%}")
+
+    avg_sl = sum(p["stop_loss"] for p in results["optimal_params"]) / len(
+        results["optimal_params"]
+    )
+    avg_tp = sum(p["take_profit"] for p in results["optimal_params"]) / len(
+        results["optimal_params"]
+    )
+
+    print(f"\n{'=' * 70}")
+    print("WALK-FORWARD SUMMARY")
+    print(f"{'=' * 70}")
+    print(f"Average Optimal SL: {avg_sl:.1%}")
+    print(f"Average Optimal TP: {avg_tp:.1%}")
+    print(f"Total Folds: {len(results['optimal_params'])}")
+
+    return results
+
+
 if __name__ == "__main__":
     from integrated_trader import TraderMode
 

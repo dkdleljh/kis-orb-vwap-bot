@@ -32,12 +32,37 @@ def is_internet_connected():
 
 
 def is_maintenance_time():
-    """서버 점검 시간인지 확인"""
+    """서버 점검 시간인지 확인.
+
+    Recommended behavior:
+    - Keep the rule simple and conservative.
+    - Support a configurable window list (KIS_MAINTENANCE_HOURS) while also
+      guarding the common 04:00~05:59 maintenance region.
+    """
     now = datetime.now()
-    # 새벽 4~5시는 보통 증권사 점검
-    if now.hour == 4 or now.hour == 5:
+
+    # Common broker maintenance window.
+    if now.hour in (4, 5):
         return True
-    return False
+
+    # Optional configured windows (hour, minute) tuples.
+    try:
+        (h1, m1), (h2, m2) = KIS_MAINTENANCE_HOURS
+        start = now.replace(hour=int(h1), minute=int(m1), second=0, microsecond=0)
+        end = now.replace(hour=int(h2), minute=int(m2), second=0, microsecond=0)
+        # handle crossing midnight
+        if end <= start:
+            if now >= start:
+                return True
+            end = end + timedelta(days=1)
+            if now < start:
+                now_cmp = now + timedelta(days=1)
+            else:
+                now_cmp = now
+            return start <= now_cmp <= end
+        return start <= now <= end
+    except Exception:
+        return False
 
 
 def get_schedule(config):
@@ -250,6 +275,31 @@ def main():
                         print(f"[Scheduler] Report Saved: {report}")
                     except Exception as e:
                         print(f"[Scheduler] Report Error: {e}")
+                        base_dir = os.path.dirname(os.path.abspath(__file__))
+
+                    # 주간 리포트 생성 (매주 월요일 09:00)
+                    if now.weekday() == 0 and now.hour == 9 and now.minute == 0:
+                        try:
+                            print("[Scheduler] Generating Weekly Report...")
+                            from reporter import KisReporter
+
+                            reporter = KisReporter(base_dir)
+                            report, _ = reporter.generate_weekly_report()
+                            print(f"[Scheduler] Weekly Report Saved: {report}")
+                        except Exception as e:
+                            print(f"[Scheduler] Weekly Report Error: {e}")
+
+                    # 월간 리포트 생성 (매월 1일 09:00)
+                    if now.day == 1 and now.hour == 9 and now.minute == 0:
+                        try:
+                            print("[Scheduler] Generating Monthly Report...")
+                            from reporter import KisReporter
+
+                            reporter = KisReporter(base_dir)
+                            report, _ = reporter.generate_monthly_report()
+                            print(f"[Scheduler] Monthly Report Saved: {report}")
+                        except Exception as e:
+                            print(f"[Scheduler] Monthly Report Error: {e}")
 
                 # 다음 날 아침까지 긴 대기 (불필요한 CPU 소모 방지)
                 if now > stop_dt:

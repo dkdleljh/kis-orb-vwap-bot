@@ -6,7 +6,7 @@ Pro Trader Phase 3 - Auto Recovery Manager
 
 import asyncio
 from datetime import datetime
-from typing import Dict, List, Optional, Any, Callable
+from typing import Dict, List, Optional, Any, Callable, Iterable, Tuple
 from dataclasses import dataclass
 from enum import Enum
 
@@ -104,27 +104,43 @@ class AutoRecoveryManager:
         qty: int,
         price: float,
     ) -> Optional[Any]:
-        """주문 실패 복구"""
+        """주문 실패 복구.
+
+        Recommended contract:
+        - place_order_func(symbol, qty, price) -> result with .order_id
+        - cancel_order_func(order_id, symbol, qty) (best-effort)
+
+        NOTE: If an order_id is not available, cancellation is skipped.
+        """
+
+        last_order_id: str | None = None
+
         for attempt in range(self.max_retries):
             try:
                 result = await place_order_func(symbol, qty, price)
-                
-                if result and result.order_id:
-                    self.logger.info(f"Order placed successfully: {result.order_id}")
+
+                if result and getattr(result, "order_id", ""):
+                    last_order_id = str(getattr(result, "order_id"))
+                    self.logger.info(f"Order placed successfully: {last_order_id}")
                     return result
-                    
+
             except Exception as e:
                 self.logger.error(f"Order failed (attempt {attempt + 1}): {e}")
-            
+
             await asyncio.sleep(self.retry_delay * (attempt + 1))
-        
-        self.logger.error(f"Order failed after {self.max_retries} attempts, attempting cancellation")
-        
-        try:
-            await cancel_order_func(symbol, qty)
-        except Exception as e:
-            self.logger.error(f"Cancel order also failed: {e}")
-        
+
+        self.logger.error(
+            f"Order failed after {self.max_retries} attempts, attempting cancellation (best-effort)"
+        )
+
+        if last_order_id:
+            try:
+                await cancel_order_func(last_order_id, symbol, qty)
+            except Exception as e:
+                self.logger.error(f"Cancel order also failed: {e}")
+        else:
+            self.logger.warning("No order_id captured; skipping cancellation")
+
         self._record_recovery(RecoveryEvent.ORDER_FAILED, False, f"Order failed for {symbol}")
         return None
     
@@ -149,10 +165,12 @@ class AutoRecoveryManager:
         
         return True
     
-    async def health_check(self, check_funcs: List[Callable]) -> Dict[str, bool]:
+    async def health_check(
+        self, check_funcs: Iterable[Tuple[str, Callable[[], Any]]]
+    ) -> Dict[str, bool]:
         """전체 건강성 체크"""
-        results = {}
-        
+        results: Dict[str, bool] = {}
+
         for name, check_func in check_funcs:
             try:
                 result = await asyncio.wait_for(check_func(), timeout=10)

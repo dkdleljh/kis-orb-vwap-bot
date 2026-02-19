@@ -3,11 +3,15 @@
 Purpose:
 - compare internal derived ledger/oms state with broker-reported positions/orders
 - surface discrepancies early (before they become risk events)
+- REC-01: Reconcile-first gate for engine start/restart
 
 Feature flag:
-    KIS_INSTITUTIONAL_RECONCILE=1
+    KIS_INSTITURAL_RECONCILE=1
 
-Until Phase3 integration, this module is intentionally unused.
+REC-01/REC-02 Extension:
+- Cash reconciliation
+- Reconcile-first gate (block before trading)
+- Automatic kill-switch on CRITICAL
 """
 
 from __future__ import annotations
@@ -42,16 +46,7 @@ def reconcile_positions(
     internal: Dict[str, Dict[str, Any]],
     broker: Dict[str, Dict[str, Any]],
 ) -> List[ReconcileIssue]:
-    """Compare internal vs broker positions.
-
-    Args:
-        internal: mapping symbol -> {qty, avg_price, ...}
-        broker: mapping symbol -> {qty, avg_price, ...}
-
-    Returns:
-        List of human-readable issues.
-    """
-
+    """Compare internal vs broker positions."""
     issues: List[ReconcileIssue] = []
     syms = set(internal) | set(broker)
     for sym in sorted(syms):
@@ -71,6 +66,41 @@ def reconcile_positions(
                 )
             )
     return issues
+
+
+def reconcile_cash(
+    internal_cash: float,
+    broker_cash: float,
+    tolerance: float = 1000.0,
+) -> List[ReconcileIssue]:
+    """Compare internal cash vs broker cash.
+
+    Args:
+        internal_cash: Cash from internal ledger
+        broker_cash: Cash from broker API
+        tolerance: Acceptable difference in KRW
+
+    Returns:
+        List of issues (empty if within tolerance)
+    """
+    diff = abs(internal_cash - broker_cash)
+    if diff > tolerance:
+        return [
+            ReconcileIssue(
+                kind="cash_mismatch",
+                symbol=None,
+                message=f"cash mismatch internal={internal_cash} broker={broker_cash} diff={diff}",
+                details={
+                    "internal": internal_cash,
+                    "broker": broker_cash,
+                    "diff": diff,
+                },
+                severity=ReconcileSeverity.CRITICAL
+                if diff > tolerance * 10
+                else ReconcileSeverity.WARNING,
+            )
+        ]
+    return []
 
 
 def reconcile_open_orders(

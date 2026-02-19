@@ -26,7 +26,7 @@
     "ping_interval_sec": 20
   },
   "trading": {
-    "entry_budget_pct": 0.2,
+    "entry_budget_pct": 0.15,
     "max_entries_per_day": 10,
     "stop_loss_pct": -0.015,
     "take_profit_pct": 0.03,
@@ -39,6 +39,14 @@
     "use_atr_stops": true,
     "atr_multiplier": 2.0,
     "enable_time_filter": true,
+
+    "scoring": {
+      "kr_scalp_entry_threshold": 72,
+      "kr_swing_entry_threshold": 65,
+      "us_scalp_entry_threshold": 75,
+      "us_swing_entry_threshold": 68
+    },
+
     "min_entry_score": 50,
     "same_day_trading": true,
     "max_trades_per_symbol": 3,
@@ -112,6 +120,30 @@
         "remove_after_miss_count": 2
       }
     },
+
+    "kr_swing": {
+      "enabled": true,
+      "symbols": [],
+      "lever": "122630",
+      "inverse": "114800",
+      "bar_minutes": 15,
+      "entry_budget_pct": 0.15,
+      "stop_loss_pct": -0.02,
+      "take_profit_pct": 0.05,
+      "entry_retry_limit": 3
+    },
+
+    "us_swing": {
+      "enabled": true,
+      "symbols": ["AAPL", "MSFT", "NVDA", "TSLA"],
+      "exchange": "NASD",
+      "bar_minutes": 15,
+      "entry_budget_pct": 0.12,
+      "stop_loss_pct": -0.03,
+      "take_profit_pct": 0.06,
+      "entry_retry_limit": 3
+    },
+
     "hwanjeon": {
       "enabled": true,
       "currencies": [

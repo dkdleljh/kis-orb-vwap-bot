@@ -166,14 +166,22 @@ class KISAuth:
                     return self.token
 
                 # No cached token available.
-                self._assert_dummy_allowed("token")
-                if self._should_log_market_closed():
-                    self.logger.info(
-                        f"Market Closed ({now.strftime('%H:%M')}). No token. Using dummy token (dev mode)."
-                    )
-                self.token = AuthToken("DUMMY", "Bearer", 0)
-                self._token_expire_at = self._now() + 300
-                return self.token
+                # In live mode, do NOT silently fall back to dummy tokens.
+                # KIS REST tokens are commonly needed for overseas trading (night KST).
+                if self._live_mode_enabled():
+                    if self._should_log_market_closed():
+                        self.logger.info(
+                            f"Market Closed ({now.strftime('%H:%M')}). No token cached. Fetching real token (live mode)."
+                        )
+                else:
+                    self._assert_dummy_allowed("token")
+                    if self._should_log_market_closed():
+                        self.logger.info(
+                            f"Market Closed ({now.strftime('%H:%M')}). No token. Using dummy token (dev mode)."
+                        )
+                    self.token = AuthToken("DUMMY", "Bearer", 0)
+                    self._token_expire_at = self._now() + 300
+                    return self.token
 
         async with self._lock:
             if self.token and self._now() < (self._token_expire_at - 60):
@@ -329,6 +337,29 @@ class KISAuth:
             self._approval_expire_at = self._now() + max(0, approval_key.expires_in)
             self.logger.info("websocket approval key fetched")
             return approval_key
+
+    async def hashkey(self, payload: dict) -> str:
+        """Compute KIS hashkey for POST body.
+
+        Many trading endpoints require `hashkey` header.
+        """
+        url = f"{self.base_url}/uapi/hashkey"
+        headers = {
+            "content-type": "application/json",
+            "appkey": self.app_key,
+            "appsecret": self.app_secret,
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, headers=headers, timeout=10) as resp:
+                    data = await resp.json()
+            h = str(data.get("HASH") or "")
+            if not h:
+                raise RuntimeError(f"hashkey_missing resp={data}")
+            return h
+        except Exception as e:
+            # Best-effort: bubble up to caller
+            raise RuntimeError(f"hashkey failed: {e}")
 
     def auth_headers(self) -> dict:
         if not self.token:
