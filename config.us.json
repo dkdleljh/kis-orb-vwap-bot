@@ -60,7 +60,7 @@
       "enabled": false
     },
     "us_swing": {
-      "enabled": true,
+      "enabled": false,
       "symbols": [
         "AAPL",
         "MSFT",
