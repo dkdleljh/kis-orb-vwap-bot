@@ -430,6 +430,77 @@ def main() -> int:
                 lines.append(f"- {t} {one.side} strength={one.strength:.2f} model={one.model} ctx={ctx2}")
             lines.append("")
 
+    # --- Reasons analysis (win/loss) ------------------------------------
+    # Best-effort: join BUY fills to the most recent prior Signal (<=10min)
+    # and bucket reasons by whether the symbol had positive/negative realized PnL.
+    lines.append("## 시그널 사유 분석(승/패 기준, best-effort)\n")
+
+    reason_win: Counter[str] = Counter()
+    reason_lose: Counter[str] = Counter()
+
+    # index signals by symbol (sorted)
+    sig_by_sym: Dict[str, List[SignalRec]] = defaultdict(list)
+    for s in signals:
+        sig_by_sym[s.symbol].append(s)
+    for sym in sig_by_sym:
+        sig_by_sym[sym] = sorted(sig_by_sym[sym], key=lambda x: x.ts)
+
+    def _nearest_signal(sym: str, t: dt.datetime, *, window_min: int = 10) -> Optional[SignalRec]:
+        ss = sig_by_sym.get(sym) or []
+        if not ss:
+            return None
+        best: Optional[SignalRec] = None
+        for one in ss:
+            if one.ts <= t:
+                best = one
+            else:
+                break
+        if best is None:
+            return None
+        delta = (t - best.ts).total_seconds()
+        if delta < 0:
+            return None
+        if delta > window_min * 60:
+            return None
+        return best
+
+    for sym in traded_symbols:
+        fills = fills_by_symbol[sym]
+        realized, _, _ = _fifo_realized_pnl(fills)
+        bucket = reason_win if realized > 0 else reason_lose
+
+        # take first BUY fill time as entry proxy
+        buy_fills = [f for f in sorted(fills, key=lambda x: x.ts) if f.side.upper() == "BUY"]
+        if not buy_fills:
+            continue
+        srec = _nearest_signal(sym, buy_fills[0].ts)
+        if srec is None:
+            continue
+        ctx = srec.context or {}
+        reasons = ctx.get("reasons")
+        if isinstance(reasons, list):
+            for r in reasons:
+                if r:
+                    bucket[str(r)] += 1
+        else:
+            rs = str(ctx.get("reason_short") or "").strip()
+            if rs:
+                for r in [x.strip() for x in rs.split(",") if x.strip()]:
+                    bucket[r] += 1
+
+    if not reason_win and not reason_lose:
+        lines.append("- (분석에 필요한 시그널 컨텍스트가 부족합니다. 내일 로그부터 자동으로 채워집니다.)\n")
+    else:
+        if reason_win:
+            lines.append("- 승리(실현손익>0) TOP:")
+            for r, c in reason_win.most_common(10):
+                lines.append(f"  - {r}: {c}")
+        if reason_lose:
+            lines.append("- 패배/기타(실현손익<=0) TOP:")
+            for r, c in reason_lose.most_common(10):
+                lines.append(f"  - {r}: {c}")
+        lines.append("")
+
     # Per symbol detail
     if not traded_symbols:
         lines.append("## 체결 상세(종목별)\n")

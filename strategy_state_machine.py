@@ -146,6 +146,7 @@ class StrategyStateMachine:
         max_spread_pct: float,
         indicators: dict[str, float] | None = None,
         market_regime: str = "NEUTRAL",  # BULL / BEAR / NEUTRAL
+        min_score: float = 50.0,
     ) -> Signal:
         """Evaluate whether current market conditions trigger an entry signal.
 
@@ -312,7 +313,8 @@ class StrategyStateMachine:
             reasons.append("TOO_HIGH")
 
         # --- 최종 판정 (Decision) ---
-        if score >= 50:
+        # min_score는 외부에서 동적으로 조정 가능(변동성/스프레드/시장국면 기반)
+        if score >= float(min_score):
             target_symbol = (
                 book.symbol
                 if book.symbol not in [lever_symbol, inverse_symbol]

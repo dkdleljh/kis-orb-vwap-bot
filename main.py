@@ -890,6 +890,36 @@ class TradingEngine:
                 self.logger.debug(f"[ML Filter] {symbol} ML score too low: {ml_score}")
                 return
 
+            # --- Dynamic entry threshold (recommended defaults) ---
+            # Base from config: trading.scoring.kr_scalp_entry_threshold (fallback=50)
+            base_thr = 50.0
+            try:
+                sc = (self.config.get("trading", {}) or {}).get("scoring", {}) or {}
+                base_thr = float(sc.get("kr_scalp_entry_threshold", 50) or 50)
+            except Exception:
+                base_thr = 50.0
+
+            spread_pct = float(book.spread_pct) if book is not None else 0.0
+            atr_pct = float(indicators.get("atr_percent", 0) or 0)
+
+            # Adjustments (conservative):
+            # - high vol / wide spread -> stricter
+            # - BULL -> slightly looser
+            # - BEAR -> stricter
+            adj = 0.0
+            if atr_pct >= 3.0:
+                adj += 5.0
+            if atr_pct >= 5.0:
+                adj += 5.0
+            if spread_pct >= 0.003:
+                adj += 5.0
+            if self.market_regime == "BULL":
+                adj -= 3.0
+            if self.market_regime == "BEAR":
+                adj += 10.0
+
+            min_score = max(45.0, min(85.0, base_thr + adj))
+
             signal = self.state_machine.evaluate_entry(
                 bar=bar,
                 last_price=last_price,
@@ -900,6 +930,7 @@ class TradingEngine:
                 max_spread_pct=self.max_spread_pct,
                 indicators=indicators,
                 market_regime=self.market_regime,  # 시장 상태 전달
+                min_score=min_score,
             )
             if signal.side:
                 self.logger.info(
@@ -923,6 +954,7 @@ class TradingEngine:
                                 "ma20": float(indicators.get("ma20", 0) or 0),
                                 "ml_score": float(indicators.get("ml_score", 50) or 50),
                                 "score": float(getattr(signal, "score", 0.0) or 0.0),
+                                "min_score": float(min_score),
                                 "reasons": list(getattr(signal, "reasons", []) or []),
                                 "reason_short": ",".join(list(getattr(signal, "reasons", []) or [])[:6]),
                                 "atr": float(indicators.get("atr", 0) or 0),
@@ -1869,27 +1901,13 @@ class TradingEngine:
                         await self.handle_exit("stop_loss (ATR)")
                         return
 
-        # 0. Quick Profit (1%): 수익 1% 이상 시 즉시 전량 익절
-        # (ATR 기반 익절이 먼저 작동하므로, ATR 조건이 충족되지 않았을 때만 여기로 옴)
-        if pnl_pct >= self.quick_profit_pct and not pos.profit_locked:
-            self.logger.info(
-                f" PROFIT TARGET🎯 QUICK REACHED: {pos.symbol} PnL={pnl_pct:.2%}"
-            )
-            pos.profit_locked = True
-            await self.handle_exit("quick_profit_1pct")
-            return
-
-        # 0-1. Profit Lock: 1% 달성 후 0.5% 이상 하락 시 익절 (수익 보장)
-        if pos.profit_locked and pnl_pct < self.min_profit_for_guarantee_pct:
-            self.logger.info(
-                f"🔒 PROFIT LOCKED - Protecting gains: {pos.symbol} PnL={pnl_pct:.2%}"
-            )
-            await self.handle_exit("profit_lock_protection")
-            return
-
         # --- 고급 청산 로직 (Advanced Exit) ---
+        # 권장 순서(안정적인 수익 분포):
+        # 1) TP1(부분익절) -> 2) Profit Lock 보호 -> 3) (필요시) 전량 익절
 
-        # 1. 부분 익절 (Scale-out): 1% 수익 시 절반 익절
+        # 1. 부분 익절 (Scale-out): +1% 도달 시 절반 익절
+        # - 포지션이 2주 이상일 때만 수행
+        # - 수행 후 profit_locked=True로 전환해서 이익 보호 로직이 동작하도록 함
         if pnl_pct >= self.quick_profit_pct and not pos.tp1_done and pos.qty > 1:
             half_qty = int(pos.qty * 0.5)
             if half_qty > 0:
@@ -1901,6 +1919,24 @@ class TradingEngine:
                 pos.tp1_done = True
                 pos.profit_locked = True
                 return
+
+        # 2. Quick Profit (1%):
+        # - 포지션이 1주뿐이거나(부분익절 불가), TP1 이후에도 계속 강하면 전량 익절
+        if pnl_pct >= self.quick_profit_pct and not pos.profit_locked:
+            self.logger.info(
+                f" PROFIT TARGET🎯 QUICK REACHED: {pos.symbol} PnL={pnl_pct:.2%}"
+            )
+            pos.profit_locked = True
+            await self.handle_exit("quick_profit_1pct")
+            return
+
+        # 3. Profit Lock: +1% 달성 후 수익이 다시 꺾이면 청산하여 이익 보호
+        if pos.profit_locked and pnl_pct < self.min_profit_for_guarantee_pct:
+            self.logger.info(
+                f"🔒 PROFIT LOCKED - Protecting gains: {pos.symbol} PnL={pnl_pct:.2%}"
+            )
+            await self.handle_exit("profit_lock_protection")
+            return
 
         # 2. 고점 수익률 갱신 (Trailing Stop용)
         if pos.symbol in self.peak_pnl_pct:
