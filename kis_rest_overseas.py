@@ -132,6 +132,8 @@ class KISOverseasRestOrders:
             "dayornight": "JTTT3010R",
             # Inquire not-concluded (미체결): TTTS3018R
             "nccs": "TTTS3018R" if not is_paper else "VTTS3018R",
+            # Reserved order list (US): TTTT3039R
+            "resv_list_us": "TTTT3039R" if not is_paper else "VTTT3039R",
         }
         return tr_id_map.get(endpoint, "TTTP6002E")
 
@@ -380,6 +382,69 @@ class KISOverseasRestOrders:
                 data = await resp.json()
 
             err = self._check_error(data, f"inquire_nccs({exchange})")
+            if err:
+                break
+
+            body_out = data.get("output")
+            if isinstance(body_out, list):
+                for r in body_out:
+                    if isinstance(r, dict):
+                        out_rows.append(r)
+            elif isinstance(body_out, dict):
+                out_rows.append(body_out)
+
+            fk200 = str(data.get("ctx_area_fk200") or data.get("CTX_AREA_FK200") or "")
+            nk200 = str(data.get("ctx_area_nk200") or data.get("CTX_AREA_NK200") or "")
+            if not fk200 and not nk200:
+                break
+
+        return out_rows
+
+    async def order_resv_list_us(
+        self,
+        *,
+        exchange: str,
+        inqr_strt_dt: str,
+        inqr_end_dt: str,
+        inqr_dvsn_cd: str = "00",
+        prdt_type_cd: str = "512",
+        max_pages: int = 5,
+    ) -> list[dict]:
+        """Overseas reserved order list (US).
+
+        Endpoint:
+        - /uapi/overseas-stock/v1/trading/order-resv-list
+
+        Params notes (from official samples):
+        - INQR_DVSN_CD: 00 전체 / 01 일반해외주식 / 02 미니스탁
+        - PRDT_TYPE_CD: default 512
+        - This API may not support demo accounts.
+        """
+        url = f"{self.base_url}/uapi/overseas-stock/v1/trading/order-resv-list"
+        headers = await self._auth_headers()
+        headers.update({"tr_id": self._get_tr_id("resv_list_us"), "custtype": "P"})
+
+        fk200 = ""
+        nk200 = ""
+        out_rows: list[dict] = []
+
+        session = await self._get_session()
+        for _ in range(max(1, int(max_pages))):
+            params = {
+                "CANO": self.account.account_no,
+                "ACNT_PRDT_CD": self.account.product_code,
+                "INQR_STRT_DT": inqr_strt_dt,
+                "INQR_END_DT": inqr_end_dt,
+                "INQR_DVSN_CD": inqr_dvsn_cd,
+                "OVRS_EXCG_CD": exchange,
+                "PRDT_TYPE_CD": prdt_type_cd,
+                "CTX_AREA_FK200": fk200,
+                "CTX_AREA_NK200": nk200,
+            }
+            async with session.get(url, headers=headers, params=params) as resp:
+                data = await resp.json()
+
+            err = self._check_error(data, f"order_resv_list_us({exchange})")
             if err:
                 break
 
