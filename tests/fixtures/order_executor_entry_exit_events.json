@@ -1,0 +1,101 @@
+[
+  {
+    "payload": {
+      "broker_order_id": "OID-BUY-0001",
+      "correlation_id": "corr:AAPL:BUY",
+      "idempotency_key": "idem:AAPL:BUY:20260220T0010"
+    },
+    "run_id": "run-golden-order-executor",
+    "schema_version": 1,
+    "symbol": "AAPL",
+    "ts": "2026-02-20T00:00:00.000Z",
+    "type": "OrderSubmitted"
+  },
+  {
+    "payload": {
+      "broker_order_id": "OID-BUY-0001",
+      "correlation_id": "corr:AAPL:BUY",
+      "idempotency_key": "idem:AAPL:BUY:20260220T0010",
+      "status": "ACK"
+    },
+    "run_id": "run-golden-order-executor",
+    "schema_version": 1,
+    "symbol": "AAPL",
+    "ts": "2026-02-20T00:00:01.000Z",
+    "type": "OrderAck"
+  },
+  {
+    "payload": {
+      "broker_order_id": "OID-BUY-0001",
+      "correlation_id": "corr:AAPL:BUY",
+      "fee": 0.12,
+      "idempotency_key": "idem:AAPL:BUY:20260220T0010",
+      "module": "engine_orb_vwap",
+      "price": 100.5,
+      "qty": 2,
+      "side": "BUY"
+    },
+    "run_id": "run-golden-order-executor",
+    "schema_version": 1,
+    "symbol": "AAPL",
+    "ts": "2026-02-20T00:00:02.000Z",
+    "type": "Fill"
+  },
+  {
+    "payload": {
+      "correlation_id": "corr:AAPL:SELL",
+      "idempotency_key": "idem:AAPL:SELL:20260220T0011",
+      "module": "engine_orb_vwap",
+      "order_type": "LMT",
+      "qty": 2,
+      "side": "SELL"
+    },
+    "run_id": "run-golden-order-executor",
+    "schema_version": 1,
+    "symbol": "AAPL",
+    "ts": "2026-02-20T00:00:03.000Z",
+    "type": "OrderIntent"
+  },
+  {
+    "payload": {
+      "broker_order_id": "OID-SELL-0001",
+      "correlation_id": "corr:AAPL:SELL",
+      "idempotency_key": "idem:AAPL:SELL:20260220T0011"
+    },
+    "run_id": "run-golden-order-executor",
+    "schema_version": 1,
+    "symbol": "AAPL",
+    "ts": "2026-02-20T00:00:04.000Z",
+    "type": "OrderSubmitted"
+  },
+  {
+    "payload": {
+      "broker_order_id": "OID-SELL-0001",
+      "correlation_id": "corr:AAPL:SELL",
+      "idempotency_key": "idem:AAPL:SELL:20260220T0011",
+      "status": "ACK"
+    },
+    "run_id": "run-golden-order-executor",
+    "schema_version": 1,
+    "symbol": "AAPL",
+    "ts": "2026-02-20T00:00:05.000Z",
+    "type": "OrderAck"
+  },
+  {
+    "payload": {
+      "broker_order_id": "OID-SELL-0001",
+      "correlation_id": "corr:AAPL:SELL",
+      "fee": 0.16,
+      "idempotency_key": "idem:AAPL:SELL:20260220T0011",
+      "module": "engine_orb_vwap",
+      "price": 101.0,
+      "qty": 2,
+      "side": "SELL"
+    },
+    "run_id": "run-golden-order-executor",
+    "schema_version": 1,
+    "symbol": "AAPL",
+    "ts": "2026-02-20T00:00:06.000Z",
+    "type": "Fill"
+  }
+]

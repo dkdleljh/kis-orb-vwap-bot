@@ -1,0 +1,167 @@
+[
+  {
+    "payload": {
+      "correlation_id": "corr:INV:BUY",
+      "idempotency_key": "idem:INV:BUY:20260220T0910",
+      "limit_price": 100.6,
+      "module": "engine_orb_vwap",
+      "order_type": "LMT",
+      "qty": 2,
+      "side": "BUY"
+    },
+    "run_id": "run-golden-trading-engine",
+    "schema_version": 1,
+    "symbol": "INV",
+    "ts": "2026-02-20T00:00:00.000Z",
+    "type": "OrderIntent"
+  },
+  {
+    "payload": {
+      "allowed": true,
+      "context": {
+        "autofilled_at_emit": true,
+        "context_missing": true
+      },
+      "correlation_id": "corr:INV:BUY",
+      "idempotency_key": "idem:INV:BUY:20260220T0910",
+      "module": "engine_orb_vwap",
+      "reason": "ok"
+    },
+    "run_id": "run-golden-trading-engine",
+    "schema_version": 1,
+    "symbol": "INV",
+    "ts": "2026-02-20T00:00:01.000Z",
+    "type": "RiskDecision"
+  },
+  {
+    "payload": {
+      "broker_order_id": "PAPER",
+      "correlation_id": "corr:INV:BUY",
+      "idempotency_key": "idem:INV:BUY:20260220T0910"
+    },
+    "run_id": "run-golden-trading-engine",
+    "schema_version": 1,
+    "symbol": "INV",
+    "ts": "2026-02-20T00:00:02.000Z",
+    "type": "OrderSubmitted"
+  },
+  {
+    "payload": {
+      "broker_order_id": "PAPER",
+      "correlation_id": "corr:INV:BUY",
+      "idempotency_key": "idem:INV:BUY:20260220T0910",
+      "status": "ACK"
+    },
+    "run_id": "run-golden-trading-engine",
+    "schema_version": 1,
+    "symbol": "INV",
+    "ts": "2026-02-20T00:00:03.000Z",
+    "type": "OrderAck"
+  },
+  {
+    "payload": {
+      "broker_order_id": "PAPER",
+      "correlation_id": "corr:INV:BUY",
+      "fee": 0.0,
+      "idempotency_key": "idem:INV:BUY:20260220T0910",
+      "module": "engine_orb_vwap",
+      "price": 100.6,
+      "qty": 2,
+      "side": "BUY"
+    },
+    "run_id": "run-golden-trading-engine",
+    "schema_version": 1,
+    "symbol": "INV",
+    "ts": "2026-02-20T00:00:04.000Z",
+    "type": "Fill"
+  },
+  {
+    "payload": {
+      "avg_price": 100.6,
+      "cash": 0.0,
+      "correlation_id": "corr:INV:BUY",
+      "equity": null,
+      "note": "paper_entry",
+      "qty": 2,
+      "trigger": "fill"
+    },
+    "run_id": "run-golden-trading-engine",
+    "schema_version": 1,
+    "symbol": "INV",
+    "ts": "2026-02-20T00:00:05.000Z",
+    "type": "PositionSnapshot"
+  },
+  {
+    "payload": {
+      "correlation_id": "corr:INV:SELL",
+      "idempotency_key": "idem:INV:SELL:20260220T0910",
+      "module": "engine_orb_vwap",
+      "order_type": "MKT",
+      "qty": 2,
+      "side": "SELL"
+    },
+    "run_id": "run-golden-trading-engine",
+    "schema_version": 1,
+    "symbol": "INV",
+    "ts": "2026-02-20T00:00:06.000Z",
+    "type": "OrderIntent"
+  },
+  {
+    "payload": {
+      "broker_order_id": "PAPER",
+      "correlation_id": "corr:INV:SELL",
+      "idempotency_key": "idem:INV:SELL:20260220T0910"
+    },
+    "run_id": "run-golden-trading-engine",
+    "schema_version": 1,
+    "symbol": "INV",
+    "ts": "2026-02-20T00:00:07.000Z",
+    "type": "OrderSubmitted"
+  },
+  {
+    "payload": {
+      "broker_order_id": "PAPER",
+      "correlation_id": "corr:INV:SELL",
+      "idempotency_key": "idem:INV:SELL:20260220T0910",
+      "status": "ACK"
+    },
+    "run_id": "run-golden-trading-engine",
+    "schema_version": 1,
+    "symbol": "INV",
+    "ts": "2026-02-20T00:00:08.000Z",
+    "type": "OrderAck"
+  },
+  {
+    "payload": {
+      "broker_order_id": "PAPER",
+      "correlation_id": "corr:INV:SELL",
+      "fee": 0.0,
+      "idempotency_key": "idem:INV:SELL:20260220T0910",
+      "module": "engine_orb_vwap",
+      "price": 100.7,
+      "qty": 2,
+      "side": "SELL"
+    },
+    "run_id": "run-golden-trading-engine",
+    "schema_version": 1,
+    "symbol": "INV",
+    "ts": "2026-02-20T00:00:09.000Z",
+    "type": "Fill"
+  },
+  {
+    "payload": {
+      "avg_price": 0.0,
+      "cash": 0.0,
+      "correlation_id": "corr:INV:SELL",
+      "equity": null,
+      "note": "paper_exit:force_exit",
+      "qty": 0,
+      "trigger": "fill"
+    },
+    "run_id": "run-golden-trading-engine",
+    "schema_version": 1,
+    "symbol": "INV",
+    "ts": "2026-02-20T00:00:10.000Z",
+    "type": "PositionSnapshot"
+  }
+]
