@@ -39,10 +39,12 @@ from core.reconcile import (
     reconcile_positions,
     should_block_new_entries,
 )
+from core.entry_gates import EntryGateEvaluator
+from core.order_executor import OrderExecutor
+from core.position_manager import PositionManager
 from core.session_rules import (
     build_time_rules,
     exit_phase,
-    resolve_entry_risk_bounds,
 )
 
 
@@ -398,6 +400,11 @@ class TradingEngine:
         self._entry_ts = deque(maxlen=5000)
         self._last_signal_context_by_symbol: Dict[str, Dict[str, Any]] = {}
 
+        # Extracted orchestration modules (refactor-only; behavior stays in delegated logic).
+        self.position_manager = PositionManager(self)
+        self.entry_gates = EntryGateEvaluator(self)
+        self.order_executor = OrderExecutor(self)
+
         # Daily baseline capture marker (for daily return reporting)
         self._baseline_written_ymd = ""
 
@@ -413,7 +420,7 @@ class TradingEngine:
 
     def _active_positions(self) -> dict[str, Position]:
         """Return a copy of currently tracked open positions."""
-        return dict(self.state_machine.positions)
+        return self.position_manager.active_positions()
 
     def _write_fill_alert(self, data: dict) -> None:
         """Append a fill alert to the queue for external notification (OpenClaw)."""
@@ -574,63 +581,7 @@ class TradingEngine:
         Returns:
             None: Updates state-machine position cache in place.
         """
-        # Broker endpoints can rate-limit (EGW00201). Retry a few times on startup.
-        restored: dict[str, Position] = {}
-        for attempt in range(3):
-            pos_map = await self.rest.get_all_positions()
-            if pos_map:
-                for sym, info in pos_map.items():
-                    qty = int(float((info or {}).get("qty", 0) or 0))
-                    avg = float((info or {}).get("avg_price", 0.0) or 0.0)
-                    if qty > 0 and avg > 0:
-                        restored[str(sym)] = Position(
-                            symbol=str(sym), qty=qty, avg_price=avg, entry_time=now_local(self.tz)
-                        )
-                break
-            # best-effort: short backoff (avoid hammering)
-            await asyncio.sleep(0.5 * (attempt + 1))
-
-        self.state_machine.positions.clear()
-        if restored:
-            for sym, pos in restored.items():
-                self.state_machine.set_position(pos)
-                self.peak_pnl_pct[sym] = -0.01
-            if len(restored) > self.max_concurrent_positions:
-                self.logger.warning(
-                    "Restored positions exceed configured max_concurrent_positions: %s > %s",
-                    len(restored),
-                    self.max_concurrent_positions,
-                )
-            # [PHASE4] Best-effort snapshot on restore (startup/resume trigger)
-            try:
-                for pos in restored.values():
-                    cash = 0.0
-                    if self.ledger is not None:
-                        lp = self.ledger.get_position(str(pos.symbol))
-                        lp.qty = int(pos.qty)
-                        lp.avg_price = float(pos.avg_price)
-                        cash = float(self.ledger.cash)
-                    self._append_event(
-                        ievents.PositionRestored(
-                            symbol=str(pos.symbol),
-                            qty=int(pos.qty),
-                            avg_price=float(pos.avg_price),
-                            cash=float(cash),
-                            equity=None,
-                            note="startup_restore",
-                        ).to_event(run_id=self.run_id)
-                    )
-                    self._record_position_snapshot(str(pos.symbol), trigger="restore")
-            except Exception:
-                pass
-            self.logger.info(
-                "restored positions: count=%s symbols=%s",
-                len(restored),
-                list(restored.keys()),
-            )
-        else:
-            self.state_machine.positions.clear()
-            self.state_machine.position = None
+        await self.position_manager.restore_positions()
 
     def _maybe_init_fallback_or(self) -> None:
         """Create a fallback opening-range window when startup is late.
@@ -1090,48 +1041,9 @@ class TradingEngine:
     def _record_position_snapshot(
         self, symbol: str, *, trigger: str, note: str = "", correlation_id: str = ""
     ) -> None:
-        """Best-effort PositionSnapshot logging.
-
-        Phase4 integration:
-        - if Ledger is enabled, snapshot reflects derived cash/avg/qty
-        - otherwise falls back to state_machine position (cash=0.0)
-        """
-        qty = 0
-        avg = 0.0
-        cash = 0.0
-
-        if self.ledger is not None:
-            try:
-                pos = self.ledger.get_position(symbol)
-                qty = int(pos.qty)
-                avg = float(pos.avg_price)
-                cash = float(self.ledger.cash)
-            except Exception:
-                self._error_counts["ledger_snapshot"] += 1
-        else:
-            try:
-                pos2 = self.state_machine.get_position(symbol)
-                if pos2:
-                    qty = int(pos2.qty)
-                    avg = float(pos2.avg_price)
-            except Exception:
-                pass
-
-        try:
-            self._append_event(
-                ievents.PositionSnapshot(
-                    symbol=symbol,
-                    qty=qty,
-                    avg_price=avg,
-                    cash=cash,
-                    equity=None,
-                    trigger=trigger,
-                    note=note,
-                    correlation_id=correlation_id,
-                ).to_event(run_id=self.run_id)
-            )
-        except Exception:
-            self._error_counts["snapshot_event"] += 1
+        self.position_manager.record_position_snapshot(
+            symbol, trigger=trigger, note=note, correlation_id=correlation_id
+        )
 
     def _build_risk_context(
         self,
@@ -1149,31 +1061,20 @@ class TradingEngine:
         max_total_position_pct: float | None = None,
         max_symbol_position_pct: float | None = None,
     ) -> dict[str, Any]:
-        ctx: Dict[str, Any] = {}
-        sig_ctx = self._last_signal_context_by_symbol.get(str(signal.symbol), {})
-        numeric_fields = {
-            "cash": cash,
-            "equity_est": equity_est,
-            "exposure": exposure,
-            "remaining_cap": remaining_cap,
-            "sym_remaining": sym_remaining,
-            "reserve_amt": reserve_amt,
-            "budget_pct": budget_pct,
-            "budget": budget,
-            "ask": float(getattr(book, "ask", 0.0) or 0.0),
-            "max_total_position_pct": max_total_position_pct,
-            "max_symbol_position_pct": max_symbol_position_pct,
-            "cash_reserve_pct": float(self.cash_reserve_pct),
-            "max_new_entries_per_minute": int(self.max_new_entries_per_minute),
-            "min_score": sig_ctx.get("min_score"),
-            "market_regime": str(self.market_regime or ""),
-        }
-        for k, v in numeric_fields.items():
-            if isinstance(v, (int, float)):
-                ctx[k] = float(v) if isinstance(v, float) else int(v)
-            else:
-                ctx[k] = v
-        return ctx
+        return self.entry_gates.build_risk_context(
+            signal=signal,
+            book=book,
+            cash=cash,
+            equity_est=equity_est,
+            exposure=exposure,
+            remaining_cap=remaining_cap,
+            sym_remaining=sym_remaining,
+            reserve_amt=reserve_amt,
+            budget_pct=budget_pct,
+            budget=budget,
+            max_total_position_pct=max_total_position_pct,
+            max_symbol_position_pct=max_symbol_position_pct,
+        )
 
     def _make_idempotency_key(
         self, symbol: str, side: str, *, bar_start: datetime | None = None
@@ -1251,391 +1152,15 @@ class TradingEngine:
             self._entry_inflight.add(symbol)
 
         try:
-            tcfg = self.config.get("trading", {}) or {}
-            bounds = resolve_entry_risk_bounds(tcfg)
-            cash = 0.0
-            exposure = 0.0
-            equity_est = 0.0
-            remaining_cap = 0.0
-            sym_remaining = 0.0
-            reserve_amt = 0.0
-            budget_pct = float(self.entry_budget_pct)
-            budget = 0.0
-            max_total_position_pct = float(bounds.max_total_position_pct)
-            max_symbol_position_pct = float(bounds.max_symbol_position_pct)
-
-            # --- Entry pacing guardrail (recommended default: 2 entries/min) ---
-            try:
-                now_s = time.time()
-                # purge older than 60s (deque is in time order)
-                while self._entry_ts and (now_s - float(self._entry_ts[0])) > 60.0:
-                    self._entry_ts.popleft()
-                if len(self._entry_ts) >= int(self.max_new_entries_per_minute):
-                    try:
-                        self.event_store.append(
-                            ievents.RiskDecision(
-                                symbol=symbol,
-                                allowed=False,
-                                reason="entry_rate_limit",
-                                idempotency_key=idempotency_key,
-                                correlation_id=correlation_id,
-                                module="engine_orb_vwap",
-                                context=self._build_risk_context(
-                                    signal=signal,
-                                    book=book,
-                                    cash=cash,
-                                    equity_est=equity_est,
-                                    exposure=exposure,
-                                    remaining_cap=remaining_cap,
-                                    sym_remaining=sym_remaining,
-                                    reserve_amt=reserve_amt,
-                                    budget_pct=budget_pct,
-                                    budget=budget,
-                                    max_total_position_pct=max_total_position_pct,
-                                    max_symbol_position_pct=max_symbol_position_pct,
-                                ),
-                            ).to_event(run_id=self.run_id)
-                        )
-                    except Exception:
-                        pass
-                    self.logger.warning(
-                        "entry blocked by rate limit: %s entries/60s (limit=%s)",
-                        len(self._entry_ts),
-                        self.max_new_entries_per_minute,
-                    )
-                    return
-            except Exception:
-                pass
-
-            if symbol != self.symbol_inverse:
-                try:
-                    news_result = await asyncio.wait_for(
-                        self.state_machine.news_analyzer.get_sentiment_score(symbol),
-                        timeout=3.0,
-                    )
-                    score = news_result.get("score", 0)
-                    self.logger.info(
-                        f"[News Filter] {symbol} Score: {score} ({news_result.get('summary')})"
-                    )
-                    if score < -20:
-                        self.logger.warning(
-                            f"[News Filter] BLOCKED: Sentiment is too negative ({score})"
-                        )
-                        return
-                except Exception as e:
-                    self.logger.warning(
-                        f"[News Filter] Check failed, proceeding with technical only: {e}"
-                    )
-
-            # Cooldown: avoid repeated entries on the same symbol (fee/churn control)
-            try:
-                until = float(self._symbol_cooldown_until.get(str(symbol), 0.0) or 0.0)
-                if until and time.time() < until:
-                    try:
-                        self.event_store.append(
-                            ievents.RiskDecision(
-                                symbol=symbol,
-                                allowed=False,
-                                reason="cooldown",
-                                idempotency_key=idempotency_key,
-                                correlation_id=correlation_id,
-                                module="engine_orb_vwap",
-                                context={"cooldown_until_epoch": until},
-                            ).to_event(run_id=self.run_id)
-                        )
-                    except Exception:
-                        pass
-                    return
-            except Exception:
-                pass
-
-            if book.ask <= 0:
-                try:
-                    self.event_store.append(
-                        ievents.RiskDecision(
-                            symbol=symbol,
-                            allowed=False,
-                            reason="ask=0",
-                            idempotency_key=idempotency_key,
-                            correlation_id=correlation_id,
-                            module="engine_orb_vwap",
-                        ).to_event(run_id=self.run_id)
-                    )
-                except Exception:
-                    pass
-                self.logger.info("entry skipped: ask=0")
+            gate = await self.entry_gates.evaluate(
+                signal, book, idempotency_key=idempotency_key, correlation_id=correlation_id
+            )
+            if not gate.allowed or gate.qty <= 0:
                 return
 
-            cash = await self.rest.get_cash_available(symbol, book.ask)
-            if cash <= 0:
-                self.logger.warning("cash query failed (0), using default budget")
-                cash = 1000
-
-            # --- Portfolio-level exposure cap ---
-            # We approximate total equity as: cash_available_now + current mark-to-market exposure.
-
-            exposure = 0.0
-            try:
-                for p in self._active_positions().values():
-                    px = self.last_price.get(p.symbol)
-                    if not px:
-                        px = float(p.avg_price or 0.0)
-                    exposure += float(px) * int(p.qty)
-            except Exception:
-                exposure = 0.0
-
-            equity_est = float(cash) + float(exposure)
-            cap_amt = float(equity_est) * float(max_total_position_pct)
-            remaining_cap = float(cap_amt) - float(exposure)
-
-            budget_pct = self.entry_budget_pct * (0.5 if self.market_regime == "BEAR" else 1.0)
-            budget = cash * budget_pct
-
-            # --- Cash reserve guardrail (recommended default: 20%) ---
-            # Keep a minimum cash buffer so multi-position mode does not fully deploy capital.
-            reserve_amt = float(equity_est) * float(self.cash_reserve_pct)
-            cash_budget_cap = float(cash) - float(reserve_amt)
-            if cash_budget_cap <= 0:
-                try:
-                    self.event_store.append(
-                        ievents.RiskDecision(
-                            symbol=symbol,
-                            allowed=False,
-                            reason="cash_reserve",
-                            idempotency_key=idempotency_key,
-                            correlation_id=correlation_id,
-                            module="engine_orb_vwap",
-                            context=self._build_risk_context(
-                                signal=signal,
-                                book=book,
-                                cash=cash,
-                                equity_est=equity_est,
-                                exposure=exposure,
-                                remaining_cap=remaining_cap,
-                                sym_remaining=sym_remaining,
-                                reserve_amt=reserve_amt,
-                                budget_pct=budget_pct,
-                                budget=budget,
-                                max_total_position_pct=max_total_position_pct,
-                                max_symbol_position_pct=max_symbol_position_pct,
-                            ),
-                        ).to_event(run_id=self.run_id)
-                    )
-                except Exception:
-                    pass
-                self.logger.warning(
-                    "entry blocked by cash reserve: cash=%.0f reserve=%.0f pct=%.2f",
-                    cash,
-                    reserve_amt,
-                    self.cash_reserve_pct,
-                )
-                return
-
-            budget = min(float(budget), float(cash_budget_cap))
-
-            # Enforce cap by shrinking budget (or blocking if none left)
-            if remaining_cap <= 0:
-                try:
-                    self.event_store.append(
-                        ievents.RiskDecision(
-                            symbol=symbol,
-                            allowed=False,
-                            reason="portfolio_exposure_cap",
-                            idempotency_key=idempotency_key,
-                            correlation_id=correlation_id,
-                            module="engine_orb_vwap",
-                            context=self._build_risk_context(
-                                signal=signal,
-                                book=book,
-                                cash=cash,
-                                equity_est=equity_est,
-                                exposure=exposure,
-                                remaining_cap=remaining_cap,
-                                sym_remaining=sym_remaining,
-                                reserve_amt=reserve_amt,
-                                budget_pct=budget_pct,
-                                budget=budget,
-                                max_total_position_pct=max_total_position_pct,
-                                max_symbol_position_pct=max_symbol_position_pct,
-                            ),
-                        ).to_event(run_id=self.run_id)
-                    )
-                except Exception:
-                    pass
-                self.logger.warning(
-                    "entry blocked by portfolio cap: exposure=%.0f cap=%.0f pct=%.2f",
-                    exposure,
-                    cap_amt,
-                    max_total_position_pct,
-                )
-                return
-
-            budget = min(float(budget), float(remaining_cap))
-
-            # --- Per-symbol exposure cap ---
-            # Limit *resulting* symbol exposure after this entry.
-
-            existing_sym_exposure = 0.0
-            try:
-                p0 = self.state_machine.get_position(symbol)
-                if p0 is not None:
-                    px0 = self.last_price.get(symbol)
-                    if not px0:
-                        px0 = float(p0.avg_price or 0.0)
-                    existing_sym_exposure = float(px0) * int(p0.qty)
-            except Exception:
-                existing_sym_exposure = 0.0
-
-            sym_cap_amt = float(equity_est) * float(max_symbol_position_pct)
-            sym_remaining = float(sym_cap_amt) - float(existing_sym_exposure)
-            if sym_remaining <= 0:
-                try:
-                    self.event_store.append(
-                        ievents.RiskDecision(
-                            symbol=symbol,
-                            allowed=False,
-                            reason="symbol_exposure_cap",
-                            idempotency_key=idempotency_key,
-                            correlation_id=correlation_id,
-                            module="engine_orb_vwap",
-                            context=self._build_risk_context(
-                                signal=signal,
-                                book=book,
-                                cash=cash,
-                                equity_est=equity_est,
-                                exposure=exposure,
-                                remaining_cap=remaining_cap,
-                                sym_remaining=sym_remaining,
-                                reserve_amt=reserve_amt,
-                                budget_pct=budget_pct,
-                                budget=budget,
-                                max_total_position_pct=max_total_position_pct,
-                                max_symbol_position_pct=max_symbol_position_pct,
-                            ),
-                        ).to_event(run_id=self.run_id)
-                    )
-                except Exception:
-                    pass
-                self.logger.warning(
-                    "entry blocked by symbol cap: symbol=%s exposure=%.0f cap=%.0f pct=%.2f",
-                    symbol,
-                    existing_sym_exposure,
-                    sym_cap_amt,
-                    max_symbol_position_pct,
-                )
-                return
-
-            budget = min(float(budget), float(sym_remaining))
-
-            qty = min(int(budget // book.ask), self.max_position_qty)
-            if qty <= 0:
-                # If we can't buy even 1 share with current symbol budget, stop spamming.
-                try:
-                    if self.symbol_cooldown_sec > 0:
-                        self._symbol_cooldown_until[str(symbol)] = time.time() + float(
-                            self.symbol_cooldown_sec
-                        )
-                except Exception:
-                    pass
-
-                try:
-                    self.event_store.append(
-                        ievents.RiskDecision(
-                            symbol=symbol,
-                            allowed=False,
-                            reason="qty=0",
-                            idempotency_key=idempotency_key,
-                            correlation_id=correlation_id,
-                            module="engine_orb_vwap",
-                            context=self._build_risk_context(
-                                signal=signal,
-                                book=book,
-                                cash=cash,
-                                equity_est=equity_est,
-                                exposure=exposure,
-                                remaining_cap=remaining_cap,
-                                sym_remaining=sym_remaining,
-                                reserve_amt=reserve_amt,
-                                budget_pct=budget_pct,
-                                budget=budget,
-                                max_total_position_pct=max_total_position_pct,
-                                max_symbol_position_pct=max_symbol_position_pct,
-                            ),
-                        ).to_event(run_id=self.run_id)
-                    )
-                except Exception:
-                    pass
-                self.logger.info(
-                    "entry skipped: qty=0 cash=%.0f budget=%.0f pct=%.3f ask=%.0f",
-                    cash,
-                    budget,
-                    self.entry_budget_pct,
-                    book.ask,
-                )
-                return
-
+            qty = int(gate.qty)
             is_kr = bool(str(symbol).isdigit())
-            trades_mkt = self.trades_today_kr if is_kr else self.trades_today_us
-            max_mkt = self.max_trades_per_day_kr if is_kr else self.max_trades_per_day_us
-            if trades_mkt >= max_mkt:
-                self.logger.warning(
-                    "entry blocked by max trades/day guardrail (%s %s/%s)",
-                    "KR" if is_kr else "US",
-                    trades_mkt,
-                    max_mkt,
-                )
-                return
-
-            symbol_trades = int(self.trades_today_by_symbol.get(symbol, 0) or 0)
-            if symbol_trades >= self.max_trades_per_symbol:
-                # Cooldown when a symbol hits the per-day cap (avoid log/risk spam).
-                try:
-                    if self.symbol_cooldown_sec > 0:
-                        self._symbol_cooldown_until[str(symbol)] = time.time() + float(
-                            self.symbol_cooldown_sec
-                        )
-                except Exception:
-                    pass
-
-                try:
-                    self.event_store.append(
-                        ievents.RiskDecision(
-                            symbol=symbol,
-                            allowed=False,
-                            reason="max_trades_per_symbol",
-                            idempotency_key=idempotency_key,
-                            correlation_id=correlation_id,
-                            module="engine_orb_vwap",
-                        ).to_event(run_id=self.run_id)
-                    )
-                except Exception:
-                    pass
-                self.logger.warning(
-                    "entry blocked by max_trades_per_symbol (%s %s/%s)",
-                    symbol,
-                    symbol_trades,
-                    self.max_trades_per_symbol,
-                )
-                return
-
-            if self.state_machine.active_position_count() >= self.max_concurrent_positions:
-                try:
-                    self.event_store.append(
-                        ievents.RiskDecision(
-                            symbol=symbol,
-                            allowed=False,
-                            reason="max_concurrent_positions",
-                            idempotency_key=idempotency_key,
-                            correlation_id=correlation_id,
-                            module="engine_orb_vwap",
-                        ).to_event(run_id=self.run_id)
-                    )
-                except Exception:
-                    pass
-                return
-
             try:
-                # Start cooldown timer on actual intent (prevents churn on rapid repeated signals)
                 if self.symbol_cooldown_sec > 0:
                     self._symbol_cooldown_until[str(symbol)] = time.time() + float(
                         self.symbol_cooldown_sec
@@ -1690,138 +1215,13 @@ class TradingEngine:
             else:
                 self.trades_today_us += 1
 
-            if not self.live_ordering_enabled():
-                pos = Position(
-                    symbol=symbol,
-                    qty=qty,
-                    avg_price=float(book.ask),
-                    entry_time=now_local(self.tz),
-                )
-                self.state_machine.set_position(pos)
-                self.logger.info(
-                    "[PAPER] entry simulated %s qty=%s price=%s", symbol, qty, book.ask
-                )
-                try:
-                    self.event_store.append(
-                        ievents.OrderSubmitted(
-                            symbol=symbol,
-                            idempotency_key=idempotency_key,
-                            broker_order_id="PAPER",
-                            correlation_id=correlation_id,
-                        ).to_event(run_id=self.run_id)
-                    )
-                    self.event_store.append(
-                        ievents.OrderAck(
-                            symbol=symbol,
-                            idempotency_key=idempotency_key,
-                            broker_order_id="PAPER",
-                            status="ACK",
-                            correlation_id=correlation_id,
-                        ).to_event(run_id=self.run_id)
-                    )
-                    self.event_store.append(
-                        ievents.Fill(
-                            symbol=symbol,
-                            side="BUY",
-                            qty=int(qty),
-                            price=float(book.ask),
-                            broker_order_id="PAPER",
-                            idempotency_key=idempotency_key,
-                            fee=0.0,
-                            correlation_id=correlation_id,
-                            module="engine_orb_vwap",
-                        ).to_event(run_id=self.run_id)
-                    )
-                    self._record_position_snapshot(
-                        symbol,
-                        trigger="fill",
-                        note="paper_entry",
-                        correlation_id=correlation_id,
-                    )
-                except Exception:
-                    pass
-                self.peak_pnl_pct[symbol] = -0.01
-                return
-
-            for _ in range(self.entry_retry_limit):
-                if self.kill_switch_on():
-                    break
-                order = await self.rest.place_buy_limit(symbol, qty, book.ask)
-                self.logger.info(
-                    "entry order submitted %s qty=%s id=%s", symbol, qty, order.order_id
-                )
-                try:
-                    broker_order_id = str(order.order_id or "")
-                    self.event_store.append(
-                        ievents.OrderSubmitted(
-                            symbol=symbol,
-                            idempotency_key=idempotency_key,
-                            broker_order_id=broker_order_id,
-                            correlation_id=correlation_id,
-                        ).to_event(run_id=self.run_id)
-                    )
-                    if broker_order_id:
-                        self.event_store.append(
-                            ievents.OrderAck(
-                                symbol=symbol,
-                                idempotency_key=idempotency_key,
-                                broker_order_id=broker_order_id,
-                                status="ACK",
-                                correlation_id=correlation_id,
-                            ).to_event(run_id=self.run_id)
-                        )
-                except Exception:
-                    pass
-
-                await asyncio.sleep(2)
-                pos_map = await self.rest.get_all_positions()
-                info = (pos_map or {}).get(symbol)
-                qty_after = int(float((info or {}).get("qty", 0) or 0))
-                avg_after = float((info or {}).get("avg_price", 0.0) or 0.0)
-                if qty_after >= qty and avg_after > 0:
-                    pos = Position(
-                        symbol=symbol,
-                        qty=qty_after,
-                        avg_price=avg_after,
-                        entry_time=now_local(self.tz),
-                    )
-                    self.state_machine.set_position(pos)
-                    self.logger.info(
-                        "entry filled %s qty=%s avg=%s", symbol, pos.qty, pos.avg_price
-                    )
-                    try:
-                        broker_order_id = str(order.order_id or "")
-                        costs = self.fee_calculator.calculate_entry_cost(
-                            float(pos.avg_price), int(pos.qty)
-                        )
-                        self.event_store.append(
-                            ievents.Fill(
-                                symbol=symbol,
-                                side="BUY",
-                                qty=int(pos.qty),
-                                price=float(pos.avg_price),
-                                broker_order_id=broker_order_id,
-                                idempotency_key=idempotency_key,
-                                fee=costs.commission + costs.tax,
-                                correlation_id=correlation_id,
-                                module="engine_orb_vwap",
-                            ).to_event(run_id=self.run_id)
-                        )
-                        self._record_position_snapshot(
-                            symbol,
-                            trigger="fill",
-                            note="live_entry",
-                            correlation_id=correlation_id,
-                        )
-                    except Exception:
-                        pass
-                    self.peak_pnl_pct[symbol] = -0.01
-                    return
-                if order.order_id:
-                    await self.rest.cancel_order(order.order_id, symbol, qty)
-
-            self.logger.info("entry failed after retries")
-            await asyncio.sleep(30)
+            await self.order_executor.execute_entry(
+                symbol=symbol,
+                qty=qty,
+                ask=float(book.ask),
+                idempotency_key=idempotency_key,
+                correlation_id=correlation_id,
+            )
         finally:
             self._entry_inflight.discard(symbol)
 
@@ -1854,158 +1254,14 @@ class TradingEngine:
         idempotency_key = self._make_idempotency_key(sym, "SELL")
         correlation_id = self._make_correlation_id(sym, "SELL")
         try:
-            self.event_store.append(
-                ievents.OrderIntent(
-                    symbol=sym,
-                    side="SELL",
-                    qty=int(pos.qty),
-                    order_type="MKT" if use_market else "LMT",
-                    limit_price=None,
-                    idempotency_key=idempotency_key,
-                    correlation_id=correlation_id,
-                    module="engine_orb_vwap",
-                ).to_event(run_id=self.run_id)
+            await self.order_executor.execute_exit(
+                reason=reason,
+                symbol=sym,
+                pos=pos,
+                use_market=use_market,
+                idempotency_key=idempotency_key,
+                correlation_id=correlation_id,
             )
-
-            if not self.live_ordering_enabled():
-                exit_price = self.last_price.get(sym, pos.avg_price)
-                gross_pnl_pct = (
-                    (exit_price - pos.avg_price) / pos.avg_price if pos.avg_price else 0.0
-                )
-                net_pnl_pct = self.fee_calculator.get_net_pnl_percent(
-                    pos.avg_price, exit_price
-                )
-                pnl_pct = net_pnl_pct
-                self.risk.record_exit(pnl_pct, pnl_pct <= self.stop_loss_pct)
-                self.state_machine.remove_position(sym)
-                self.peak_pnl_pct.pop(sym, None)
-                try:
-                    self.event_store.append(
-                        ievents.OrderSubmitted(
-                            symbol=sym,
-                            idempotency_key=idempotency_key,
-                            broker_order_id="PAPER",
-                            correlation_id=correlation_id,
-                        ).to_event(run_id=self.run_id)
-                    )
-                    self.event_store.append(
-                        ievents.OrderAck(
-                            symbol=sym,
-                            idempotency_key=idempotency_key,
-                            broker_order_id="PAPER",
-                            status="ACK",
-                            correlation_id=correlation_id,
-                        ).to_event(run_id=self.run_id)
-                    )
-                    self.event_store.append(
-                        ievents.Fill(
-                            symbol=sym,
-                            side="SELL",
-                            qty=int(pos.qty),
-                            price=float(exit_price),
-                            broker_order_id="PAPER",
-                            idempotency_key=idempotency_key,
-                            fee=0.0,
-                            correlation_id=correlation_id,
-                            module="engine_orb_vwap",
-                        ).to_event(run_id=self.run_id)
-                    )
-                    self._record_position_snapshot(
-                        sym,
-                        trigger="fill",
-                        note=f"paper_exit:{reason}",
-                        correlation_id=correlation_id,
-                    )
-                except Exception:
-                    pass
-                self.logger.info(
-                    "[PAPER] exit simulated symbol=%s reason=%s pnl=%.4f(gross=%.4f, net=%.4f)",
-                    sym,
-                    reason,
-                    pnl_pct,
-                    gross_pnl_pct,
-                    net_pnl_pct,
-                )
-                return
-
-            current_book = self.last_book.get(sym)
-            if current_book and current_book.bid > 0:
-                order = await self.rest.place_sell_limit(sym, pos.qty, current_book.bid)
-                self.logger.info(
-                    "exit order(SmartLimit) symbol=%s reason=%s price=%s id=%s",
-                    sym,
-                    reason,
-                    current_book.bid,
-                    order.order_id,
-                )
-            else:
-                order = await self.rest.place_sell_market(sym, pos.qty)
-                self.logger.info(
-                    "exit order(Market) symbol=%s reason=%s id=%s",
-                    sym,
-                    reason,
-                    order.order_id,
-                )
-            try:
-                broker_order_id = str(order.order_id or "")
-                self.event_store.append(
-                    ievents.OrderSubmitted(
-                        symbol=sym,
-                        idempotency_key=idempotency_key,
-                        broker_order_id=broker_order_id,
-                        correlation_id=correlation_id,
-                    ).to_event(run_id=self.run_id)
-                )
-                if broker_order_id:
-                    self.event_store.append(
-                        ievents.OrderAck(
-                            symbol=sym,
-                            idempotency_key=idempotency_key,
-                            broker_order_id=broker_order_id,
-                            status="ACK",
-                            correlation_id=correlation_id,
-                        ).to_event(run_id=self.run_id)
-                    )
-            except Exception:
-                pass
-
-            await asyncio.sleep(2)
-            pos_map = await self.rest.get_all_positions()
-            info = (pos_map or {}).get(sym)
-            qty_after = int(float((info or {}).get("qty", 0) or 0))
-            if qty_after <= 0:
-                exit_price = self.last_price.get(sym, pos.avg_price)
-                pnl_pct = self.fee_calculator.get_net_pnl_percent(pos.avg_price, exit_price)
-                self.risk.record_exit(pnl_pct, pnl_pct <= self.stop_loss_pct)
-                self.state_machine.remove_position(sym)
-                self.peak_pnl_pct.pop(sym, None)
-                try:
-                    broker_order_id = str(order.order_id or "")
-                    costs = self.fee_calculator.calculate_exit_cost(
-                        float(exit_price), int(pos.qty)
-                    )
-                    self.event_store.append(
-                        ievents.Fill(
-                            symbol=sym,
-                            side="SELL",
-                            qty=int(pos.qty),
-                            price=float(exit_price),
-                            broker_order_id=broker_order_id,
-                            idempotency_key=idempotency_key,
-                            fee=costs.commission + costs.tax,
-                            correlation_id=correlation_id,
-                            module="engine_orb_vwap",
-                        ).to_event(run_id=self.run_id)
-                    )
-                    self._record_position_snapshot(
-                        sym,
-                        trigger="fill",
-                        note=f"live_exit:{reason}",
-                        correlation_id=correlation_id,
-                    )
-                except Exception:
-                    pass
-                self.logger.info("exit done symbol=%s reason=%s pnl=%.4f", sym, reason, pnl_pct)
         finally:
             if self.state_machine.state != State.DONE_TODAY:
                 self.state_machine.set_state(State.WAIT_SIGNAL)
