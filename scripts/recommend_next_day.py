@@ -93,7 +93,13 @@ def _extract_day_features(events_path: Path) -> dict[str, float]:
                 if reason == "qty=0":
                     f["qty0_blocks"] += 1
                     ctx = payload.get("context")
-                    if not (isinstance(ctx, dict) and ctx):
+                    is_real_ctx = (
+                        isinstance(ctx, dict)
+                        and bool(ctx)
+                        and ctx.get("context_missing") is not True
+                        and ctx.get("autofilled_at_emit") is not True
+                    )
+                    if not is_real_ctx:
                         f["qty0_missing_context"] += 1
                 elif reason == "cooldown":
                     f["cooldown_blocks"] += 1
@@ -281,6 +287,7 @@ def main() -> int:
     ap.add_argument("--date", help="YYYY-MM-DD (KST). default=today", default=None)
     ap.add_argument("--events-path", default=None, help="override events path")
     ap.add_argument("--lookback-days", type=int, default=30)
+    ap.add_argument("--min-train-rows", type=int, default=10)
     args = ap.parse_args()
 
     kst = dt.timezone(dt.timedelta(hours=9))
@@ -304,12 +311,36 @@ def main() -> int:
     features_today = _extract_day_features(events_path)
     x_train, y_train, train_days = _discover_training_rows(day, max(7, int(args.lookback_days)))
     x_pred = [float(features_today[k]) for k in FEATURE_NAMES]
+    min_train_rows = max(1, int(args.min_train_rows))
+    train_rows = len(x_train)
+    training_rows_sufficient = train_rows >= min_train_rows
+    training_gate_reason = (
+        f"insufficient_training_rows:{train_rows}<{min_train_rows}"
+        if not training_rows_sufficient
+        else ""
+    )
 
-    fit = _fit_and_predict(x_train, y_train, x_pred)
+    fit = (
+        _fit_and_predict(x_train, y_train, x_pred)
+        if training_rows_sufficient
+        else {
+            "ok": False,
+            "backend": "insufficient_rows_guard",
+            "prediction": 0.0,
+            "r2_train": 0.0,
+            "coef": [0.0 for _ in FEATURE_NAMES],
+            "intercept": 0.0,
+            "pickle_obj": None,
+            "pickle_lib": None,
+        }
+    )
     pred_pnl = float(fit["prediction"]) if fit.get("ok") else 0.0
     r2_train = float(fit.get("r2_train") or 0.0)
 
-    conf_level, conf_score = _confidence_from_quality(r2_train, len(x_train))
+    if training_rows_sufficient:
+        conf_level, conf_score = _confidence_from_quality(r2_train, train_rows)
+    else:
+        conf_level, conf_score = "low", 0.32
 
     coef = [float(c) for c in (fit.get("coef") or [0.0 for _ in FEATURE_NAMES])]
     importances = []
@@ -340,13 +371,17 @@ def main() -> int:
             "features": features_today,
             "model": {
                 "backend": fit.get("backend"),
-                "train_rows": len(x_train),
+                "train_rows": train_rows,
+                "min_train_rows": min_train_rows,
+                "train_rows_sufficient": training_rows_sufficient,
+                "training_gate_reason": training_gate_reason,
                 "train_days": train_days,
                 "r2_train": round(r2_train, 6),
                 "prediction_daily_pnl": round(pred_pnl, 4),
                 "feature_importances": top_importances,
             },
         },
+        "reasons": [training_gate_reason] if training_gate_reason else [],
         "recommendations": [],
     }
 
@@ -372,7 +407,7 @@ def main() -> int:
     fill_count = int(features_today["fill_count"])
     fee_total = float(features_today["fee_total"])
 
-    if fit.get("ok") and len(x_train) >= 5:
+    if training_rows_sufficient and fit.get("ok") and train_rows >= 5:
         # Guardrail policy from predicted outcome.
         if pred_pnl < -500:
             bump = _clamp(abs(pred_pnl) / 3000.0, 1.0, 4.0)
@@ -410,7 +445,7 @@ def main() -> int:
             )
 
     # Safety overlays from observed day quality.
-    if qty0 >= 5:
+    if training_rows_sufficient and qty0 >= 5:
         add(
             "trading.cash_reserve_pct",
             cur_cash_reserve_pct,
@@ -419,7 +454,7 @@ def main() -> int:
             {"qty0_blocks": qty0, "qty0_missing_context": qty0_miss},
         )
 
-    if fill_count >= 12 and fee_total >= 800:
+    if training_rows_sufficient and fill_count >= 12 and fee_total >= 800:
         add(
             "trading.atr_min_percent",
             cur_atr_min,
@@ -428,7 +463,7 @@ def main() -> int:
             {"fill_count": fill_count, "fee_total": round(fee_total, 2)},
         )
 
-    if not recos["recommendations"]:
+    if not recos["recommendations"] or not training_rows_sufficient:
         recos["recommendations"].append(
             {
                 "key": "keep_defaults",
@@ -437,10 +472,17 @@ def main() -> int:
                 "recommended": "as-is",
                 "delta": 0,
                 "confidence": _conf(conf_level, conf_score),
-                "rationale": "학습 신뢰도/데이터 기준에서 적극적인 파라미터 변경 근거가 충분하지 않습니다.",
+                "rationale": (
+                    "학습 데이터가 최소 기준에 미달하여(as-is 유지) 추천 변경을 생성하지 않습니다."
+                    if not training_rows_sufficient
+                    else "학습 신뢰도/데이터 기준에서 적극적인 파라미터 변경 근거가 충분하지 않습니다."
+                ),
                 "evidence": {
                     "prediction_daily_pnl": round(pred_pnl, 2),
-                    "train_rows": len(x_train),
+                    "train_rows": train_rows,
+                    "min_train_rows": min_train_rows,
+                    "train_rows_sufficient": training_rows_sufficient,
+                    "training_gate_reason": training_gate_reason,
                     "r2_train": round(r2_train, 4),
                 },
             }
@@ -463,7 +505,10 @@ def main() -> int:
         "feature_names": FEATURE_NAMES,
         "coef": coef,
         "intercept": float(fit.get("intercept") or 0.0),
-        "train_rows": len(x_train),
+        "train_rows": train_rows,
+        "min_train_rows": min_train_rows,
+        "train_rows_sufficient": training_rows_sufficient,
+        "training_gate_reason": training_gate_reason,
         "train_days": train_days,
         "r2_train": round(r2_train, 6),
         "prediction_daily_pnl": round(pred_pnl, 6),
@@ -492,7 +537,11 @@ def main() -> int:
     lines.append("## ML Summary")
     lines.append("")
     lines.append(f"- backend: `{fit.get('backend')}`")
-    lines.append(f"- train_rows: `{len(x_train)}`")
+    lines.append(f"- train_rows: `{train_rows}`")
+    lines.append(f"- min_train_rows: `{min_train_rows}`")
+    lines.append(f"- train_rows_sufficient: `{training_rows_sufficient}`")
+    if training_gate_reason:
+        lines.append(f"- training_gate_reason: `{training_gate_reason}`")
     lines.append(f"- r2_train: `{round(r2_train, 6)}`")
     lines.append(f"- prediction_daily_pnl: `{round(pred_pnl, 2)}`")
     lines.append(f"- top_importances: `{json.dumps(top_importances, ensure_ascii=False)}`")

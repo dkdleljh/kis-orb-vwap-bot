@@ -9,8 +9,10 @@ This module defines a minimal, stable event envelope.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
+
+EVENT_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -19,6 +21,9 @@ class Event:
 
     We keep the outer shape stable and evolve by adding new *types* and
     *payload* keys. This makes replay/backfills simpler.
+
+    Added (backward-compatible):
+    - schema_version: envelope schema version integer.
     """
 
     ts: str
@@ -26,10 +31,11 @@ class Event:
     payload: Dict[str, Any]
     symbol: Optional[str] = None
     run_id: Optional[str] = None
+    schema_version: int = EVENT_SCHEMA_VERSION
 
     @staticmethod
     def now_iso() -> str:
-        return datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+        return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
     @classmethod
     def make(
@@ -44,7 +50,12 @@ class Event:
         )
 
     def to_dict(self) -> Dict[str, Any]:
-        d: Dict[str, Any] = {"ts": self.ts, "type": self.type, "payload": self.payload}
+        d: Dict[str, Any] = {
+            "ts": self.ts,
+            "type": self.type,
+            "payload": self.payload,
+            "schema_version": int(self.schema_version),
+        }
         if self.symbol:
             d["symbol"] = self.symbol
         if self.run_id:

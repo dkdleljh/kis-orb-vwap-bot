@@ -21,6 +21,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from core.events import EVENT_SCHEMA_VERSION
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -89,6 +91,9 @@ def main() -> int:
             parse_errors += 1
             out_lines.append(raw)
             continue
+
+        if "schema_version" not in ev:
+            ev["schema_version"] = EVENT_SCHEMA_VERSION
 
         typ = str(ev.get("type") or "")
         payload = dict(ev.get("payload") or {})

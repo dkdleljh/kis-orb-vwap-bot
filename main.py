@@ -4,7 +4,7 @@ import os
 import signal
 import time
 from collections import defaultdict, deque
-from datetime import datetime, timedelta
+from datetime import datetime, time as dt_time, timedelta
 from types import FrameType
 from typing import Any, Dict, IO, Optional, cast
 
@@ -39,6 +39,110 @@ from core.reconcile import (
     reconcile_positions,
     should_block_new_entries,
 )
+
+DEFAULT_TIME_RULES: dict[str, str] = {
+    "observe_start": "08:59:00",
+    "or_start": "09:00:00",
+    "or_end": "09:05:00",
+    "entry_start": "09:05:05",
+    "force_exit": "15:15:00",
+    "early_exit": "15:00:00",
+}
+
+
+def _parse_time_rule_with_default(
+    tr_cfg: Dict[str, Any],
+    key: str,
+    logger: Any,
+    *,
+    log_prefix: str,
+) -> tuple[dt_time, bool]:
+    raw = tr_cfg.get(key)
+    default_raw = DEFAULT_TIME_RULES[key]
+    used_default = False
+    if raw is None or str(raw).strip() == "":
+        raw = default_raw
+        used_default = True
+    try:
+        return parse_time(str(raw)), used_default
+    except Exception:
+        logger.warning(
+            "%s invalid time_rules.%s=%r; using default=%s",
+            log_prefix,
+            key,
+            raw,
+            default_raw,
+        )
+        return parse_time(default_raw), True
+
+
+def _build_time_rules(
+    tr_cfg: Dict[str, Any] | None,
+    logger: Any,
+    *,
+    log_prefix: str,
+) -> tuple[TimeRules, dt_time]:
+    tr = tr_cfg or {}
+    defaults_used: list[str] = []
+
+    observe_start, used = _parse_time_rule_with_default(tr, "observe_start", logger, log_prefix=log_prefix)
+    if used:
+        defaults_used.append("observe_start")
+    or_start, used = _parse_time_rule_with_default(tr, "or_start", logger, log_prefix=log_prefix)
+    if used:
+        defaults_used.append("or_start")
+    or_end, used = _parse_time_rule_with_default(tr, "or_end", logger, log_prefix=log_prefix)
+    if used:
+        defaults_used.append("or_end")
+    entry_start, used = _parse_time_rule_with_default(tr, "entry_start", logger, log_prefix=log_prefix)
+    if used:
+        defaults_used.append("entry_start")
+    force_exit, used = _parse_time_rule_with_default(tr, "force_exit", logger, log_prefix=log_prefix)
+    if used:
+        defaults_used.append("force_exit")
+    early_exit, used = _parse_time_rule_with_default(tr, "early_exit", logger, log_prefix=log_prefix)
+    if used:
+        defaults_used.append("early_exit")
+
+    rules = TimeRules(
+        observe_start=observe_start,
+        or_start=or_start,
+        or_end=or_end,
+        entry_start=entry_start,
+        force_exit=force_exit,
+    )
+    logger.info(
+        "%s time_rules resolved: observe_start=%s or_start=%s or_end=%s entry_start=%s force_exit=%s early_exit=%s",
+        log_prefix,
+        rules.observe_start,
+        rules.or_start,
+        rules.or_end,
+        rules.entry_start,
+        rules.force_exit,
+        early_exit,
+    )
+    if defaults_used:
+        logger.warning("%s time_rules defaults used for: %s", log_prefix, ", ".join(defaults_used))
+    return rules, early_exit
+
+
+def _exit_phase(now_dt: datetime, early_exit: dt_time, force_exit: dt_time) -> tuple[str | None, dt_time]:
+    force_exit_dt = now_dt.replace(
+        hour=force_exit.hour,
+        minute=force_exit.minute,
+        second=force_exit.second,
+        microsecond=0,
+    )
+    final_kill_dt = force_exit_dt + timedelta(minutes=3)
+    final_kill_time = final_kill_dt.time()
+
+    if is_after(final_kill_time, now_dt):
+        return "emergency", final_kill_time
+    if is_after(force_exit, now_dt):
+        return "force", final_kill_time
+    if is_after(early_exit, now_dt):
+        return "early", final_kill_time
+    return None, final_kill_time
 
 
 class TradingEngine:
@@ -141,15 +245,11 @@ class TradingEngine:
         self.rest = KISRestOrders(rest_base_url, self.auth, account, self.logger)
 
         # 4) 시간 규칙
-        tr = self.config.get("time_rules", {}) or {}
-        self.time_rules = TimeRules(
-            observe_start=parse_time(tr.get("observe_start", "08:59:00")),
-            or_start=parse_time(tr.get("or_start", "09:00:00")),
-            or_end=parse_time(tr.get("or_end", "09:05:00")),
-            entry_start=parse_time(tr.get("entry_start", "09:05:05")),
-            force_exit=parse_time(tr.get("force_exit", "15:15:00")),
+        self.time_rules, self.early_exit = _build_time_rules(
+            self.config.get("time_rules", {}),
+            self.logger,
+            log_prefix="[TradingEngine]",
         )
-        self.early_exit = parse_time(tr.get("early_exit", "15:00:00"))
 
         # 5) 트레이딩 파라미터
         tcfg = self.config.get("trading", {}) or {}
@@ -2043,17 +2143,17 @@ class TradingEngine:
         """
         now_dt = now_local(self.tz)
 
-        # 1) 강제 종료 시간 (15:15 ~ 15:20)
-        # 15:15: 1차 청산 시도 (지정가/시장가)
-        # 15:18: 2차 강제 청산 (남은 물량 시장가 투척)
-        force_exit_time = self.time_rules.force_exit
-        final_kill_time = force_exit_time.replace(minute=18)
+        phase, final_kill_time = _exit_phase(now_dt, self.early_exit, self.time_rules.force_exit)
 
-        if is_after(final_kill_time, now_dt):
+        # 1) 강제 종료 시간 (15:15 ~ 15:18)
+        # 15:15: 1차 청산 시도
+        # 15:18: 2차 강제 청산 (남은 물량 시장가 투척)
+        if phase == "emergency":
             if self.state_machine.active_position_count() > 0:
                 # 15:18 넘으면 묻지도 따지지도 않고 시장가 청산
                 self.logger.warning(
-                    "🚨 EMERGENCY EXIT (Market Close): Dumping all positions!"
+                    "EMERGENCY EXIT (%s): Dumping all positions by market order!",
+                    final_kill_time,
                 )
                 # 비동기로 던져버림 (fire and forget 스타일)
                 asyncio.create_task(
@@ -2067,7 +2167,7 @@ class TradingEngine:
             return
 
         # 0-1) 조기 청산 (15:00): 수익 여부와 관계없이 무조건 청산
-        if is_after(self.early_exit, now_dt):
+        if phase == "early":
             if self.state_machine.active_position_count() > 0:
                 self.logger.warning(
                     " EARLY EXIT (15:00): Closing all positions! count=%s",
@@ -2079,7 +2179,7 @@ class TradingEngine:
                 self.state_machine.set_state(State.DONE_TODAY)
             return
 
-        if is_after(force_exit_time, now_dt):
+        if phase == "force":
             if self.state_machine.active_position_count() > 0:
                 # 15:15 ~ 15:18: 일반적인 강제 청산 시도
                 asyncio.create_task(self.handle_exit("force_exit", symbol=None))
@@ -2149,8 +2249,12 @@ class TradingEngine:
         now_dt = now_local(self.tz)
 
         if self.state_machine.active_position_count() > 0:
+            phase, _ = _exit_phase(now_dt, self.early_exit, self.time_rules.force_exit)
+            if phase == "emergency":
+                await self.handle_exit("emergency_market_close", symbol=None, use_market=True)
+                return
             # 조기 청산 (15:00): 수익 여부와 관계없이 무조건 청산
-            if is_after(self.early_exit, now_dt):
+            if phase == "early":
                 self.logger.warning(
                     " EARLY EXIT (15:00): Closing all positions! count=%s",
                     self.state_machine.active_position_count(),
@@ -2159,7 +2263,7 @@ class TradingEngine:
                 return
 
             # 강제 청산 (15:15)
-            if is_after(self.time_rules.force_exit, now_dt):
+            if phase == "force":
                 await self.handle_exit("force_exit", symbol=None)
 
     async def check_tp_sl(self) -> None:
@@ -2964,13 +3068,10 @@ async def run_module_system(base_dir: str) -> None:
 
         scanner = KisScanner(auth, rest_base_url)
 
-        tr = config.get("time_rules", {}) or {}
-        time_rules = TimeRules(
-            observe_start=parse_time(tr.get("observe_start", "08:59:00")),
-            or_start=parse_time(tr.get("or_start", "09:00:00")),
-            or_end=parse_time(tr.get("or_end", "09:05:00")),
-            entry_start=parse_time(tr.get("entry_start", "09:05:05")),
-            force_exit=parse_time(tr.get("force_exit", "15:15:00")),
+        time_rules, _early_exit = _build_time_rules(
+            config.get("time_rules", {}),
+            logger,
+            log_prefix="[ModuleLoader:kukjang]",
         )
 
         ctx = ModuleContext(

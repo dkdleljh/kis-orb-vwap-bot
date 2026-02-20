@@ -26,6 +26,16 @@ ROOT = Path(__file__).resolve().parents[1]
 PARSE_ERROR_RATE_MAX = 0.05
 
 
+def _is_real_context(ctx: Any) -> bool:
+    if not (isinstance(ctx, dict) and len(ctx) > 0):
+        return False
+    if ctx.get("context_missing") is True:
+        return False
+    if ctx.get("autofilled_at_emit") is True:
+        return False
+    return True
+
+
 def _iter_events_with_stats(path: Path) -> tuple[list[dict[str, Any]], dict[str, int]]:
     stats = {"line_count": 0, "parsed_count": 0, "parse_errors": 0}
     out: list[dict[str, Any]] = []
@@ -64,14 +74,19 @@ def _run(cmd: list[str]) -> tuple[bool, str]:
 def _compute_event_quality(events: list[dict[str, Any]]) -> dict[str, int]:
     qty0_total = 0
     qty0_with_context = 0
+    qty0_with_autofilled_context = 0
 
     signal_total = 0
+    signal_with_any_context = 0
     signal_with_context = 0
+    signal_with_autofilled_context = 0
     signal_with_min_score = 0
     signal_with_reasons = 0
 
     risk_total = 0
+    risk_with_any_context = 0
     risk_with_context = 0
+    risk_with_autofilled_context = 0
 
     for ev in events:
         typ = ev.get("type")
@@ -81,33 +96,48 @@ def _compute_event_quality(events: list[dict[str, Any]]) -> dict[str, int]:
             risk_total += 1
             ctx = payload.get("context")
             if isinstance(ctx, dict) and len(ctx) > 0:
-                risk_with_context += 1
+                risk_with_any_context += 1
+                if _is_real_context(ctx):
+                    risk_with_context += 1
+                else:
+                    risk_with_autofilled_context += 1
 
             if payload.get("allowed") is False and str(payload.get("reason") or "") == "qty=0":
                 qty0_total += 1
-                if isinstance(ctx, dict) and len(ctx) > 0:
+                if _is_real_context(ctx):
                     qty0_with_context += 1
+                elif isinstance(ctx, dict) and len(ctx) > 0:
+                    qty0_with_autofilled_context += 1
 
         elif typ == "Signal":
             signal_total += 1
             ctx = payload.get("context")
             if isinstance(ctx, dict) and len(ctx) > 0:
-                signal_with_context += 1
-                if ctx.get("min_score") is not None:
-                    signal_with_min_score += 1
-                reasons = ctx.get("reasons")
-                if isinstance(reasons, list) and len(reasons) > 0:
-                    signal_with_reasons += 1
+                signal_with_any_context += 1
+                if _is_real_context(ctx):
+                    signal_with_context += 1
+                    if ctx.get("min_score") is not None:
+                        signal_with_min_score += 1
+                    reasons = ctx.get("reasons")
+                    if isinstance(reasons, list) and len(reasons) > 0:
+                        signal_with_reasons += 1
+                else:
+                    signal_with_autofilled_context += 1
 
     return {
         "qty0_total": qty0_total,
         "qty0_with_context": qty0_with_context,
+        "qty0_with_autofilled_context": qty0_with_autofilled_context,
         "qty0_missing_context": qty0_total - qty0_with_context,
         "risk_total": risk_total,
+        "risk_with_any_context": risk_with_any_context,
         "risk_with_context": risk_with_context,
+        "risk_with_autofilled_context": risk_with_autofilled_context,
         "risk_missing_context": risk_total - risk_with_context,
         "signal_total": signal_total,
+        "signal_with_any_context": signal_with_any_context,
         "signal_with_context": signal_with_context,
+        "signal_with_autofilled_context": signal_with_autofilled_context,
         "signal_missing_context": signal_total - signal_with_context,
         "signal_with_min_score": signal_with_min_score,
         "signal_with_reasons": signal_with_reasons,
@@ -134,6 +164,13 @@ def main() -> int:
     ap.add_argument("--no-autogen", action="store_true", help="do not auto-generate missing report/reco")
     ap.add_argument("--auto-enrich", action="store_true", help="run one enrichment pass when context checks fail")
     ap.add_argument("--auto-backfill", action="store_true", help="deprecated alias of --auto-enrich")
+    ap.add_argument(
+        "--strict-signal-context",
+        action="store_true",
+        help="require signal min_score/reasons coverage ratios instead of >=1 absolute checks",
+    )
+    ap.add_argument("--signal-min-score-ratio-threshold", type=float, default=0.30)
+    ap.add_argument("--signal-reasons-ratio-threshold", type=float, default=0.10)
     args = ap.parse_args()
 
     kst = dt.timezone(dt.timedelta(hours=9))
@@ -188,7 +225,25 @@ def main() -> int:
     sanity_ok = all(sanity.values())
 
     qty0_ctx_ok = (q["qty0_total"] == 0) or (q["qty0_with_context"] == q["qty0_total"])
-    signal_ctx_ok = q["signal_with_min_score"] >= 1 and q["signal_with_reasons"] >= 1
+    signal_total = max(0, int(q.get("signal_total", 0)))
+    min_score_ratio = (
+        (float(q.get("signal_with_min_score", 0)) / float(signal_total))
+        if signal_total > 0
+        else 0.0
+    )
+    reasons_ratio = (
+        (float(q.get("signal_with_reasons", 0)) / float(signal_total))
+        if signal_total > 0
+        else 0.0
+    )
+    if args.strict_signal_context:
+        signal_ctx_ok = (
+            signal_total > 0
+            and min_score_ratio >= float(args.signal_min_score_ratio_threshold)
+            and reasons_ratio >= float(args.signal_reasons_ratio_threshold)
+        )
+    else:
+        signal_ctx_ok = q["signal_with_min_score"] >= 1 and q["signal_with_reasons"] >= 1
 
     context_fail = (not qty0_ctx_ok) or (not signal_ctx_ok)
     if enrich_enabled and context_fail and base_events_path.exists():
@@ -210,7 +265,25 @@ def main() -> int:
             }
             sanity_ok = all(sanity.values())
             qty0_ctx_ok = (q["qty0_total"] == 0) or (q["qty0_with_context"] == q["qty0_total"])
-            signal_ctx_ok = q["signal_with_min_score"] >= 1 and q["signal_with_reasons"] >= 1
+            signal_total = max(0, int(q.get("signal_total", 0)))
+            min_score_ratio = (
+                (float(q.get("signal_with_min_score", 0)) / float(signal_total))
+                if signal_total > 0
+                else 0.0
+            )
+            reasons_ratio = (
+                (float(q.get("signal_with_reasons", 0)) / float(signal_total))
+                if signal_total > 0
+                else 0.0
+            )
+            if args.strict_signal_context:
+                signal_ctx_ok = (
+                    signal_total > 0
+                    and min_score_ratio >= float(args.signal_min_score_ratio_threshold)
+                    and reasons_ratio >= float(args.signal_reasons_ratio_threshold)
+                )
+            else:
+                signal_ctx_ok = q["signal_with_min_score"] >= 1 and q["signal_with_reasons"] >= 1
 
     ok = artifacts_ok and sanity_ok and qty0_ctx_ok and signal_ctx_ok
     pass_via_enrichment = ok and (used_events_path == enriched_events_path)
@@ -239,6 +312,13 @@ def main() -> int:
             "parse_error_rate_max": PARSE_ERROR_RATE_MAX,
         },
         "quality": q,
+        "signal_context_policy": {
+            "strict_enabled": bool(args.strict_signal_context),
+            "min_score_ratio": round(min_score_ratio, 6),
+            "reasons_ratio": round(reasons_ratio, 6),
+            "min_score_ratio_threshold": float(args.signal_min_score_ratio_threshold),
+            "reasons_ratio_threshold": float(args.signal_reasons_ratio_threshold),
+        },
         "autogen": autogen_done,
         "enrichment": {
             "enabled": enrich_enabled,
@@ -276,7 +356,9 @@ def main() -> int:
     print(
         "signal_context_min_score_and_reasons="
         + ("PASS" if signal_ctx_ok else "FAIL")
-        + f" :: min_score={q['signal_with_min_score']}, reasons={q['signal_with_reasons']}"
+        + f" :: min_score={q['signal_with_min_score']}, reasons={q['signal_with_reasons']}, "
+        + f"min_score_ratio={min_score_ratio:.3f}, reasons_ratio={reasons_ratio:.3f}, "
+        + f"strict={'YES' if args.strict_signal_context else 'NO'}"
     )
 
     print(

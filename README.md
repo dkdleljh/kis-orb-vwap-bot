@@ -86,6 +86,20 @@ cp .env.example .env
   - `KIS_ACCOUNT_NO`
   - `KIS_ACCOUNT_PRODUCT_CODE`
 
+`time_rules` 스키마(형식: `HH:MM:SS`, 누락 시 기본값 사용):
+- `observe_start` (기본 `08:59:00`)
+- `or_start` (기본 `09:00:00`)
+- `or_end` (기본 `09:05:00`)
+- `entry_start` (기본 `09:05:05`)
+- `early_exit` (기본 `15:00:00`)
+- `force_exit` (기본 `15:15:00`)
+
+운영 동작:
+- `15:00` 이후: 조기 청산(`early_exit`)
+- `15:15` 이후: 강제 청산(`force_exit`)
+- `force_exit + 3분` 이후: 긴급 시장가 청산(예: `15:18`)
+- 누락/잘못된 값은 런타임 로그에 어떤 키가 기본값으로 대체됐는지 기록됩니다.
+
 ---
 
 ## 5) 실행 방법(모듈 시스템)
@@ -243,12 +257,16 @@ KRW 기반으로 US 매수여력을 추정하는 모드입니다.
 2-1) 준비 검증(자동 복구 + immutable enrichment)
 ```bash
 ./venv/bin/python scripts/verify_next_day_prep.py --date YYYY-MM-DD --auto-enrich
+./venv/bin/python scripts/verify_next_day_prep.py --date YYYY-MM-DD --auto-enrich --strict-signal-context
 ```
 - 순서: 아티팩트 자동생성 → 이벤트 품질검사 → 컨텍스트 결함 시 1회 enrichment → 재검증
+- 이벤트 envelope는 `schema_version` 필드를 포함하며, 구버전 로그도 역호환 처리됩니다.
 - 원본 이벤트는 불변 유지, 파생 파일 생성:
   - `logs/events/YYYYMMDD/events.enriched.jsonl`
   - `logs/events/YYYYMMDD/events.enrichment_patches.jsonl`
 - 검증 메트릭: `reports/next_day_prep_metrics_YYYY-MM-DD.json`
+- `--strict-signal-context` 사용 시 Signal 컨텍스트를 절대 개수(>=1)가 아니라 비율 기준으로 검사합니다.
+  - 기본 임계값: `min_score >= 30%`, `reasons >= 10%` (옵션으로 조정 가능)
 
 3) 추천값 자동 적용(무인)
 ```bash
@@ -273,6 +291,10 @@ KRW 기반으로 US 매수여력을 추정하는 모드입니다.
 ### 12-2) 자동 실행(권장)
 현재 운영은 systemd timer(OpenClaw)로 **매일 00:05(KST)** 에 다음을 수행하도록 구성할 수 있습니다.
 - `scripts/apply_next_day_reco.sh` 실행(전날 추천 적용)
+
+역할 분리 권장:
+- `systemd/scheduler`: 실행 시각 보장, 재시도, 프로세스 재기동
+- 봇/스크립트(`main.py`, `scripts/*.py`): 거래 로직, 검증, 리스크 가드
 
 ---
 

@@ -34,11 +34,12 @@
     "max_new_entries_per_minute": 2
   },
   "time_rules": {
-    "observe_start": "09:05:00",
-    "or_start": "09:05:00",
-    "or_end": "09:10:00",
-    "entry_start": "09:10:00",
-    "force_exit": "14:50:00"
+    "observe_start": "08:59:00",
+    "or_start": "09:00:00",
+    "or_end": "09:05:00",
+    "entry_start": "09:05:05",
+    "early_exit": "15:00:00",
+    "force_exit": "15:15:00"
   },
   "logging": {
     "dir": "logs"
