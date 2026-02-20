@@ -29,6 +29,8 @@ import argparse
 import asyncio
 import os
 import sys
+
+import aiohttp
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -121,6 +123,29 @@ def _parse_rows(rows: list[dict], *, symbol_filter: str = "") -> list[Row]:
     return out
 
 
+async def _retry(label: str, fn, *, tries: int = 4, base_sleep: float = 0.8):
+    """Retry for transient broker/network failures.
+
+    Returns:
+        The awaited result of fn(). Raises last exception if all retries fail.
+    """
+    last_exc: Exception | None = None
+    for i in range(tries):
+        try:
+            return await fn()
+        except (
+            aiohttp.client_exceptions.ServerDisconnectedError,
+            aiohttp.ClientConnectionError,
+            aiohttp.ClientOSError,
+            aiohttp.ClientResponseError,
+            asyncio.TimeoutError,
+        ) as e:
+            last_exc = e
+            await asyncio.sleep(base_sleep * (2**i))
+    assert last_exc is not None
+    raise last_exc
+
+
 async def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--exchange", default="AMEX", help="NASD/NYSE/AMEX")
@@ -140,7 +165,12 @@ async def main() -> int:
     logger = setup_logger(str(ROOT / "logs" / "tmp"), "Asia/Seoul")
     app_key, app_secret, _ = load_auth_from_env()
     auth = KISAuth("https://openapi.koreainvestment.com:9443", app_key, app_secret, logger)
-    await auth.fetch_token(force=True)
+    try:
+        await _retry("fetch_token", lambda: auth.fetch_token(force=True), tries=3, base_sleep=0.8)
+    except Exception as e:
+        # Do not alarm on transient broker issues; skip this run.
+        print(f"OK: broker unavailable ({type(e).__name__})")
+        return 0
 
     account = AccountInfo(
         account_no=os.environ.get("KIS_ACCOUNT_NO", ""),
@@ -152,11 +182,20 @@ async def main() -> int:
 
     rest = KISOverseasRestOrders(auth.base_url, auth, account, logger, exchange=args.exchange)
     try:
-        rows_raw = await rest.order_resv_list_us(
-            exchange=args.exchange,
-            inqr_strt_dt=_ymd(start),
-            inqr_end_dt=_ymd(end),
-        )
+        try:
+            rows_raw = await _retry(
+                "order_resv_list_us",
+                lambda: rest.order_resv_list_us(
+                    exchange=args.exchange,
+                    inqr_strt_dt=_ymd(start),
+                    inqr_end_dt=_ymd(end),
+                ),
+                tries=4,
+                base_sleep=0.8,
+            )
+        except Exception as e:
+            print(f"OK: broker unavailable ({type(e).__name__})")
+            return 0
 
         # Keep only active(received) + not-cancelled rows when those flags exist.
         filtered: list[dict] = []
@@ -201,7 +240,17 @@ async def main() -> int:
                 print("ABORT: kill_switch_on")
                 return 3
             print(f"CANCEL {r.symbol} rcit_dt={r.rcit_dt} odno={r.odno} qty={r.qty} px={r.price}")
-            resp = await rest.order_resv_ccnl_us(rsvn_ord_rcit_dt=r.rcit_dt, ovrs_rsvn_odno=r.odno)
+            try:
+                resp = await _retry(
+                    "order_resv_ccnl_us",
+                    lambda: rest.order_resv_ccnl_us(rsvn_ord_rcit_dt=r.rcit_dt, ovrs_rsvn_odno=r.odno),
+                    tries=3,
+                    base_sleep=0.8,
+                )
+            except Exception as e:
+                failed += 1
+                print(f"CANCEL_FAIL odno={r.odno} exc={type(e).__name__}")
+                continue
             rt_cd = str((resp or {}).get("rt_cd"))
             msg1 = str((resp or {}).get("msg1") or "")
             if rt_cd == "0" or "이미 취소" in msg1:

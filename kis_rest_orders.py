@@ -357,6 +357,8 @@ class KISRestOrders:
         }
 
         params_variants: list[tuple[str, dict]] = [
+            # Some KIS environments reject order-division fields; try without them first.
+            ("NONE", {**base_params}),
             ("ORD_DVSN_CD", {**base_params, "ORD_DVSN_CD": "00"}),
             ("ORD_DVSN", {**base_params, "ORD_DVSN": "00"}),
         ]
@@ -575,11 +577,22 @@ class KISRestOrders:
         try:
             session = await self._get_session()
             async with session.get(url, params=params, headers=headers) as resp:
+                # KIS sometimes returns JSON with missing/incorrect content-type.
+                data = None
                 try:
                     data = await resp.json()
                 except Exception:
-                    # Some broker outages return non-json/empty content-type; treat as no fills.
-                    return []
+                    try:
+                        text = await resp.text()
+                        if text:
+                            import json as _json
+                            data = _json.loads(text)
+                    except Exception:
+                        # Broker outage / non-json: treat as no fills.
+                        return []
+
+            if not isinstance(data, dict):
+                return []
 
             err = self._check_error(data, "get_fills")
             if err:
@@ -596,9 +609,59 @@ class KISRestOrders:
                         or f"{item.get('cncl_cntr')}@{item.get('exec_prc')}@{item.get('exec_qty')}"
                     )
 
-                    side_map = {"1": "BUY", "2": "SELL", "买入": "BUY", "卖出": "SELL"}
-                    raw_side = item.get("sll_buy_dvsn_cd") or item.get("ord_dt")
-                    side = side_map.get(str(raw_side), "BUY")
+                    # KIS: 01=SELL, 02=BUY in many endpoints. Keep robust mapping.
+                    side_map = {
+                        "01": "SELL",
+                        "02": "BUY",
+                        "1": "BUY",
+                        "2": "SELL",
+                        "BUY": "BUY",
+                        "SELL": "SELL",
+                        "买入": "BUY",
+                        "卖出": "SELL",
+                    }
+                    raw_side = item.get("sll_buy_dvsn_cd") or item.get("SLL_BUY_DVSN_CD")
+                    side = side_map.get(str(raw_side).strip(), "") or "BUY"
+
+                    # price/qty fields vary by environment; pick the best available.
+                    px = None
+                    for k in [
+                        "exec_prc",
+                        "cntr_pric",
+                        "cntr_pric2",
+                        "ccld_unpr",
+                        "cntr_prc",
+                        "ord_unpr",
+                    ]:
+                        v = item.get(k)
+                        if v not in (None, ""):
+                            try:
+                                px = float(v)
+                                break
+                            except Exception:
+                                pass
+                    if px is None:
+                        px = 0.0
+
+                    q = None
+                    for k in ["exec_qty", "cntr_qty", "ccld_qty", "ord_qty"]:
+                        v = item.get(k)
+                        if v not in (None, ""):
+                            try:
+                                q = int(float(v))
+                                break
+                            except Exception:
+                                pass
+                    if q is None:
+                        q = 0
+
+                    ts = ""
+                    dt = str(item.get("exec_dt") or item.get("ord_dt") or "")
+                    tm = str(item.get("exec_tm") or item.get("ord_tmd") or item.get("cntr_tm") or "")
+                    if dt and tm:
+                        ts = dt + tm
+                    else:
+                        ts = dt or tm
 
                     fills.append(
                         {
@@ -606,10 +669,10 @@ class KISRestOrders:
                             "order_id": str(item.get("odno", "")),
                             "symbol": str(item.get("pdno", symbol or "")),
                             "side": side,
-                            "qty": int(item.get("exec_qty", 0)),
-                            "price": float(item.get("exec_prc", 0)),
-                            "ts": item.get("exec_dt") + item.get("exec_tm", ""),
-                            "fee": float(item.get("comm_tax", 0)),
+                            "qty": int(q),
+                            "price": float(px),
+                            "ts": ts,
+                            "fee": float(item.get("comm_tax", 0) or 0),
                             "broker_order_id": str(item.get("orgn_odno", "")),
                         }
                     )

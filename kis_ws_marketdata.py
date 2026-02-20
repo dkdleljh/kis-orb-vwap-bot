@@ -127,6 +127,10 @@ class KISWebSocket:
                 if msg_cd == "OPSP8996" or "ALREADY IN USE appkey" in msg1.upper():
                     return {"type": "appkey_in_use", "data": data}
 
+                # 구독 한도 초과: 이후 구독 시도를 잠시 중단(데이터 품질 악화 + 에러 폭주 방지)
+                if msg_cd == "OPSP0008" or "MAX SUBSCRIBE OVER" in msg1.upper():
+                    return {"type": "max_subscribe_over", "data": data}
+
                 return {"type": "response", "data": data}
 
             # KIS 응답 형식에 따라 파싱 (데이터)
@@ -334,6 +338,13 @@ class KISWebSocket:
                                 except Exception:
                                     pass
                                 break
+
+                            if mtype == "max_subscribe_over":
+                                # Temporarily block further subscribe attempts.
+                                now_ts = time.time()
+                                setattr(self, "_subscribe_blocked_until", now_ts + 600)
+                                self.logger.warning("MAX SUBSCRIBE OVER(OPSP0008) - blocking new subscriptions for 600s")
+                                continue
 
                             if mtype == "trade":
                                 tick = TradeTick(

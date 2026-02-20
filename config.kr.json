@@ -15,30 +15,40 @@
   },
   "ws": {
     "url": "ws://ops.koreainvestment.com:21000",
-    "reconnect_backoff_sec": [1, 2, 3, 5, 8, 13],
+    "reconnect_backoff_sec": [
+      1,
+      2,
+      3,
+      5,
+      8,
+      13
+    ],
     "ping_interval_sec": 20
   },
   "trading": {
-    "entry_budget_pct": 0.17,
+    "entry_budget_pct": 0.18,
     "max_entries_per_day": 10,
     "max_concurrent_positions": 20,
     "stop_loss_pct": -0.015,
     "take_profit_pct": 0.03,
+    "min_hold_sec": 120,
+    "symbol_cooldown_sec": 900,
+    "atr_min_percent": 0.35,
     "quick_profit_pct": 0.01,
     "min_profit_for_guarantee_pct": 0.008,
     "daily_loss_limit_pct": -0.05,
     "max_consecutive_stop": 3,
     "max_spread_pct": 0.005,
     "entry_retry_limit": 5,
-    "max_total_position_pct": 0.60,
+    "max_total_position_pct": 0.6,
     "max_symbol_position_pct": 0.08,
-    "cash_reserve_pct": 0.20,
+    "cash_reserve_pct": 0.18,
     "max_new_entries_per_minute": 2,
     "use_atr_stops": true,
-    "atr_multiplier": 2.0,
+    "atr_multiplier": 2.7,
     "enable_time_filter": true,
     "scoring": {
-      "kr_scalp_entry_threshold": 75,
+      "kr_scalp_entry_threshold": 77.0,
       "kr_swing_entry_threshold": 65,
       "us_scalp_entry_threshold": 75,
       "us_swing_entry_threshold": 68
@@ -86,7 +96,9 @@
     "min_profit_for_guarantee_pct": 0.01,
     "same_day_trading": true
   },
-  "logging": { "dir": "logs" },
+  "logging": {
+    "dir": "logs"
+  },
   "automation": {
     "retry": {
       "max_attempts": 5,
@@ -95,7 +107,10 @@
       "jitter": true,
       "rate_limit_cooldown_sec": 65
     },
-    "healthcheck": { "enabled": true, "interval_sec": 60 }
+    "healthcheck": {
+      "enabled": true,
+      "interval_sec": 60
+    }
   },
   "modules": {
     "kukjang": {
@@ -107,9 +122,12 @@
         "enabled": true,
         "scan_interval_sec": 300,
         "top_n": 60,
-        "max_symbols": 30,
+        "max_symbols": 20,
         "market_div_code": "J",
-        "always_include": ["122630", "114800"],
+        "always_include": [
+          "122630",
+          "114800"
+        ],
         "min_price": 5,
         "min_liquidity": 1000000,
         "volatility_preference": "high",
@@ -133,17 +151,26 @@
         "top_n": 120,
         "max_symbols": 60,
         "market_div_code": "J",
-        "always_include": ["122630", "114800"],
+        "always_include": [
+          "122630",
+          "114800"
+        ],
         "min_price": 3,
         "min_liquidity": 500000,
         "volatility_preference": "stable_trend",
         "exclude_spac": true
       }
     },
-    "us_swing": { "enabled": false },
+    "us_swing": {
+      "enabled": false
+    },
     "hwanjeon": {
       "enabled": true,
-      "currencies": ["USD", "EUR", "JPY"],
+      "currencies": [
+        "USD",
+        "EUR",
+        "JPY"
+      ],
       "poll_interval": 60,
       "alerts": {
         "USD_above": 1400,
@@ -151,6 +178,8 @@
         "USD_change": 2.0
       }
     },
-    "mijang": { "enabled": false }
+    "mijang": {
+      "enabled": false
+    }
   }
 }

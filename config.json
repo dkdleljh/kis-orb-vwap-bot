@@ -135,7 +135,19 @@
       "entry_budget_pct": 0.17,
       "stop_loss_pct": -0.02,
       "take_profit_pct": 0.05,
-      "entry_retry_limit": 3
+      "entry_retry_limit": 3,
+      "dynamic_universe": {
+        "enabled": true,
+        "scan_interval_sec": 600,
+        "top_n": 120,
+        "max_symbols": 60,
+        "market_div_code": "J",
+        "always_include": ["122630", "114800"],
+        "min_price": 3,
+        "min_liquidity": 500000,
+        "volatility_preference": "stable_trend",
+        "exclude_spac": true
+      }
     },
 
     "us_swing": {

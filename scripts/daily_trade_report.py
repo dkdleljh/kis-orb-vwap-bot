@@ -422,6 +422,18 @@ def main() -> int:
             lines.append(f"- {reason}: **{cnt}**")
         lines.append("")
 
+    # (2-0) Cooldown blocks (new)
+    cooldown_recs = [r for r in risk_decisions if (not r.allowed) and r.reason == "cooldown"]
+    if cooldown_recs:
+        lines.append("## 쿨다운 차단 요약(cooldown)\n")
+        lines.append(f"- cooldown 차단 건수: **{len(cooldown_recs)}**")
+        by_sym: Counter[str] = Counter([r.symbol for r in cooldown_recs if r.symbol])
+        if by_sym:
+            lines.append("- TOP 5 심볼:")
+            for sym, cnt in by_sym.most_common(5):
+                lines.append(f"  - {sym}: {cnt}")
+        lines.append("")
+
     # (2-1) qty=0 numeric context breakdown
     lines.append("## qty=0 차단 원인 분해 (RiskDecision.context 기반)\n")
     qty0_recs = [r for r in risk_decisions if (not r.allowed) and r.reason == "qty=0"]

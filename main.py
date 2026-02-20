@@ -168,7 +168,14 @@ class TradingEngine:
         self.max_trades_per_symbol = max(
             1, int(tcfg.get("max_trades_per_symbol", 3))
         )
+        self.symbol_cooldown_sec = int(float(tcfg.get("symbol_cooldown_sec", 900) or 900))
+        self.symbol_cooldown_sec = max(0, min(24 * 3600, self.symbol_cooldown_sec))
+        self.atr_min_percent = float(tcfg.get("atr_min_percent", 0.35) or 0.35)
         self.atr_multiplier_sl = float(tcfg.get("atr_multiplier", 2.0))
+        self.min_hold_sec = int(float(tcfg.get("min_hold_sec", os.environ.get("KIS_MIN_HOLD_SEC", "120"))))
+
+        # Per-symbol cooldown memory (entry attempts)
+        self._symbol_cooldown_until: dict[str, float] = {}
 
         # Portfolio safety (recommended defaults)
         self.cash_reserve_pct = float(tcfg.get("cash_reserve_pct", 0.20))
@@ -576,7 +583,7 @@ class TradingEngine:
                     avg = float((info or {}).get("avg_price", 0.0) or 0.0)
                     if qty > 0 and avg > 0:
                         restored[str(sym)] = Position(
-                            symbol=str(sym), qty=qty, avg_price=avg
+                            symbol=str(sym), qty=qty, avg_price=avg, entry_time=now_local(self.tz)
                         )
                 break
             # best-effort: short backoff (avoid hammering)
@@ -962,8 +969,26 @@ class TradingEngine:
             except Exception:
                 base_thr = 50.0
 
-            spread_pct = float(book.spread_pct) if book is not None else 0.0
+            spread_pct = 0.0
+            try:
+                if book is not None and float(book.ask) > 0 and float(book.bid) > 0:
+                    spread_pct = (float(book.ask) - float(book.bid)) / float(book.ask)
+            except Exception:
+                spread_pct = 0.0
             atr_pct = float(indicators.get("atr_percent", 0) or 0)
+
+            # Filter: avoid low-ATR names where fees dominate (reduces buy-high/sell-low churn).
+            try:
+                if float(atr_pct) > 0 and float(atr_pct) < float(self.atr_min_percent):
+                    self.logger.debug(
+                        "[ATR Filter] %s atr_pct=%.3f < min=%.3f -> skip",
+                        symbol,
+                        float(atr_pct),
+                        float(self.atr_min_percent),
+                    )
+                    return
+            except Exception:
+                pass
 
             # Adjustments (conservative):
             # - high vol / wide spread -> stricter
@@ -1011,7 +1036,11 @@ class TradingEngine:
                     "correlation_id": signal_corr_id,
                     "close": float(bar.close),
                     "vwap": float(vwap) if vwap is not None else None,
-                    "spread_pct": float(book.spread_pct) if book is not None else None,
+                    "spread_pct": (
+                        ((float(book.ask) - float(book.bid)) / float(book.ask))
+                        if (book is not None and float(book.ask) > 0 and float(book.bid) > 0)
+                        else None
+                    ),
                     "rsi": float(indicators.get("rsi", 0) or 0),
                     "ma20": float(indicators.get("ma20", 0) or 0),
                     "ml_score": float(indicators.get("ml_score", 50) or 50),
@@ -1296,6 +1325,28 @@ class TradingEngine:
                         f"[News Filter] Check failed, proceeding with technical only: {e}"
                     )
 
+            # Cooldown: avoid repeated entries on the same symbol (fee/churn control)
+            try:
+                until = float(self._symbol_cooldown_until.get(str(symbol), 0.0) or 0.0)
+                if until and time.time() < until:
+                    try:
+                        self.event_store.append(
+                            ievents.RiskDecision(
+                                symbol=symbol,
+                                allowed=False,
+                                reason="cooldown",
+                                idempotency_key=idempotency_key,
+                                correlation_id=correlation_id,
+                                module="engine_orb_vwap",
+                                context={"cooldown_until_epoch": until},
+                            ).to_event(run_id=self.run_id)
+                        )
+                    except Exception:
+                        pass
+                    return
+            except Exception:
+                pass
+
             if book.ask <= 0:
                 try:
                     self.event_store.append(
@@ -1489,6 +1540,15 @@ class TradingEngine:
 
             qty = min(int(budget // book.ask), self.max_position_qty)
             if qty <= 0:
+                # If we can't buy even 1 share with current symbol budget, stop spamming.
+                try:
+                    if self.symbol_cooldown_sec > 0:
+                        self._symbol_cooldown_until[str(symbol)] = time.time() + float(
+                            self.symbol_cooldown_sec
+                        )
+                except Exception:
+                    pass
+
                 try:
                     self.event_store.append(
                         ievents.RiskDecision(
@@ -1539,6 +1599,15 @@ class TradingEngine:
 
             symbol_trades = int(self.trades_today_by_symbol.get(symbol, 0) or 0)
             if symbol_trades >= self.max_trades_per_symbol:
+                # Cooldown when a symbol hits the per-day cap (avoid log/risk spam).
+                try:
+                    if self.symbol_cooldown_sec > 0:
+                        self._symbol_cooldown_until[str(symbol)] = time.time() + float(
+                            self.symbol_cooldown_sec
+                        )
+                except Exception:
+                    pass
+
                 try:
                     self.event_store.append(
                         ievents.RiskDecision(
@@ -1577,6 +1646,12 @@ class TradingEngine:
                 return
 
             try:
+                # Start cooldown timer on actual intent (prevents churn on rapid repeated signals)
+                if self.symbol_cooldown_sec > 0:
+                    self._symbol_cooldown_until[str(symbol)] = time.time() + float(
+                        self.symbol_cooldown_sec
+                    )
+
                 self.event_store.append(
                     ievents.OrderIntent(
                         symbol=symbol,
@@ -2122,11 +2197,25 @@ class TradingEngine:
         if not last_price:
             return
 
+        # Guard: avoid immediate stop-out right after entry (microstructure noise).
+        try:
+            if pos.entry_time is not None:
+                held = (now_local(self.tz) - pos.entry_time).total_seconds()
+                if held < float(self.min_hold_sec):
+                    return
+        except Exception:
+            pass
+
         gross_pnl_pct = (last_price - pos.avg_price) / pos.avg_price
         net_pnl_pct = self.fee_calculator.get_net_pnl_percent(pos.avg_price, last_price)
-        pnl_pct = net_pnl_pct
-        pos.unrealized_pnl_pct = pnl_pct
-        pos.unrealized_gross_pnl_pct = gross_pnl_pct
+
+        # Use NET for reporting, but use GROSS for exit triggers.
+        pnl_net = net_pnl_pct
+        pnl_gross = gross_pnl_pct
+        pnl_exit = pnl_gross
+
+        pos.unrealized_pnl_pct = pnl_net
+        pos.unrealized_gross_pnl_pct = pnl_gross
 
         self.logger.debug(
             f"[Fee Adjust] {pos.symbol} Gross={gross_pnl_pct:.4f} Net={net_pnl_pct:.4f}"
@@ -2162,12 +2251,12 @@ class TradingEngine:
                         latest_atr / pos.avg_price
                     ) * atr_multiplier_tp
                     
-                    if pnl_pct >= dynamic_take_profit_pct:
-                        self.logger.info(f"🎯 SMART PROFIT (ATR): {pos.symbol} PnL={pnl_pct:.2%} Target={dynamic_take_profit_pct:.2%}")
+                    if pnl_exit >= dynamic_take_profit_pct:
+                        self.logger.info(f"🎯 SMART PROFIT (ATR): {pos.symbol} GrossPnL={pnl_exit:.2%} Target={dynamic_take_profit_pct:.2%} (Net={pnl_net:.2%})")
                         await self.handle_exit("take_profit (ATR)", symbol=pos.symbol)
                         return
-                    elif pnl_pct <= dynamic_stop_loss_pct:
-                        self.logger.info(f"🛡 SMART STOP (ATR): {pos.symbol} PnL={pnl_pct:.2%} Limit={dynamic_stop_loss_pct:.2%}")
+                    elif pnl_exit <= dynamic_stop_loss_pct:
+                        self.logger.info(f"🛡 SMART STOP (ATR): {pos.symbol} GrossPnL={pnl_exit:.2%} Limit={dynamic_stop_loss_pct:.2%} (Net={pnl_net:.2%})")
                         await self.handle_exit("stop_loss (ATR)", symbol=pos.symbol)
                         return
 
@@ -2178,7 +2267,7 @@ class TradingEngine:
         # 1. 부분 익절 (Scale-out): +1% 도달 시 절반 익절
         # - 포지션이 2주 이상일 때만 수행
         # - 수행 후 profit_locked=True로 전환해서 이익 보호 로직이 동작하도록 함
-        if pnl_pct >= self.quick_profit_pct and not pos.tp1_done and pos.qty > 1:
+        if pnl_exit >= self.quick_profit_pct and not pos.tp1_done and pos.qty > 1:
             half_qty = int(pos.qty * 0.5)
             if half_qty > 0:
                 if self.kill_switch_on():
@@ -2189,7 +2278,7 @@ class TradingEngine:
                     )
                     return
                 self.logger.info(
-                    f"💰 TP1 (Scale-out): {pos.symbol} PnL={pnl_pct:.2%} Qty={half_qty}"
+                    f"💰 TP1 (Scale-out): {pos.symbol} GrossPnL={pnl_exit:.2%} Qty={half_qty} (Net={pnl_net:.2%})"
                 )
                 await self.rest.place_sell_market(pos.symbol, half_qty)
                 pos.qty -= half_qty
@@ -2199,37 +2288,37 @@ class TradingEngine:
 
         # 2. Quick Profit (1%):
         # - 포지션이 1주뿐이거나(부분익절 불가), TP1 이후에도 계속 강하면 전량 익절
-        if pnl_pct >= self.quick_profit_pct and not pos.profit_locked:
+        if pnl_exit >= self.quick_profit_pct and not pos.profit_locked:
             self.logger.info(
-                f" PROFIT TARGET🎯 QUICK REACHED: {pos.symbol} PnL={pnl_pct:.2%}"
+                f" PROFIT TARGET🎯 QUICK REACHED: {pos.symbol} GrossPnL={pnl_exit:.2%} (Net={pnl_net:.2%})"
             )
             pos.profit_locked = True
             await self.handle_exit("quick_profit_1pct", symbol=pos.symbol)
             return
 
         # 3. Profit Lock: +1% 달성 후 수익이 다시 꺾이면 청산하여 이익 보호
-        if pos.profit_locked and pnl_pct < self.min_profit_for_guarantee_pct:
+        if pos.profit_locked and pnl_exit < self.min_profit_for_guarantee_pct:
             self.logger.info(
-                f"🔒 PROFIT LOCKED - Protecting gains: {pos.symbol} PnL={pnl_pct:.2%}"
+                f"🔒 PROFIT LOCKED - Protecting gains: {pos.symbol} GrossPnL={pnl_exit:.2%} (Net={pnl_net:.2%})"
             )
             await self.handle_exit("profit_lock_protection", symbol=pos.symbol)
             return
 
         # 2. 고점 수익률 갱신 (Trailing Stop용)
         if pos.symbol in self.peak_pnl_pct:
-            self.peak_pnl_pct[pos.symbol] = max(self.peak_pnl_pct[pos.symbol], pnl_pct)
+            self.peak_pnl_pct[pos.symbol] = max(self.peak_pnl_pct[pos.symbol], pnl_exit)
         else:
-            self.peak_pnl_pct[pos.symbol] = pnl_pct
+            self.peak_pnl_pct[pos.symbol] = pnl_exit
 
         peak_pnl = self.peak_pnl_pct[pos.symbol]
 
         # 3. 본전 스탑 (Breakeven): 수익이 +1.2% 이상 났다가 +0.3% 미만으로 떨어지면 즉시 청산
-        if peak_pnl >= 0.012 and pnl_pct < 0.003:
+        if peak_pnl >= 0.012 and pnl_exit < 0.003:
             await self.handle_exit("breakeven_stop", symbol=pos.symbol)
             return
 
         # 4. 트레일링 스탑 (Trailing): 수익이 +3.0% 이상 났다가, 고점 대비 -1.0% 하락하면 익절
-        if peak_pnl >= 0.030 and (peak_pnl - pnl_pct) >= 0.010:
+        if peak_pnl >= 0.030 and (peak_pnl - pnl_exit) >= 0.010:
             await self.handle_exit(
                 f"trailing_stop (peak={peak_pnl:.2%})", symbol=pos.symbol
             )
@@ -2237,9 +2326,9 @@ class TradingEngine:
 
         # 5. 동적 TP/SL (ATR 기반) 또는 고정 TP/SL
         # (위에서 이미 처리했으므로 여기서는 제거하거나 고정 TP/SL만 남김)
-        if pnl_pct >= self.take_profit_pct:
+        if pnl_exit >= self.take_profit_pct:
             await self.handle_exit("take_profit", symbol=pos.symbol)
-        elif pnl_pct <= self.stop_loss_pct:
+        elif pnl_exit <= self.stop_loss_pct:
             await self.handle_exit("stop_loss", symbol=pos.symbol)
 
     def kill_switch_on(self) -> bool:

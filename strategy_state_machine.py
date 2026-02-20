@@ -363,7 +363,7 @@ class StrategyStateMachine:
         else:
             if score > 0 and self.logger:
                 self.logger.info(
-                    f"[Score Fail] {book.symbol} Score={score}/95 Reasons={reasons} (Price={last_price} VWAP={vwap:.0f})"
+                    f"[Score Fail] {book.symbol} Score={score}/{float(min_score):.0f} Reasons={reasons} (Price={last_price} VWAP={vwap:.0f})"
                 )
 
         # [Pyramiding Logic] 불타기

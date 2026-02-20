@@ -28,6 +28,10 @@ data/
 reports/*.md
 reports/*.json
 reports/*.csv
+reports/applied/
+
+# Local backups
+*.bak.*
 
 # Frontend dependencies
 /dashboard/node_modules/

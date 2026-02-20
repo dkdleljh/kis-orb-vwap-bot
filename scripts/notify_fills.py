@@ -10,6 +10,7 @@ def format_currency(value):
 
 def main():
     if not os.path.exists(LOG_FILE):
+        print("OK (no fills log)")
         return
 
     # 파일 읽기 및 비우기 (Atomic하게 처리하려면 rename 후 읽는 게 좋음)
@@ -25,6 +26,7 @@ def main():
         return
 
     if not lines:
+        print("OK (no new fills)")
         return
 
     messages = []

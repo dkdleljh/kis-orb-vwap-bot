@@ -219,7 +219,54 @@ KRW 기반으로 US 매수여력을 추정하는 모드입니다.
 
 ---
 
-## 12) 실전 운영 체크리스트(장 시작 전/중/후)
+## 12) 무인 학습/자동 튜닝(Next-day Auto Tuning)
+
+이 프로젝트는 **매일 장 마감 후 데이터(이벤트/리포트)를 학습**하고, 다음날 장 시작 전에
+**전략 파라미터를 자동으로 업데이트**할 수 있습니다.
+
+### 12-1) 파이프라인 구성
+1) 일일 리포트 생성
+```bash
+./venv/bin/python scripts/daily_trade_report.py --date YYYY-MM-DD
+```
+- 입력: `logs/events/YYYYMMDD/events.jsonl`
+- 출력: `reports/trade_report_YYYY-MM-DD.md`
+
+2) 다음날 추천값 생성(학습)
+```bash
+./venv/bin/python scripts/recommend_next_day.py --date YYYY-MM-DD
+```
+- 입력: `logs/events/...` + `reports/trade_report_...`
+- 출력: `reports/next_day_reco_YYYY-MM-DD.(json|md)`
+- 특징: **수수료/회전(Churn) 비용**과 `qty=0(budget<ask)` 같은 실패 패턴을 반영해 튜닝합니다.
+
+3) 추천값 자동 적용(무인)
+```bash
+./venv/bin/python scripts/apply_next_day_reco.py --yesterday
+```
+- 적용 대상: **화이트리스트 키만**
+  - `trading.cash_reserve_pct`
+  - `trading.entry_budget_pct`
+  - `trading.scoring.kr_scalp_entry_threshold`
+  - `trading.symbol_cooldown_sec`
+  - `trading.atr_min_percent`
+- 안전장치:
+  - 안전 범위(clamp) + 최소 신뢰도(confidence) 통과 시에만 적용
+  - 적용 전 설정 백업 생성
+  - 적용 내역 `reports/applied/`에 감사 로그 저장
+  - 적용 후 `scripts/smoke_test.sh` + `scripts/healthcheck_kis.py` 실행
+  - 실패 시 **자동 롤백 + 서비스 재시작**
+
+> 운영 팁
+> - 무인 모드에서 `next_day_reco_*.json`이 없으면 `apply_next_day_reco.py`는 **OK로 스킵**합니다.
+
+### 12-2) 자동 실행(권장)
+현재 운영은 systemd timer(OpenClaw)로 **매일 00:05(KST)** 에 다음을 수행하도록 구성할 수 있습니다.
+- `scripts/apply_next_day_reco.sh` 실행(전날 추천 적용)
+
+---
+
+## 13) 실전 운영 체크리스트(장 시작 전/중/후)
 
 ### 12-1) 장 시작 전(필수)
 - [ ] `STOP_TRADING.flag`가 **의도대로** 설정되어 있는지 확인
@@ -254,7 +301,7 @@ KRW 기반으로 US 매수여력을 추정하는 모드입니다.
 
 ---
 
-## 13) 주인님 운영 기준(권장 기본 조합)
+## 14) 주인님 운영 기준(권장 기본 조합)
 
 현재 운영(추천값) 기준으로는 아래 조합이 가장 안정적입니다.
 
@@ -276,7 +323,7 @@ KRW 기반으로 US 매수여력을 추정하는 모드입니다.
 
 ---
 
-## 13) 디렉토리 구조(요약)
+## 15) 디렉토리 구조(요약)
 
 - `main.py` : 엔트리포인트(모듈 시스템 포함)
 - `modules/` : 전략/모듈(kukjang, kr_swing, mijang, us_swing, hwanjeon)
@@ -286,7 +333,7 @@ KRW 기반으로 US 매수여력을 추정하는 모드입니다.
 
 ---
 
-## 13) 면책 조항
+## 16) 면책 조항
 
 본 소프트웨어는 교육/연구 목적이며, 어떠한 수익도 보장하지 않습니다.
 실거래 사용에 따른 모든 책임은 사용자에게 있습니다.
