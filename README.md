@@ -366,7 +366,11 @@ KRW 기반으로 US 매수여력을 추정하는 모드입니다.
 
 ## 15) 디렉토리 구조(요약)
 
-- `main.py` : 엔트리포인트/오케스트레이터(세션 상태 전환 + 모듈 조합)
+- `main.py` : 최소 엔트리포인트(`engine.core_engine.TradingEngine` 실행/모듈 모드 부팅)
+- `engine/core_engine.py` : TradingEngine 오케스트레이터/루프
+- `engine/strategy.py` : 시그널 생성, 바 핸들러, TP/SL 평가
+- `engine/io_adapters.py` : REST/WS 연동 상태 래퍼
+- `engine/state.py` : 상태머신 연동/진입·청산 glue
 - `core/entry_gates.py` : 진입 게이트(노출/예산/쿨다운/리스크 이벤트)
 - `core/order_executor.py` : 주문 실행 래퍼(KISRestOrders 호출 + 주문/체결 이벤트)
 - `core/position_manager.py` : 포지션 상태/복구/스냅샷 오케스트레이션
