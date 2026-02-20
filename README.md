@@ -99,6 +99,7 @@ cp .env.example .env
 - `15:15` 이후: 강제 청산(`force_exit`)
 - `force_exit + 3분` 이후: 긴급 시장가 청산(예: `15:18`)
 - 누락/잘못된 값은 런타임 로그에 어떤 키가 기본값으로 대체됐는지 기록됩니다.
+- 관련 구현: `core/session_rules.py` (time_rules 파싱/기본값 + exit phase 계산)
 
 ---
 
@@ -253,11 +254,18 @@ KRW 기반으로 US 매수여력을 추정하는 모드입니다.
 - 입력: `logs/events/...` + `reports/trade_report_...`
 - 출력: `reports/next_day_reco_YYYY-MM-DD.(json|md)`
 - 특징: 과거 N일 학습(기본 30일), 모델 아티팩트 저장(`reports/models/`), 신뢰도/설명(importance) 포함 추천 생성.
+- 추가: walk-forward 검증(최근 K일, prior-days train)으로 `MAE`/`directional_accuracy`를 기록하고 추천 게이트에 반영.
+
+2-0) walk-forward 포함 실행 예시
+```bash
+./venv/bin/python scripts/recommend_next_day.py --date YYYY-MM-DD --lookback-days 45 --walk-forward-k 10 --wf-min-evals 4
+```
 
 2-1) 준비 검증(자동 복구 + immutable enrichment)
 ```bash
 ./venv/bin/python scripts/verify_next_day_prep.py --date YYYY-MM-DD --auto-enrich
 ./venv/bin/python scripts/verify_next_day_prep.py --date YYYY-MM-DD --auto-enrich --strict-signal-context
+./venv/bin/python scripts/verify_next_day_prep.py --date YYYY-MM-DD --auto-enrich --strict-signal-context --strict-require-enriched-no
 ```
 - 순서: 아티팩트 자동생성 → 이벤트 품질검사 → 컨텍스트 결함 시 1회 enrichment → 재검증
 - 이벤트 envelope는 `schema_version` 필드를 포함하며, 구버전 로그도 역호환 처리됩니다.
@@ -267,6 +275,7 @@ KRW 기반으로 US 매수여력을 추정하는 모드입니다.
 - 검증 메트릭: `reports/next_day_prep_metrics_YYYY-MM-DD.json`
 - `--strict-signal-context` 사용 시 Signal 컨텍스트를 절대 개수(>=1)가 아니라 비율 기준으로 검사합니다.
   - 기본 임계값: `min_score >= 30%`, `reasons >= 10%` (옵션으로 조정 가능)
+- `--strict-require-enriched-no`를 함께 쓰면 strict 모드에서 `enriched_used==NO`를 추가로 요구합니다(기본값은 비활성, 하위호환 유지).
 
 3) 추천값 자동 적용(무인)
 ```bash

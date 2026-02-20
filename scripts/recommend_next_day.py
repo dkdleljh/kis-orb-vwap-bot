@@ -7,7 +7,6 @@ import argparse
 import datetime as dt
 import hashlib
 import json
-import math
 import re
 from pathlib import Path
 from typing import Any
@@ -35,6 +34,13 @@ FEATURE_NAMES = [
     "fee_zero_live",
     "cooldown_blocks",
     "entry_rate_limit_blocks",
+    "report_realized_pnl_est",
+    "report_slippage_count",
+    "report_slippage_avg",
+    "report_slippage_worst",
+    "report_avg_hold_sec",
+    "report_win_count",
+    "report_loss_count",
 ]
 
 
@@ -77,7 +83,71 @@ def _load_current_cfg() -> dict[str, Any]:
     return {"_config_path": "", "_config_hash": ""}
 
 
-def _extract_day_features(events_path: Path) -> dict[str, float]:
+def _extract_trade_report_features(report_path: Path) -> dict[str, float]:
+    out = {
+        "report_realized_pnl_est": 0.0,
+        "report_slippage_count": 0.0,
+        "report_slippage_avg": 0.0,
+        "report_slippage_worst": 0.0,
+        "report_avg_hold_sec": 0.0,
+        "report_win_count": 0.0,
+        "report_loss_count": 0.0,
+    }
+    if not report_path.exists():
+        return out
+    try:
+        txt = report_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return out
+
+    # 당일 손익(추정, KRW): **-2,070원**
+    m_pnl = re.search(r"당일 손익\(추정, KRW\): \*\*([\-0-9,]+)원\*\*", txt)
+    if m_pnl:
+        try:
+            out["report_realized_pnl_est"] = float(m_pnl.group(1).replace(",", ""))
+        except Exception:
+            pass
+
+    # KR slippage: count=11, avg=-1.6364, best=-10.0000, worst=0.0000
+    m_slip = re.search(
+        r"KR slippage:\s*count=([0-9]+),\s*avg=([\-0-9.]+),\s*best=([\-0-9.]+),\s*worst=([\-0-9.]+)",
+        txt,
+    )
+    if m_slip:
+        try:
+            out["report_slippage_count"] = float(m_slip.group(1))
+            out["report_slippage_avg"] = float(m_slip.group(2))
+            out["report_slippage_worst"] = float(m_slip.group(4))
+        except Exception:
+            pass
+
+    # Optional patterns when report template includes explicit holding-time summary.
+    m_hold = re.search(r"(?:avg[_ ]hold[_ ]sec|평균\s*보유\s*초)\s*[:=]\s*([0-9.]+)", txt, flags=re.IGNORECASE)
+    if m_hold:
+        try:
+            out["report_avg_hold_sec"] = float(m_hold.group(1))
+        except Exception:
+            pass
+
+    # Best-effort win/loss from per-symbol realized lines.
+    # Example: - 실현손익(추정, FIFO): 804원
+    wins = 0
+    losses = 0
+    for ms in re.finditer(r"실현손익\(추정,\s*FIFO\):\s*([\-0-9,]+)원", txt):
+        try:
+            v = float(ms.group(1).replace(",", ""))
+            if v > 0:
+                wins += 1
+            elif v < 0:
+                losses += 1
+        except Exception:
+            continue
+    out["report_win_count"] = float(wins)
+    out["report_loss_count"] = float(losses)
+    return out
+
+
+def _extract_day_features(events_path: Path, report_path: Path | None = None) -> dict[str, float]:
     f = {k: 0.0 for k in FEATURE_NAMES}
 
     for ev in _iter_events(events_path):
@@ -123,6 +193,11 @@ def _extract_day_features(events_path: Path) -> dict[str, float]:
             if fee == 0.0 and str(payload.get("broker_order_id") or "").upper() != "PAPER":
                 f["fee_zero_live"] += 1
 
+    if report_path is not None:
+        rep = _extract_trade_report_features(report_path)
+        for k in FEATURE_NAMES:
+            if k in rep:
+                f[k] = float(rep[k])
     return f
 
 
@@ -171,7 +246,7 @@ def _discover_training_rows(target_day: dt.date, lookback_days: int) -> tuple[li
         if y is None or not events_path.exists():
             continue
 
-        feats = _extract_day_features(events_path)
+        feats = _extract_day_features(events_path, report_path=report_path)
         rows_x.append([float(feats[k]) for k in FEATURE_NAMES])
         rows_y.append(float(y))
         row_days.append(day.isoformat())
@@ -268,13 +343,91 @@ def _fit_and_predict(x_train: list[list[float]], y_train: list[float], x_pred: l
         }
 
 
-def _confidence_from_quality(r2_train: float, n_rows: int) -> tuple[str, float]:
+def _walk_forward_validate(
+    x_all: list[list[float]],
+    y_all: list[float],
+    day_all: list[str],
+    *,
+    min_train_rows: int,
+    eval_last_k: int,
+) -> dict[str, Any]:
+    n = len(x_all)
+    if n <= min_train_rows:
+        return {
+            "enabled": True,
+            "evaluated_days": [],
+            "n_eval": 0,
+            "mae": None,
+            "directional_accuracy": None,
+            "y_true": [],
+            "y_pred": [],
+        }
+
+    start = max(min_train_rows, n - max(1, int(eval_last_k)))
+    eval_days: list[str] = []
+    y_true: list[float] = []
+    y_pred: list[float] = []
+
+    for i in range(start, n):
+        fit = _fit_and_predict(x_all[:i], y_all[:i], x_all[i])
+        if not fit.get("ok"):
+            continue
+        eval_days.append(day_all[i])
+        y_true.append(float(y_all[i]))
+        y_pred.append(float(fit.get("prediction") or 0.0))
+
+    n_eval = len(y_true)
+    if n_eval <= 0:
+        return {
+            "enabled": True,
+            "evaluated_days": eval_days,
+            "n_eval": 0,
+            "mae": None,
+            "directional_accuracy": None,
+            "y_true": [],
+            "y_pred": [],
+        }
+
+    abs_err = [abs(y_true[i] - y_pred[i]) for i in range(n_eval)]
+    dir_hits = 0
+    for i in range(n_eval):
+        yt = y_true[i]
+        yp = y_pred[i]
+        yt_sign = 1 if yt > 0 else (-1 if yt < 0 else 0)
+        yp_sign = 1 if yp > 0 else (-1 if yp < 0 else 0)
+        if yt_sign == yp_sign:
+            dir_hits += 1
+
+    return {
+        "enabled": True,
+        "evaluated_days": eval_days,
+        "n_eval": n_eval,
+        "mae": float(sum(abs_err) / n_eval),
+        "directional_accuracy": float(dir_hits / n_eval),
+        "y_true": [round(v, 4) for v in y_true],
+        "y_pred": [round(v, 4) for v in y_pred],
+    }
+
+
+def _confidence_from_quality(
+    r2_train: float,
+    n_rows: int,
+    wf_n_eval: int,
+    wf_directional_acc: float | None,
+) -> tuple[str, float]:
     base = 0.45
     if n_rows >= 8:
         base += 0.1
     if n_rows >= 15:
         base += 0.1
-    score = _clamp(base + _clamp(r2_train, 0.0, 1.0) * 0.25, 0.3, 0.92)
+    if wf_n_eval >= 3 and wf_directional_acc is not None:
+        if wf_directional_acc >= 0.65:
+            base += 0.08
+        elif wf_directional_acc >= 0.55:
+            base += 0.04
+        else:
+            base -= 0.10
+    score = _clamp(base + _clamp(r2_train, 0.0, 1.0) * 0.22, 0.25, 0.92)
     if score >= 0.75:
         return "high", score
     if score >= 0.58:
@@ -288,6 +441,20 @@ def main() -> int:
     ap.add_argument("--events-path", default=None, help="override events path")
     ap.add_argument("--lookback-days", type=int, default=30)
     ap.add_argument("--min-train-rows", type=int, default=10)
+    ap.add_argument("--walk-forward-k", type=int, default=7, help="evaluate last K train days")
+    ap.add_argument("--wf-min-evals", type=int, default=3, help="minimum walk-forward eval points")
+    ap.add_argument(
+        "--wf-directional-acc-min",
+        type=float,
+        default=0.55,
+        help="minimum walk-forward directional accuracy gate",
+    )
+    ap.add_argument(
+        "--wf-mae-max",
+        type=float,
+        default=4000.0,
+        help="maximum walk-forward MAE gate (KRW estimate)",
+    )
     args = ap.parse_args()
 
     kst = dt.timezone(dt.timedelta(hours=9))
@@ -308,7 +475,7 @@ def main() -> int:
     cur_cooldown_sec = float(trading.get("symbol_cooldown_sec", 900) or 900)
     cur_atr_min = float(trading.get("atr_min_percent", 0.35) or 0.35)
 
-    features_today = _extract_day_features(events_path)
+    features_today = _extract_day_features(events_path, report_path=trade_report_path)
     x_train, y_train, train_days = _discover_training_rows(day, max(7, int(args.lookback_days)))
     x_pred = [float(features_today[k]) for k in FEATURE_NAMES]
     min_train_rows = max(1, int(args.min_train_rows))
@@ -319,6 +486,17 @@ def main() -> int:
         if not training_rows_sufficient
         else ""
     )
+
+    wf = _walk_forward_validate(
+        x_train,
+        y_train,
+        train_days,
+        min_train_rows=min_train_rows,
+        eval_last_k=max(1, int(args.walk_forward_k)),
+    )
+    wf_n_eval = int(wf.get("n_eval") or 0)
+    wf_dir_acc = wf.get("directional_accuracy")
+    wf_mae = wf.get("mae")
 
     fit = (
         _fit_and_predict(x_train, y_train, x_pred)
@@ -338,9 +516,39 @@ def main() -> int:
     r2_train = float(fit.get("r2_train") or 0.0)
 
     if training_rows_sufficient:
-        conf_level, conf_score = _confidence_from_quality(r2_train, train_rows)
+        conf_level, conf_score = _confidence_from_quality(
+            r2_train,
+            train_rows,
+            wf_n_eval,
+            float(wf_dir_acc) if wf_dir_acc is not None else None,
+        )
     else:
         conf_level, conf_score = "low", 0.32
+
+    wf_quality_ok = (
+        training_rows_sufficient
+        and wf_n_eval >= max(1, int(args.wf_min_evals))
+        and (wf_dir_acc is not None and float(wf_dir_acc) >= float(args.wf_directional_acc_min))
+        and (wf_mae is not None and float(wf_mae) <= float(args.wf_mae_max))
+    )
+    ml_reco_gate_ok = bool(training_rows_sufficient and fit.get("ok") and wf_quality_ok)
+    ml_reco_gate_reason = ""
+    if not training_rows_sufficient:
+        ml_reco_gate_reason = training_gate_reason
+    elif not fit.get("ok"):
+        ml_reco_gate_reason = "model_fit_failed"
+    elif wf_n_eval < max(1, int(args.wf_min_evals)):
+        ml_reco_gate_reason = f"wf_insufficient:{wf_n_eval}<{max(1, int(args.wf_min_evals))}"
+    elif wf_dir_acc is None or float(wf_dir_acc) < float(args.wf_directional_acc_min):
+        ml_reco_gate_reason = (
+            f"wf_directional_acc_low:{0.0 if wf_dir_acc is None else float(wf_dir_acc):.3f}"
+            f"<{float(args.wf_directional_acc_min):.3f}"
+        )
+    elif wf_mae is None or float(wf_mae) > float(args.wf_mae_max):
+        ml_reco_gate_reason = (
+            f"wf_mae_high:{0.0 if wf_mae is None else float(wf_mae):.2f}"
+            f">{float(args.wf_mae_max):.2f}"
+        )
 
     coef = [float(c) for c in (fit.get("coef") or [0.0 for _ in FEATURE_NAMES])]
     importances = []
@@ -381,7 +589,7 @@ def main() -> int:
                 "feature_importances": top_importances,
             },
         },
-        "reasons": [training_gate_reason] if training_gate_reason else [],
+        "reasons": [x for x in [training_gate_reason, ml_reco_gate_reason] if x],
         "recommendations": [],
     }
 
@@ -407,7 +615,7 @@ def main() -> int:
     fill_count = int(features_today["fill_count"])
     fee_total = float(features_today["fee_total"])
 
-    if training_rows_sufficient and fit.get("ok") and train_rows >= 5:
+    if ml_reco_gate_ok and train_rows >= 5:
         # Guardrail policy from predicted outcome.
         if pred_pnl < -500:
             bump = _clamp(abs(pred_pnl) / 3000.0, 1.0, 4.0)
@@ -483,6 +691,8 @@ def main() -> int:
                     "min_train_rows": min_train_rows,
                     "train_rows_sufficient": training_rows_sufficient,
                     "training_gate_reason": training_gate_reason,
+                    "ml_reco_gate_ok": ml_reco_gate_ok,
+                    "ml_reco_gate_reason": ml_reco_gate_reason,
                     "r2_train": round(r2_train, 4),
                 },
             }
@@ -512,6 +722,20 @@ def main() -> int:
         "train_days": train_days,
         "r2_train": round(r2_train, 6),
         "prediction_daily_pnl": round(pred_pnl, 6),
+        "walk_forward": {
+            "k": int(args.walk_forward_k),
+            "n_eval": wf_n_eval,
+            "mae": None if wf_mae is None else round(float(wf_mae), 6),
+            "directional_accuracy": None if wf_dir_acc is None else round(float(wf_dir_acc), 6),
+            "evaluated_days": list(wf.get("evaluated_days") or []),
+        },
+        "ml_reco_gate": {
+            "ok": ml_reco_gate_ok,
+            "reason": ml_reco_gate_reason,
+            "wf_min_evals": int(args.wf_min_evals),
+            "wf_directional_acc_min": float(args.wf_directional_acc_min),
+            "wf_mae_max": float(args.wf_mae_max),
+        },
     }
     model_json.write_text(json.dumps(model_artifact, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -525,6 +749,20 @@ def main() -> int:
 
     recos["inputs"]["model"]["artifact_json"] = str(model_json)
     recos["inputs"]["model"]["artifact_pickle"] = str(model_pkl) if model_pkl.exists() else None
+    recos["inputs"]["model"]["walk_forward"] = {
+        "k": int(args.walk_forward_k),
+        "n_eval": wf_n_eval,
+        "mae": None if wf_mae is None else round(float(wf_mae), 6),
+        "directional_accuracy": None if wf_dir_acc is None else round(float(wf_dir_acc), 6),
+        "evaluated_days": list(wf.get("evaluated_days") or []),
+    }
+    recos["inputs"]["model"]["ml_reco_gate"] = {
+        "ok": ml_reco_gate_ok,
+        "reason": ml_reco_gate_reason,
+        "wf_min_evals": int(args.wf_min_evals),
+        "wf_directional_acc_min": float(args.wf_directional_acc_min),
+        "wf_mae_max": float(args.wf_mae_max),
+    }
 
     out_json.write_text(json.dumps(recos, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -544,6 +782,15 @@ def main() -> int:
         lines.append(f"- training_gate_reason: `{training_gate_reason}`")
     lines.append(f"- r2_train: `{round(r2_train, 6)}`")
     lines.append(f"- prediction_daily_pnl: `{round(pred_pnl, 2)}`")
+    lines.append(f"- walk_forward_k: `{int(args.walk_forward_k)}`")
+    lines.append(f"- walk_forward_n_eval: `{wf_n_eval}`")
+    lines.append(f"- walk_forward_mae: `{None if wf_mae is None else round(float(wf_mae), 2)}`")
+    lines.append(
+        f"- walk_forward_directional_accuracy: `{None if wf_dir_acc is None else round(float(wf_dir_acc), 4)}`"
+    )
+    lines.append(f"- ml_reco_gate_ok: `{ml_reco_gate_ok}`")
+    if ml_reco_gate_reason:
+        lines.append(f"- ml_reco_gate_reason: `{ml_reco_gate_reason}`")
     lines.append(f"- top_importances: `{json.dumps(top_importances, ensure_ascii=False)}`")
     lines.append("")
     lines.append("## 추천 항목")

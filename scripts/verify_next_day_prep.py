@@ -144,7 +144,14 @@ def _compute_event_quality(events: list[dict[str, Any]]) -> dict[str, int]:
     }
 
 
-def _classify_failures(*, artifacts_ok: bool, sanity_ok: bool, qty0_ctx_ok: bool, signal_ctx_ok: bool) -> list[str]:
+def _classify_failures(
+    *,
+    artifacts_ok: bool,
+    sanity_ok: bool,
+    qty0_ctx_ok: bool,
+    signal_ctx_ok: bool,
+    strict_enriched_ok: bool,
+) -> list[str]:
     reasons: list[str] = []
     if not artifacts_ok:
         reasons.append("artifact_missing")
@@ -154,6 +161,8 @@ def _classify_failures(*, artifacts_ok: bool, sanity_ok: bool, qty0_ctx_ok: bool
         reasons.append("qty0_context_missing")
     if not signal_ctx_ok:
         reasons.append("signal_context_incomplete")
+    if not strict_enriched_ok:
+        reasons.append("strict_requires_enriched_no")
     return reasons
 
 
@@ -168,6 +177,11 @@ def main() -> int:
         "--strict-signal-context",
         action="store_true",
         help="require signal min_score/reasons coverage ratios instead of >=1 absolute checks",
+    )
+    ap.add_argument(
+        "--strict-require-enriched-no",
+        action="store_true",
+        help="with --strict-signal-context, also require enriched_used==NO",
     )
     ap.add_argument("--signal-min-score-ratio-threshold", type=float, default=0.30)
     ap.add_argument("--signal-reasons-ratio-threshold", type=float, default=0.10)
@@ -285,7 +299,11 @@ def main() -> int:
             else:
                 signal_ctx_ok = q["signal_with_min_score"] >= 1 and q["signal_with_reasons"] >= 1
 
-    ok = artifacts_ok and sanity_ok and qty0_ctx_ok and signal_ctx_ok
+    strict_enriched_ok = True
+    if args.strict_signal_context and args.strict_require_enriched_no:
+        strict_enriched_ok = used_events_path != enriched_events_path
+
+    ok = artifacts_ok and sanity_ok and qty0_ctx_ok and signal_ctx_ok and strict_enriched_ok
     pass_via_enrichment = ok and (used_events_path == enriched_events_path)
 
     reasons = _classify_failures(
@@ -293,6 +311,7 @@ def main() -> int:
         sanity_ok=sanity_ok,
         qty0_ctx_ok=qty0_ctx_ok,
         signal_ctx_ok=signal_ctx_ok,
+        strict_enriched_ok=strict_enriched_ok,
     )
     if enrich_attempted and not enrich_done:
         reasons.append("enrichment_failed")
@@ -314,6 +333,7 @@ def main() -> int:
         "quality": q,
         "signal_context_policy": {
             "strict_enabled": bool(args.strict_signal_context),
+            "strict_require_enriched_no": bool(args.strict_require_enriched_no),
             "min_score_ratio": round(min_score_ratio, 6),
             "reasons_ratio": round(reasons_ratio, 6),
             "min_score_ratio_threshold": float(args.signal_min_score_ratio_threshold),
@@ -328,6 +348,7 @@ def main() -> int:
             "pass_via_enrichment": pass_via_enrichment,
         },
         "failure_reasons": reasons,
+        "strict_enriched_ok": strict_enriched_ok,
         "pass": ok,
     }
 
@@ -360,6 +381,11 @@ def main() -> int:
         + f"min_score_ratio={min_score_ratio:.3f}, reasons_ratio={reasons_ratio:.3f}, "
         + f"strict={'YES' if args.strict_signal_context else 'NO'}"
     )
+    if args.strict_signal_context and args.strict_require_enriched_no:
+        print(
+            f"strict_require_enriched_no={'PASS' if strict_enriched_ok else 'FAIL'}"
+            + f" :: enriched_used={'YES' if used_events_path == enriched_events_path else 'NO'}"
+        )
 
     print(
         "KIS NextDayPrep Verification: "
