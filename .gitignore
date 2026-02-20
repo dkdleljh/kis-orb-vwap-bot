@@ -30,6 +30,7 @@ reports/*.json
 reports/*.csv
 reports/applied/
 reports/models/
+reports/datasets/
 
 # Local backups
 *.bak.*
