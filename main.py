@@ -4,7 +4,7 @@ import os
 import signal
 import time
 from collections import defaultdict, deque
-from datetime import datetime, time as dt_time, timedelta
+from datetime import datetime
 from types import FrameType
 from typing import Any, Dict, IO, Optional, cast
 
@@ -20,7 +20,7 @@ from logger import setup_logger
 from models import Bar1m, OrderBookTop, Position, TradeTick
 from risk_manager import RiskManager
 from strategy_state_machine import Signal, State, StrategyStateMachine
-from utils_time import TimeRules, is_after, is_between, now_local, parse_time
+from utils_time import is_after, is_between, now_local
 
 from kis_scanner import KisScanner
 from fee_calculator import FeeCalculator, USFeeCalculator
@@ -39,110 +39,11 @@ from core.reconcile import (
     reconcile_positions,
     should_block_new_entries,
 )
-
-DEFAULT_TIME_RULES: dict[str, str] = {
-    "observe_start": "08:59:00",
-    "or_start": "09:00:00",
-    "or_end": "09:05:00",
-    "entry_start": "09:05:05",
-    "force_exit": "15:15:00",
-    "early_exit": "15:00:00",
-}
-
-
-def _parse_time_rule_with_default(
-    tr_cfg: Dict[str, Any],
-    key: str,
-    logger: Any,
-    *,
-    log_prefix: str,
-) -> tuple[dt_time, bool]:
-    raw = tr_cfg.get(key)
-    default_raw = DEFAULT_TIME_RULES[key]
-    used_default = False
-    if raw is None or str(raw).strip() == "":
-        raw = default_raw
-        used_default = True
-    try:
-        return parse_time(str(raw)), used_default
-    except Exception:
-        logger.warning(
-            "%s invalid time_rules.%s=%r; using default=%s",
-            log_prefix,
-            key,
-            raw,
-            default_raw,
-        )
-        return parse_time(default_raw), True
-
-
-def _build_time_rules(
-    tr_cfg: Dict[str, Any] | None,
-    logger: Any,
-    *,
-    log_prefix: str,
-) -> tuple[TimeRules, dt_time]:
-    tr = tr_cfg or {}
-    defaults_used: list[str] = []
-
-    observe_start, used = _parse_time_rule_with_default(tr, "observe_start", logger, log_prefix=log_prefix)
-    if used:
-        defaults_used.append("observe_start")
-    or_start, used = _parse_time_rule_with_default(tr, "or_start", logger, log_prefix=log_prefix)
-    if used:
-        defaults_used.append("or_start")
-    or_end, used = _parse_time_rule_with_default(tr, "or_end", logger, log_prefix=log_prefix)
-    if used:
-        defaults_used.append("or_end")
-    entry_start, used = _parse_time_rule_with_default(tr, "entry_start", logger, log_prefix=log_prefix)
-    if used:
-        defaults_used.append("entry_start")
-    force_exit, used = _parse_time_rule_with_default(tr, "force_exit", logger, log_prefix=log_prefix)
-    if used:
-        defaults_used.append("force_exit")
-    early_exit, used = _parse_time_rule_with_default(tr, "early_exit", logger, log_prefix=log_prefix)
-    if used:
-        defaults_used.append("early_exit")
-
-    rules = TimeRules(
-        observe_start=observe_start,
-        or_start=or_start,
-        or_end=or_end,
-        entry_start=entry_start,
-        force_exit=force_exit,
-    )
-    logger.info(
-        "%s time_rules resolved: observe_start=%s or_start=%s or_end=%s entry_start=%s force_exit=%s early_exit=%s",
-        log_prefix,
-        rules.observe_start,
-        rules.or_start,
-        rules.or_end,
-        rules.entry_start,
-        rules.force_exit,
-        early_exit,
-    )
-    if defaults_used:
-        logger.warning("%s time_rules defaults used for: %s", log_prefix, ", ".join(defaults_used))
-    return rules, early_exit
-
-
-def _exit_phase(now_dt: datetime, early_exit: dt_time, force_exit: dt_time) -> tuple[str | None, dt_time]:
-    force_exit_dt = now_dt.replace(
-        hour=force_exit.hour,
-        minute=force_exit.minute,
-        second=force_exit.second,
-        microsecond=0,
-    )
-    final_kill_dt = force_exit_dt + timedelta(minutes=3)
-    final_kill_time = final_kill_dt.time()
-
-    if is_after(final_kill_time, now_dt):
-        return "emergency", final_kill_time
-    if is_after(force_exit, now_dt):
-        return "force", final_kill_time
-    if is_after(early_exit, now_dt):
-        return "early", final_kill_time
-    return None, final_kill_time
+from core.session_rules import (
+    build_time_rules,
+    exit_phase,
+    resolve_entry_risk_bounds,
+)
 
 
 class TradingEngine:
@@ -245,7 +146,7 @@ class TradingEngine:
         self.rest = KISRestOrders(rest_base_url, self.auth, account, self.logger)
 
         # 4) 시간 규칙
-        self.time_rules, self.early_exit = _build_time_rules(
+        self.time_rules, self.early_exit = build_time_rules(
             self.config.get("time_rules", {}),
             self.logger,
             log_prefix="[TradingEngine]",
@@ -1351,6 +1252,7 @@ class TradingEngine:
 
         try:
             tcfg = self.config.get("trading", {}) or {}
+            bounds = resolve_entry_risk_bounds(tcfg)
             cash = 0.0
             exposure = 0.0
             equity_est = 0.0
@@ -1359,8 +1261,8 @@ class TradingEngine:
             reserve_amt = 0.0
             budget_pct = float(self.entry_budget_pct)
             budget = 0.0
-            max_total_position_pct = 0.60
-            max_symbol_position_pct = 0.08
+            max_total_position_pct = float(bounds.max_total_position_pct)
+            max_symbol_position_pct = float(bounds.max_symbol_position_pct)
 
             # --- Entry pacing guardrail (recommended default: 2 entries/min) ---
             try:
@@ -1469,15 +1371,8 @@ class TradingEngine:
                 self.logger.warning("cash query failed (0), using default budget")
                 cash = 1000
 
-            # --- Portfolio-level exposure cap (recommended default: 60%) ---
-            # We approximate total equity as: cash_available_now + current_mark_to_market_exposure.
-            # This is conservative enough for limiting new entries and avoids a separate equity API.
-            max_total_position_pct = 0.60
-            try:
-                max_total_position_pct = float(tcfg.get("max_total_position_pct", 0.60) or 0.60)
-            except Exception:
-                max_total_position_pct = 0.60
-            max_total_position_pct = max(0.05, min(0.95, max_total_position_pct))
+            # --- Portfolio-level exposure cap ---
+            # We approximate total equity as: cash_available_now + current mark-to-market exposure.
 
             exposure = 0.0
             try:
@@ -1577,14 +1472,8 @@ class TradingEngine:
 
             budget = min(float(budget), float(remaining_cap))
 
-            # --- Per-symbol exposure cap (recommended default: 8%) ---
+            # --- Per-symbol exposure cap ---
             # Limit *resulting* symbol exposure after this entry.
-            max_symbol_position_pct = 0.08
-            try:
-                max_symbol_position_pct = float(tcfg.get("max_symbol_position_pct", 0.08) or 0.08)
-            except Exception:
-                max_symbol_position_pct = 0.08
-            max_symbol_position_pct = max(0.01, min(0.50, max_symbol_position_pct))
 
             existing_sym_exposure = 0.0
             try:
@@ -2143,7 +2032,7 @@ class TradingEngine:
         """
         now_dt = now_local(self.tz)
 
-        phase, final_kill_time = _exit_phase(now_dt, self.early_exit, self.time_rules.force_exit)
+        phase, final_kill_time = exit_phase(now_dt, self.early_exit, self.time_rules.force_exit)
 
         # 1) 강제 종료 시간 (15:15 ~ 15:18)
         # 15:15: 1차 청산 시도
@@ -2249,7 +2138,7 @@ class TradingEngine:
         now_dt = now_local(self.tz)
 
         if self.state_machine.active_position_count() > 0:
-            phase, _ = _exit_phase(now_dt, self.early_exit, self.time_rules.force_exit)
+            phase, _ = exit_phase(now_dt, self.early_exit, self.time_rules.force_exit)
             if phase == "emergency":
                 await self.handle_exit("emergency_market_close", symbol=None, use_market=True)
                 return
@@ -3068,7 +2957,7 @@ async def run_module_system(base_dir: str) -> None:
 
         scanner = KisScanner(auth, rest_base_url)
 
-        time_rules, _early_exit = _build_time_rules(
+        time_rules, _early_exit = build_time_rules(
             config.get("time_rules", {}),
             logger,
             log_prefix="[ModuleLoader:kukjang]",
