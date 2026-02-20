@@ -83,8 +83,13 @@ class Signal:
         }
         if self.correlation_id:
             payload["correlation_id"] = self.correlation_id
-        if self.context:
+        if isinstance(self.context, dict) and self.context:
             payload["context"] = self.context
+        else:
+            payload["context"] = {
+                "context_missing": True,
+                "autofilled_at_emit": True,
+            }
         return Event.make(
             type="Signal",
             payload=payload,
@@ -149,8 +154,13 @@ class RiskDecision:
             payload["correlation_id"] = self.correlation_id
         if self.module:
             payload["module"] = self.module
-        if self.context:
+        if isinstance(self.context, dict) and self.context:
             payload["context"] = self.context
+        else:
+            payload["context"] = {
+                "context_missing": True,
+                "autofilled_at_emit": True,
+            }
         return Event.make(
             type="RiskDecision",
             payload=payload,

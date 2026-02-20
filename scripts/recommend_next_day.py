@@ -1,39 +1,55 @@
 #!/usr/bin/env python3
-"""Recommend next-day tuning values (best-effort, safe).
-
-Inputs:
-- reports/trade_report_YYYY-MM-DD.md (optional)
-- logs/events/YYYYMMDD/events.jsonl
-- config.json
-
-Outputs:
-- reports/next_day_reco_YYYY-MM-DD.json
-- reports/next_day_reco_YYYY-MM-DD.md
-"""
+"""Train and infer next-day recommendations from historical events/reports."""
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
-import statistics
-from collections import Counter
+import math
+import re
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 
+SAFE_RANGES: dict[str, tuple[float, float]] = {
+    "trading.cash_reserve_pct": (0.10, 0.35),
+    "trading.entry_budget_pct": (0.05, 0.35),
+    "trading.scoring.kr_scalp_entry_threshold": (55.0, 85.0),
+    "trading.symbol_cooldown_sec": (60.0, 3600.0),
+    "trading.atr_min_percent": (0.10, 2.00),
+}
 
-def _iter_events(path: Path) -> Iterable[dict]:
+FEATURE_NAMES = [
+    "risk_blocked",
+    "risk_allowed",
+    "qty0_blocks",
+    "qty0_missing_context",
+    "signal_total",
+    "signal_with_min_score",
+    "signal_with_reasons",
+    "fill_count",
+    "fee_total",
+    "fee_zero_live",
+    "cooldown_blocks",
+    "entry_rate_limit_blocks",
+]
+
+
+def _iter_events(path: Path):
     if not path.exists():
         return
-    with path.open("r", encoding="utf-8") as f:
+    with path.open("r", encoding="utf-8", errors="replace") as f:
         for line in f:
-            line = line.strip()
-            if not line:
+            s = line.strip()
+            if not s:
                 continue
             try:
-                yield json.loads(line)
+                d = json.loads(s)
+                if isinstance(d, dict):
+                    yield d
             except Exception:
                 continue
 
@@ -42,47 +58,236 @@ def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 
-def _conf(level: str, score: float) -> Dict[str, Any]:
+def _conf(level: str, score: float) -> dict[str, Any]:
     return {"level": level, "score": round(float(score), 2)}
 
 
-def _load_current_cfg() -> Dict[str, Any]:
-    # Prefer KR config when present.
-    for name in ["config.kr.json", "config.json"]:
-        cfg_path = ROOT / name
-        if not cfg_path.exists():
+def _load_current_cfg() -> dict[str, Any]:
+    for name in ("config.kr.json", "config.json"):
+        p = ROOT / name
+        if not p.exists():
             continue
         try:
-            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-            cfg["_config_path"] = str(cfg_path)
+            cfg = json.loads(p.read_text(encoding="utf-8"))
+            cfg["_config_path"] = str(p)
+            cfg["_config_hash"] = hashlib.sha256(p.read_bytes()).hexdigest()
             return cfg
         except Exception:
             continue
-    return {}
+    return {"_config_path": "", "_config_hash": ""}
 
 
-def _med(vals: List[float]) -> float | None:
-    if not vals:
+def _extract_day_features(events_path: Path) -> dict[str, float]:
+    f = {k: 0.0 for k in FEATURE_NAMES}
+
+    for ev in _iter_events(events_path):
+        typ = ev.get("type")
+        payload = ev.get("payload") or {}
+
+        if typ == "RiskDecision":
+            if payload.get("allowed"):
+                f["risk_allowed"] += 1
+            else:
+                f["risk_blocked"] += 1
+                reason = str(payload.get("reason") or "")
+                if reason == "qty=0":
+                    f["qty0_blocks"] += 1
+                    ctx = payload.get("context")
+                    if not (isinstance(ctx, dict) and ctx):
+                        f["qty0_missing_context"] += 1
+                elif reason == "cooldown":
+                    f["cooldown_blocks"] += 1
+                elif reason == "entry_rate_limit":
+                    f["entry_rate_limit_blocks"] += 1
+
+        elif typ == "Signal":
+            f["signal_total"] += 1
+            ctx = payload.get("context")
+            if isinstance(ctx, dict) and ctx:
+                if ctx.get("min_score") is not None:
+                    f["signal_with_min_score"] += 1
+                reasons = ctx.get("reasons")
+                if isinstance(reasons, list) and reasons:
+                    f["signal_with_reasons"] += 1
+
+        elif typ == "Fill":
+            f["fill_count"] += 1
+            fee = float(payload.get("fee") or 0.0)
+            f["fee_total"] += fee
+            if fee == 0.0 and str(payload.get("broker_order_id") or "").upper() != "PAPER":
+                f["fee_zero_live"] += 1
+
+    return f
+
+
+def _parse_daily_pnl(report_path: Path) -> float | None:
+    if not report_path.exists():
         return None
     try:
-        return float(statistics.median(vals))
+        txt = report_path.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return None
+
+    # 당일 손익(추정, KRW): **-2,070원**
+    m = re.search(r"당일 손익\(추정, KRW\): \*\*([\-0-9,]+)원\*\*", txt)
+    if not m:
+        return None
+    try:
+        return float(m.group(1).replace(",", ""))
+    except Exception:
+        return None
+
+
+def _discover_training_rows(target_day: dt.date, lookback_days: int) -> tuple[list[list[float]], list[float], list[str]]:
+    events_root = ROOT / "logs" / "events"
+    rows_x: list[list[float]] = []
+    rows_y: list[float] = []
+    row_days: list[str] = []
+
+    if not events_root.exists():
+        return rows_x, rows_y, row_days
+
+    start_day = target_day - dt.timedelta(days=lookback_days)
+
+    for d in sorted(events_root.iterdir()):
+        if not d.is_dir() or not d.name.isdigit() or len(d.name) != 8:
+            continue
+        try:
+            day = dt.datetime.strptime(d.name, "%Y%m%d").date()
+        except Exception:
+            continue
+        if day >= target_day or day < start_day:
+            continue
+
+        events_path = d / "events.jsonl"
+        report_path = ROOT / "reports" / f"trade_report_{day.isoformat()}.md"
+        y = _parse_daily_pnl(report_path)
+        if y is None or not events_path.exists():
+            continue
+
+        feats = _extract_day_features(events_path)
+        rows_x.append([float(feats[k]) for k in FEATURE_NAMES])
+        rows_y.append(float(y))
+        row_days.append(day.isoformat())
+
+    return rows_x, rows_y, row_days
+
+
+def _fit_and_predict(x_train: list[list[float]], y_train: list[float], x_pred: list[float]) -> dict[str, Any]:
+    # sklearn path first; fallback to numpy ridge
+    try:
+        import joblib  # type: ignore
+        import numpy as np
+        from sklearn.linear_model import Ridge
+        from sklearn.metrics import r2_score
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import StandardScaler
+
+        x = np.asarray(x_train, dtype=float)
+        y = np.asarray(y_train, dtype=float)
+        xp = np.asarray([x_pred], dtype=float)
+
+        model = Pipeline(
+            [
+                ("scaler", StandardScaler()),
+                ("ridge", Ridge(alpha=2.0, random_state=42)),
+            ]
+        )
+        model.fit(x, y)
+
+        y_hat_train = model.predict(x)
+        pred = float(model.predict(xp)[0])
+        r2 = float(r2_score(y, y_hat_train)) if len(y_train) >= 2 else 0.0
+
+        ridge = model.named_steps["ridge"]
+        scaler = model.named_steps["scaler"]
+        # Convert scaled coef back to original feature scale.
+        coef = (ridge.coef_ / scaler.scale_).tolist()
+        intercept = float(ridge.intercept_ - float(sum((ridge.coef_ * scaler.mean_) / scaler.scale_)))
+
+        return {
+            "ok": True,
+            "backend": "sklearn_ridge",
+            "prediction": pred,
+            "r2_train": r2,
+            "coef": [float(c) for c in coef],
+            "intercept": intercept,
+            "pickle_obj": model,
+            "pickle_lib": joblib,
+        }
+    except Exception:
+        pass
+
+    try:
+        import numpy as np
+
+        x = np.asarray(x_train, dtype=float)
+        y = np.asarray(y_train, dtype=float)
+        xp = np.asarray(x_pred, dtype=float)
+
+        alpha = 2.0
+        ones = np.ones((x.shape[0], 1), dtype=float)
+        xa = np.hstack([ones, x])
+        eye = np.eye(xa.shape[1], dtype=float)
+        eye[0, 0] = 0.0  # do not regularize intercept
+        w = np.linalg.pinv(xa.T @ xa + alpha * eye) @ xa.T @ y
+
+        pred = float(np.hstack([[1.0], xp]) @ w)
+        y_hat = xa @ w
+        y_bar = float(np.mean(y)) if len(y) else 0.0
+        ss_res = float(np.sum((y - y_hat) ** 2))
+        ss_tot = float(np.sum((y - y_bar) ** 2))
+        r2 = 0.0 if ss_tot <= 0 else 1.0 - (ss_res / ss_tot)
+
+        return {
+            "ok": True,
+            "backend": "numpy_ridge",
+            "prediction": pred,
+            "r2_train": r2,
+            "coef": [float(z) for z in w[1:].tolist()],
+            "intercept": float(w[0]),
+            "pickle_obj": None,
+            "pickle_lib": None,
+        }
+    except Exception:
+        return {
+            "ok": False,
+            "backend": "none",
+            "prediction": 0.0,
+            "r2_train": 0.0,
+            "coef": [0.0 for _ in FEATURE_NAMES],
+            "intercept": 0.0,
+            "pickle_obj": None,
+            "pickle_lib": None,
+        }
+
+
+def _confidence_from_quality(r2_train: float, n_rows: int) -> tuple[str, float]:
+    base = 0.45
+    if n_rows >= 8:
+        base += 0.1
+    if n_rows >= 15:
+        base += 0.1
+    score = _clamp(base + _clamp(r2_train, 0.0, 1.0) * 0.25, 0.3, 0.92)
+    if score >= 0.75:
+        return "high", score
+    if score >= 0.58:
+        return "medium", score
+    return "low", score
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", help="YYYY-MM-DD (KST). default=today", default=None)
+    ap.add_argument("--events-path", default=None, help="override events path")
+    ap.add_argument("--lookback-days", type=int, default=30)
     args = ap.parse_args()
 
     kst = dt.timezone(dt.timedelta(hours=9))
-    if args.date:
-        day = dt.date.fromisoformat(args.date)
-    else:
-        day = dt.datetime.now(tz=kst).date()
+    day = dt.date.fromisoformat(args.date) if args.date else dt.datetime.now(tz=kst).date()
 
     ymd = day.strftime("%Y%m%d")
-    events_path = ROOT / "logs" / "events" / ymd / "events.jsonl"
+    events_path = Path(args.events_path) if args.events_path else (ROOT / "logs" / "events" / ymd / "events.jsonl")
     trade_report_path = ROOT / "reports" / f"trade_report_{day.isoformat()}.md"
 
     cfg = _load_current_cfg()
@@ -96,128 +301,28 @@ def main() -> int:
     cur_cooldown_sec = float(trading.get("symbol_cooldown_sec", 900) or 900)
     cur_atr_min = float(trading.get("atr_min_percent", 0.35) or 0.35)
 
-    risk_block_reasons: Counter[str] = Counter()
-    qty0_contexts: List[Dict[str, Any]] = []
-    signal_ctx_count = 0
-    signal_ctx_min_score_count = 0
-    signal_ctx_reasons_count = 0
+    features_today = _extract_day_features(events_path)
+    x_train, y_train, train_days = _discover_training_rows(day, max(7, int(args.lookback_days)))
+    x_pred = [float(features_today[k]) for k in FEATURE_NAMES]
 
-    fee_zero = 0
-    fee_zero_paper = 0
-    fee_zero_live = 0
-    fee_total = 0.0
-    fill_count = 0
+    fit = _fit_and_predict(x_train, y_train, x_pred)
+    pred_pnl = float(fit["prediction"]) if fit.get("ok") else 0.0
+    r2_train = float(fit.get("r2_train") or 0.0)
 
-    for ev in _iter_events(events_path):
-        typ = ev.get("type")
-        payload = ev.get("payload") or {}
+    conf_level, conf_score = _confidence_from_quality(r2_train, len(x_train))
 
-        if typ == "RiskDecision":
-            try:
-                if payload.get("allowed") is False:
-                    reason = str(payload.get("reason") or "") or "(empty)"
-                    risk_block_reasons[reason] += 1
-                    if reason == "qty=0":
-                        qty0_contexts.append(dict(payload.get("context") or {}))
-            except Exception:
-                pass
+    coef = [float(c) for c in (fit.get("coef") or [0.0 for _ in FEATURE_NAMES])]
+    importances = []
+    for i, name in enumerate(FEATURE_NAMES):
+        c = coef[i] if i < len(coef) else 0.0
+        importances.append({"feature": name, "coefficient": round(float(c), 6), "abs": abs(float(c))})
+    importances.sort(key=lambda x: x["abs"], reverse=True)
+    top_importances = importances[:5]
 
-        elif typ == "Signal":
-            try:
-                ctx = dict(payload.get("context") or {})
-                if ctx:
-                    signal_ctx_count += 1
-                if ctx.get("min_score") is not None:
-                    signal_ctx_min_score_count += 1
-                reasons = ctx.get("reasons")
-                if isinstance(reasons, list) and len(reasons) > 0:
-                    signal_ctx_reasons_count += 1
-            except Exception:
-                pass
-
-        elif typ == "Fill":
-            try:
-                fee = float(payload.get("fee") or 0.0)
-                fill_count += 1
-                fee_total += fee
-                if fee == 0.0:
-                    fee_zero += 1
-                    if str(payload.get("broker_order_id") or "").upper() == "PAPER":
-                        fee_zero_paper += 1
-                    else:
-                        fee_zero_live += 1
-            except Exception:
-                pass
-
-    qty0_budget_lt_ask = 0
-    qty0_remaining_cap_le0 = 0
-    qty0_sym_remaining_le0 = 0
-    qty0_cash_reserve_hit = 0
-    qty0_missing_context = 0
-
-    qty0_budget_vals: List[float] = []
-    qty0_ask_vals: List[float] = []
-    qty0_remaining_vals: List[float] = []
-
-    for ctx in qty0_contexts:
-        if not ctx:
-            qty0_missing_context += 1
-            continue
-
-        def _f(key: str) -> float | None:
-            try:
-                v = ctx.get(key)
-                return None if v is None else float(v)
-            except Exception:
-                return None
-
-        budget = _f("budget")
-        ask = _f("ask")
-        remaining_cap = _f("remaining_cap")
-        sym_remaining = _f("sym_remaining")
-        cash = _f("cash")
-        reserve_amt = _f("reserve_amt")
-
-        if budget is not None:
-            qty0_budget_vals.append(budget)
-        if ask is not None and ask > 0:
-            qty0_ask_vals.append(ask)
-        if remaining_cap is not None:
-            qty0_remaining_vals.append(remaining_cap)
-
-        if budget is not None and ask is not None and budget < ask:
-            qty0_budget_lt_ask += 1
-        if remaining_cap is not None and remaining_cap <= 0:
-            qty0_remaining_cap_le0 += 1
-        if sym_remaining is not None and sym_remaining <= 0:
-            qty0_sym_remaining_le0 += 1
-        if cash is not None and reserve_amt is not None and cash <= reserve_amt:
-            qty0_cash_reserve_hit += 1
-
-    # Parse report summary numbers when present (best-effort)
-    realized_est = None
-    daily_pnl_est = None
-    if trade_report_path.exists():
-        try:
-            txt = trade_report_path.read_text(encoding="utf-8", errors="replace")
-            # Examples in report: "당일 손익(추정, KRW): **-2,070원** / ..."
-            import re
-
-            m = re.search(r"당일 손익\(추정, KRW\): \*\*([\-0-9,]+)원\*\*", txt)
-            if m:
-                daily_pnl_est = float(m.group(1).replace(",", ""))
-            # KR 실현손익(추정): **224원**
-            m2 = re.search(r"KR 실현손익\(추정\): \*\*([\-0-9,]+)원\*\*", txt)
-            if m2:
-                realized_est = float(m2.group(1).replace(",", ""))
-        except Exception:
-            pass
-
-    fee_per_fill = (fee_total / max(1, fill_count)) if fill_count else 0.0
-
-    recos: Dict[str, Any] = {
+    recos: dict[str, Any] = {
         "date": day.isoformat(),
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "generated_by": "ml_training_inference",
         "current": {
             "trading.entry_budget_pct": cur_entry_budget_pct,
             "trading.cash_reserve_pct": cur_cash_reserve_pct,
@@ -228,207 +333,99 @@ def main() -> int:
         },
         "inputs": {
             "config_path": str(cfg.get("_config_path") or ""),
+            "config_hash": str(cfg.get("_config_hash") or ""),
             "events_path": str(events_path),
             "trade_report_path": str(trade_report_path),
             "trade_report_exists": trade_report_path.exists(),
-            "fill_count": fill_count,
-            "fee_total": fee_total,
-            "fee_per_fill": fee_per_fill,
-            "realized_est": realized_est,
-            "daily_pnl_est": daily_pnl_est,
-            "fee_zero": fee_zero,
-            "fee_zero_paper": fee_zero_paper,
-            "fee_zero_live": fee_zero_live,
-            "risk_block_reasons": dict(risk_block_reasons),
-            "qty0_context_count": len(qty0_contexts),
-            "qty0_missing_context": qty0_missing_context,
-            "signal_context": {
-                "total": signal_ctx_count,
-                "with_min_score": signal_ctx_min_score_count,
-                "with_reasons": signal_ctx_reasons_count,
+            "features": features_today,
+            "model": {
+                "backend": fit.get("backend"),
+                "train_rows": len(x_train),
+                "train_days": train_days,
+                "r2_train": round(r2_train, 6),
+                "prediction_daily_pnl": round(pred_pnl, 4),
+                "feature_importances": top_importances,
             },
         },
         "recommendations": [],
     }
 
-    def add(
-        *,
-        key: str,
-        path: str,
-        current: float | int,
-        recommended: float | int,
-        confidence: Dict[str, Any],
-        rationale: str,
-        evidence: Dict[str, Any],
-    ) -> None:
+    def add(path: str, current: float | int, recommended: float | int, rationale: str, evidence: dict[str, Any]) -> None:
+        lo, hi = SAFE_RANGES[path]
+        v = _clamp(float(recommended), float(lo), float(hi))
+        level, score = conf_level, conf_score
         recos["recommendations"].append(
             {
-                "key": key,
+                "key": path.split(".")[-1],
                 "path": path,
                 "current": current,
-                "recommended": recommended,
-                "delta": round(float(recommended) - float(current), 6),
-                "confidence": confidence,
+                "recommended": round(v, 6),
+                "delta": round(v - float(current), 6),
+                "confidence": _conf(level, score),
                 "rationale": rationale,
                 "evidence": evidence,
             }
         )
 
-    total_blocks = sum(risk_block_reasons.values())
-    qty0 = int(risk_block_reasons.get("qty=0", 0) or 0)
-    qty0_ratio = qty0 / max(1, total_blocks)
+    qty0 = int(features_today["qty0_blocks"])
+    qty0_miss = int(features_today["qty0_missing_context"])
+    fill_count = int(features_today["fill_count"])
+    fee_total = float(features_today["fee_total"])
 
-    if qty0 >= 5 and qty0_ratio >= 0.40:
-        median_budget = _med(qty0_budget_vals)
-        median_ask = _med(qty0_ask_vals)
-        budget_vs_ask = (
-            (median_budget / median_ask)
-            if (median_budget is not None and median_ask is not None and median_ask > 0)
-            else None
-        )
-        step = 0.01
-        if qty0_budget_lt_ask >= max(3, int(qty0 * 0.5)):
-            step = 0.03
-        elif qty0_budget_lt_ask >= max(2, int(qty0 * 0.3)):
-            step = 0.02
-
-        # Prefer reducing reserve slightly before increasing per-trade budget.
-        new_reserve = _clamp(cur_cash_reserve_pct - step, 0.10, 0.35)
-        if new_reserve != cur_cash_reserve_pct:
+    if fit.get("ok") and len(x_train) >= 5:
+        # Guardrail policy from predicted outcome.
+        if pred_pnl < -500:
+            bump = _clamp(abs(pred_pnl) / 3000.0, 1.0, 4.0)
             add(
-                key="cash_reserve_pct",
-                path="trading.cash_reserve_pct",
-                current=cur_cash_reserve_pct,
-                recommended=round(new_reserve, 4),
-                confidence=_conf("medium", 0.63),
-                rationale="qty=0(budget<ask)가 반복되어, 현금보유 하한을 소폭 완화해 유효 주문 비율을 개선합니다.",
-                evidence={
-                    "qty0": qty0,
-                    "qty0_budget_lt_ask": qty0_budget_lt_ask,
-                    "median_budget": median_budget,
-                    "median_ask": median_ask,
-                    "budget_vs_ask": budget_vs_ask,
+                "trading.scoring.kr_scalp_entry_threshold",
+                cur_min_score,
+                cur_min_score + bump,
+                "ML 예측 손익이 음수로 나타나 진입 점수 하한을 상향해 과도한 진입을 억제합니다.",
+                {
+                    "prediction_daily_pnl": round(pred_pnl, 2),
+                    "r2_train": round(r2_train, 4),
+                    "top_importances": top_importances,
+                },
+            )
+            add(
+                "trading.symbol_cooldown_sec",
+                cur_cooldown_sec,
+                cur_cooldown_sec + 120,
+                "ML 리스크 신호에 따라 재진입 빈도를 완만히 낮춥니다.",
+                {"prediction_daily_pnl": round(pred_pnl, 2), "cooldown_blocks": int(features_today["cooldown_blocks"])} ,
+            )
+
+        elif pred_pnl > 700:
+            ease = _clamp(pred_pnl / 7000.0, 0.01, 0.03)
+            add(
+                "trading.entry_budget_pct",
+                cur_entry_budget_pct,
+                cur_entry_budget_pct + ease,
+                "ML 예측 손익이 양호해 진입 예산을 소폭 완화합니다.",
+                {
+                    "prediction_daily_pnl": round(pred_pnl, 2),
+                    "r2_train": round(r2_train, 4),
+                    "top_importances": top_importances,
                 },
             )
 
-        reco_budget = round(_clamp(cur_entry_budget_pct + step, 0.05, 0.35), 3)
+    # Safety overlays from observed day quality.
+    if qty0 >= 5:
         add(
-            key="entry_budget_pct",
-            path="trading.entry_budget_pct",
-            current=cur_entry_budget_pct,
-            recommended=reco_budget,
-            confidence=_conf("medium", 0.68 if qty0 < 12 else 0.76),
-            rationale="qty=0 차단 비중이 높고 budget<ask 패턴이 많아 진입예산을 소폭 상향합니다.",
-            evidence={
-                "qty0": qty0,
-                "total_blocks": total_blocks,
-                "qty0_ratio": round(qty0_ratio, 4),
-                "qty0_budget_lt_ask": qty0_budget_lt_ask,
-                "median_budget": median_budget,
-                "median_ask": median_ask,
-                "median_budget_vs_ask": budget_vs_ask,
-            },
+            "trading.cash_reserve_pct",
+            cur_cash_reserve_pct,
+            cur_cash_reserve_pct - 0.02,
+            "qty=0 차단이 반복되어 현금보유 하한을 보수 범위 내에서 소폭 완화합니다.",
+            {"qty0_blocks": qty0, "qty0_missing_context": qty0_miss},
         )
 
-    cash_reserve_blocks = int(risk_block_reasons.get("cash_reserve", 0) or 0)
-    if cash_reserve_blocks >= 3:
-        reco_reserve = round(_clamp(cur_cash_reserve_pct - 0.02, 0.05, 0.80), 3)
+    if fill_count >= 12 and fee_total >= 800:
         add(
-            key="cash_reserve_pct",
-            path="trading.cash_reserve_pct",
-            current=cur_cash_reserve_pct,
-            recommended=reco_reserve,
-            confidence=_conf("medium", 0.63),
-            rationale="cash_reserve 차단이 반복되어 현금보유 하한을 소폭 완화합니다.",
-            evidence={"cash_reserve_blocks": cash_reserve_blocks},
-        )
-
-    # Cooldown tuning (reduce repeated attempts / max_trades spam)
-    mtps = int(risk_block_reasons.get("max_trades_per_symbol", 0) or 0)
-    if mtps >= 10:
-        reco_cd = int(_clamp(cur_cooldown_sec + 300, 300, 3600))
-        add(
-            key="symbol_cooldown_sec",
-            path="trading.symbol_cooldown_sec",
-            current=cur_cooldown_sec,
-            recommended=reco_cd,
-            confidence=_conf("medium", 0.65),
-            rationale="동일 종목 재시도/차단이 많아(symbol per-day cap hit), 쿨다운을 늘려 회전/수수료를 줄입니다.",
-            evidence={"max_trades_per_symbol_blocks": mtps},
-        )
-
-    entry_rate_blocks = int(risk_block_reasons.get("entry_rate_limit", 0) or 0)
-    if entry_rate_blocks >= 2:
-        reco_rate = int(max(1, min(10, cur_entries_per_min + 1)))
-        add(
-            key="max_new_entries_per_minute",
-            path="trading.max_new_entries_per_minute",
-            current=cur_entries_per_min,
-            recommended=reco_rate,
-            confidence=_conf("medium", 0.60),
-            rationale="entry_rate_limit 차단이 있어 신규진입 속도 제한을 1단계 완화합니다.",
-            evidence={"entry_rate_limit_blocks": entry_rate_blocks},
-        )
-
-    # Fee efficiency tuning: when fees dominate, raise threshold to reduce churn.
-    if fill_count >= 10 and fee_total > 0:
-        bump = 0.0
-        # high churn
-        if fill_count >= 20:
-            bump += 3.0
-        elif fill_count >= 12:
-            bump += 2.0
-
-        # losing day with meaningful fees -> be stricter
-        if (daily_pnl_est is not None and daily_pnl_est < 0) and fee_total >= 800:
-            bump += 2.0
-
-        # fee per fill guard
-        if fee_per_fill >= 70:
-            bump += 2.0
-
-        if bump > 0:
-            reco_min_score = round(_clamp(cur_min_score + bump, 55, 85), 1)
-            add(
-                key="kr_scalp_entry_threshold",
-                path="trading.scoring.kr_scalp_entry_threshold",
-                current=cur_min_score,
-                recommended=reco_min_score,
-                confidence=_conf("medium" if bump >= 4 else "low", 0.60 if bump >= 4 else 0.55),
-                rationale="수수료/회전 부담을 줄이기 위해 진입 점수 하한을 상향합니다.",
-                evidence={
-                    "fill_count": fill_count,
-                    "fee_total": round(fee_total, 4),
-                    "fee_per_fill": round(fee_per_fill, 2),
-                    "daily_pnl_est": daily_pnl_est,
-                },
-            )
-
-    # ATR filter tuning (if fee/churn is high, increase atr_min slightly)
-    if fee_total >= 1200 and fill_count >= 15:
-        reco_atrmin = round(_clamp(cur_atr_min + 0.05, 0.10, 2.00), 3)
-        add(
-            key="atr_min_percent",
-            path="trading.atr_min_percent",
-            current=cur_atr_min,
-            recommended=reco_atrmin,
-            confidence=_conf("low", 0.55),
-            rationale="수수료 부담이 큰 날에는 저변동(수수료 못 이기는) 종목을 더 강하게 필터링합니다.",
-            evidence={"fee_total": round(fee_total, 4), "fill_count": fill_count},
-        )
-
-    if fee_zero_live >= 1:
-        recos["recommendations"].append(
-            {
-                "key": "fee_logging_check",
-                "path": "ops.fill_fee_pipeline",
-                "current": "unknown",
-                "recommended": "verify_live_fee_path",
-                "delta": None,
-                "confidence": _conf("high", 0.9),
-                "rationale": "live/unknown fee=0 Fill이 확인되어 수수료 로깅 정합성 점검이 필요합니다.",
-                "evidence": {"fee_zero_live": fee_zero_live, "fee_zero_paper": fee_zero_paper},
-            }
+            "trading.atr_min_percent",
+            cur_atr_min,
+            cur_atr_min + 0.05,
+            "체결/수수료 부담이 커서 저변동 구간 진입을 줄이도록 ATR 필터를 상향합니다.",
+            {"fill_count": fill_count, "fee_total": round(fee_total, 2)},
         )
 
     if not recos["recommendations"]:
@@ -439,27 +436,73 @@ def main() -> int:
                 "current": "as-is",
                 "recommended": "as-is",
                 "delta": 0,
-                "confidence": _conf("medium", 0.7),
-                "rationale": "이벤트 기반 이상징후가 크지 않아 기본값 유지가 합리적입니다.",
-                "evidence": {"total_blocks": total_blocks, "fill_count": fill_count},
+                "confidence": _conf(conf_level, conf_score),
+                "rationale": "학습 신뢰도/데이터 기준에서 적극적인 파라미터 변경 근거가 충분하지 않습니다.",
+                "evidence": {
+                    "prediction_daily_pnl": round(pred_pnl, 2),
+                    "train_rows": len(x_train),
+                    "r2_train": round(r2_train, 4),
+                },
             }
         )
 
     out_dir = ROOT / "reports"
+    models_dir = out_dir / "models"
     out_dir.mkdir(parents=True, exist_ok=True)
+    models_dir.mkdir(parents=True, exist_ok=True)
+
     out_json = out_dir / f"next_day_reco_{day.isoformat()}.json"
     out_md = out_dir / f"next_day_reco_{day.isoformat()}.md"
+    model_json = models_dir / f"reco_model_{day.isoformat()}.json"
+    model_pkl = models_dir / f"reco_model_{day.isoformat()}.pkl"
+
+    model_artifact = {
+        "date": day.isoformat(),
+        "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "backend": fit.get("backend"),
+        "feature_names": FEATURE_NAMES,
+        "coef": coef,
+        "intercept": float(fit.get("intercept") or 0.0),
+        "train_rows": len(x_train),
+        "train_days": train_days,
+        "r2_train": round(r2_train, 6),
+        "prediction_daily_pnl": round(pred_pnl, 6),
+    }
+    model_json.write_text(json.dumps(model_artifact, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    pkl_obj = fit.get("pickle_obj")
+    pkl_lib = fit.get("pickle_lib")
+    if pkl_obj is not None and pkl_lib is not None:
+        try:
+            pkl_lib.dump(pkl_obj, model_pkl)
+        except Exception:
+            pass
+
+    recos["inputs"]["model"]["artifact_json"] = str(model_json)
+    recos["inputs"]["model"]["artifact_pickle"] = str(model_pkl) if model_pkl.exists() else None
 
     out_json.write_text(json.dumps(recos, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
-    lines = [f"# 내일 장 대비 추천 - {day.isoformat()}\n", "## 자동 체크리스트(권장 기본값)\n"]
-    lines.append(f"- [x] trade_report 확인: `{trade_report_path}`")
-    lines.append(f"- [x] next_day_reco 생성: `{out_json}`")
-    lines.append(f"- [ ] 검증 실행: `python scripts/verify_next_day_prep.py --date {day.isoformat()}`\n")
-    lines.append("## 추천 항목\n")
+    lines = [f"# 내일 장 대비 추천 - {day.isoformat()}", "", "## Metadata", ""]
+    lines.append(f"- generated_at: `{recos['generated_at']}`")
+    lines.append(f"- input_events_path: `{events_path}`")
+    lines.append(f"- config_hash_sha256: `{cfg.get('_config_hash') or ''}`")
+    lines.append(f"- model_artifact: `{model_json}`")
+    lines.append("")
+    lines.append("## ML Summary")
+    lines.append("")
+    lines.append(f"- backend: `{fit.get('backend')}`")
+    lines.append(f"- train_rows: `{len(x_train)}`")
+    lines.append(f"- r2_train: `{round(r2_train, 6)}`")
+    lines.append(f"- prediction_daily_pnl: `{round(pred_pnl, 2)}`")
+    lines.append(f"- top_importances: `{json.dumps(top_importances, ensure_ascii=False)}`")
+    lines.append("")
+    lines.append("## 추천 항목")
+    lines.append("")
 
     for r in recos["recommendations"]:
-        lines.append(f"### {r['key']} ({r['path']})\n")
+        lines.append(f"### {r['key']} ({r['path']})")
+        lines.append("")
         lines.append(f"- 현재값: `{r['current']}`")
         lines.append(f"- 추천값: `{r['recommended']}`")
         if r.get("delta") is not None:

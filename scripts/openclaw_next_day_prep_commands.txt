@@ -1,0 +1,14 @@
+# OpenClaw job command strings (shell)
+# Updated for hardened next-day prep verification and immutable enrichment.
+
+# job_id=f59dc38f-00da-4461-bc67-db2757b78003
+# purpose: 15:35 daily report/reco/verify (heavy)
+# timeout recommendation: 900s
+# delivery recommendation: non-critical delivery should not fail the job (best-effort)
+cd /home/zenith/Desktop/kis_orb_vwap_bot && ./venv/bin/python scripts/daily_trade_report.py --date "$(TZ=Asia/Seoul date +%F)" && ./venv/bin/python scripts/recommend_next_day.py --date "$(TZ=Asia/Seoul date +%F)" && ./venv/bin/python scripts/verify_next_day_prep.py --date "$(TZ=Asia/Seoul date +%F)" --auto-enrich
+
+# job_id=a71076d6-0b22-481e-b3b4-43e75219cd00
+# purpose: verification-only follow-up
+# timeout recommendation: 300s
+# delivery recommendation: best-effort (delivery failure should not mark execution failure)
+cd /home/zenith/Desktop/kis_orb_vwap_bot && ./venv/bin/python scripts/verify_next_day_prep.py --date "$(TZ=Asia/Seoul date +%F)" --auto-enrich

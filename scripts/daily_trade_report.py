@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import statistics
 from collections import Counter, defaultdict, deque
@@ -104,6 +105,19 @@ def _iter_events(path: Path) -> Iterable[dict]:
                 yield json.loads(line)
             except Exception:
                 continue
+
+
+def _config_path_and_hash() -> tuple[str, str]:
+    for name in ("config.kr.json", "config.json"):
+        p = ROOT / name
+        if not p.exists():
+            continue
+        try:
+            b = p.read_bytes()
+            return str(p), hashlib.sha256(b).hexdigest()
+        except Exception:
+            continue
+    return "", ""
 
 
 def _kst(dtu: dt.datetime) -> dt.datetime:
@@ -227,6 +241,7 @@ def _slippage(intent: Optional[IntentRec], fill: FillRec) -> Optional[float]:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", help="YYYY-MM-DD (KST). default=today", default=None)
+    ap.add_argument("--events-path", default=None, help="override input events path")
     args = ap.parse_args()
 
     kst = dt.timezone(dt.timedelta(hours=9))
@@ -236,7 +251,8 @@ def main() -> int:
         day = dt.datetime.now(tz=kst).date()
 
     ymd = day.strftime("%Y%m%d")
-    events_path = ROOT / "logs" / "events" / ymd / "events.jsonl"
+    events_path = Path(args.events_path) if args.events_path else (ROOT / "logs" / "events" / ymd / "events.jsonl")
+    config_path, config_hash = _config_path_and_hash()
 
     fills_by_symbol: Dict[str, List[FillRec]] = defaultdict(list)
     fills_by_source: Dict[str, List[FillRec]] = defaultdict(list)
@@ -382,6 +398,12 @@ def main() -> int:
 
     lines: List[str] = []
     lines.append(f"# 일일 거래 리포트 ({day.isoformat()} KST)\n")
+    lines.append("<!-- metadata -->")
+    lines.append(f"- generated_at: `{dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')}`")
+    lines.append(f"- input_events_path: `{events_path}`")
+    lines.append(f"- config_path: `{config_path}`")
+    lines.append(f"- config_hash_sha256: `{config_hash}`")
+    lines.append("")
 
     lines.append("## 요약\n")
     lines.append(f"- Fill(체결) 발생 종목 수: **{len(traded_symbols)}**")

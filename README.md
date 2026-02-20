@@ -232,13 +232,23 @@ KRW 기반으로 US 매수여력을 추정하는 모드입니다.
 - 입력: `logs/events/YYYYMMDD/events.jsonl`
 - 출력: `reports/trade_report_YYYY-MM-DD.md`
 
-2) 다음날 추천값 생성(학습)
+2) 다음날 추천값 생성(ML 학습+추론)
 ```bash
 ./venv/bin/python scripts/recommend_next_day.py --date YYYY-MM-DD
 ```
 - 입력: `logs/events/...` + `reports/trade_report_...`
 - 출력: `reports/next_day_reco_YYYY-MM-DD.(json|md)`
-- 특징: **수수료/회전(Churn) 비용**과 `qty=0(budget<ask)` 같은 실패 패턴을 반영해 튜닝합니다.
+- 특징: 과거 N일 학습(기본 30일), 모델 아티팩트 저장(`reports/models/`), 신뢰도/설명(importance) 포함 추천 생성.
+
+2-1) 준비 검증(자동 복구 + immutable enrichment)
+```bash
+./venv/bin/python scripts/verify_next_day_prep.py --date YYYY-MM-DD --auto-enrich
+```
+- 순서: 아티팩트 자동생성 → 이벤트 품질검사 → 컨텍스트 결함 시 1회 enrichment → 재검증
+- 원본 이벤트는 불변 유지, 파생 파일 생성:
+  - `logs/events/YYYYMMDD/events.enriched.jsonl`
+  - `logs/events/YYYYMMDD/events.enrichment_patches.jsonl`
+- 검증 메트릭: `reports/next_day_prep_metrics_YYYY-MM-DD.json`
 
 3) 추천값 자동 적용(무인)
 ```bash
