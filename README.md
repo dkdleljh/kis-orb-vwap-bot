@@ -366,7 +366,11 @@ KRW 기반으로 US 매수여력을 추정하는 모드입니다.
 
 ## 15) 디렉토리 구조(요약)
 
-- `main.py` : 엔트리포인트(모듈 시스템 포함)
+- `main.py` : 엔트리포인트/오케스트레이터(세션 상태 전환 + 모듈 조합)
+- `core/entry_gates.py` : 진입 게이트(노출/예산/쿨다운/리스크 이벤트)
+- `core/order_executor.py` : 주문 실행 래퍼(KISRestOrders 호출 + 주문/체결 이벤트)
+- `core/position_manager.py` : 포지션 상태/복구/스냅샷 오케스트레이션
+- `core/session_rules.py` : 시간 규칙/exit phase 계산
 - `modules/` : 전략/모듈(kukjang, kr_swing, mijang, us_swing, hwanjeon)
 - `scripts/` : 운영 스크립트(추천 임계값, 모니터링 등)
 - `data/` : 수집/캐시 데이터(premarket, 뉴스 캐시 등)
