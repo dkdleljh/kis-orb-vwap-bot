@@ -197,6 +197,48 @@ def _extract_trade_report_features(report_path: Path) -> dict[str, float]:
     return out
 
 
+def _extract_report_features_from_metrics(metrics_path: Path | None) -> dict[str, float]:
+    out = {
+        "report_realized_pnl_est": 0.0,
+        "report_slippage_count": 0.0,
+        "report_slippage_avg": 0.0,
+        "report_slippage_worst": 0.0,
+        "report_avg_hold_sec": 0.0,
+        "report_win_count": 0.0,
+        "report_loss_count": 0.0,
+    }
+    if metrics_path is None:
+        return out
+    data = _read_json(metrics_path)
+    if not data:
+        return out
+
+    report = data.get("report") if isinstance(data.get("report"), dict) else {}
+    quality = data.get("quality") if isinstance(data.get("quality"), dict) else {}
+
+    pnl = report.get("daily_pnl_est") if report else None
+    if isinstance(pnl, (int, float)):
+        out["report_realized_pnl_est"] = float(pnl)
+
+    sl = report.get("slippage") if isinstance(report.get("slippage"), dict) else {}
+    if isinstance(sl.get("count"), (int, float)):
+        out["report_slippage_count"] = float(sl.get("count") or 0.0)
+    if isinstance(sl.get("avg"), (int, float)):
+        out["report_slippage_avg"] = float(sl.get("avg") or 0.0)
+    if isinstance(sl.get("worst"), (int, float)):
+        out["report_slippage_worst"] = float(sl.get("worst") or 0.0)
+
+    if isinstance(report.get("avg_hold_sec"), (int, float)):
+        out["report_avg_hold_sec"] = float(report.get("avg_hold_sec") or 0.0)
+
+    if isinstance(quality.get("win_count"), (int, float)):
+        out["report_win_count"] = float(quality.get("win_count") or 0.0)
+    if isinstance(quality.get("loss_count"), (int, float)):
+        out["report_loss_count"] = float(quality.get("loss_count") or 0.0)
+
+    return out
+
+
 def _extract_prep_metrics_features(metrics_path: Path | None) -> dict[str, float]:
     out = {
         "prep_parse_error_rate": 0.0,
@@ -281,10 +323,24 @@ def _extract_day_features(
             if fee == 0.0 and str(payload.get("broker_order_id") or "").upper() != "PAPER":
                 f["fee_zero_live"] += 1
 
+    rep_json = _extract_report_features_from_metrics(prep_metrics_path)
+    rep_json_keys = {
+        "report_realized_pnl_est",
+        "report_slippage_count",
+        "report_slippage_avg",
+        "report_slippage_worst",
+        "report_avg_hold_sec",
+        "report_win_count",
+        "report_loss_count",
+    }
+    for k in FEATURE_NAMES:
+        if k in rep_json:
+            f[k] = float(rep_json[k])
+
     if report_path is not None:
         rep = _extract_trade_report_features(report_path)
         for k in FEATURE_NAMES:
-            if k in rep:
+            if k in rep and (k not in rep_json_keys or f.get(k, 0.0) == 0.0):
                 f[k] = float(rep[k])
     prep = _extract_prep_metrics_features(prep_metrics_path)
     for k in FEATURE_NAMES:
@@ -293,7 +349,17 @@ def _extract_day_features(
     return f
 
 
-def _parse_daily_pnl(report_path: Path) -> float | None:
+def _parse_daily_pnl(
+    report_path: Path,
+    prep_metrics_path: Path | None = None,
+) -> float | None:
+    if prep_metrics_path is not None:
+        data = _read_json(prep_metrics_path)
+        if data:
+            report = data.get("report") if isinstance(data.get("report"), dict) else {}
+            pnl = report.get("daily_pnl_est") if report else None
+            if isinstance(pnl, (int, float)):
+                return float(pnl)
     if not report_path.exists():
         return None
     try:
@@ -335,7 +401,7 @@ def _discover_training_rows(target_day: dt.date, lookback_days: int) -> tuple[li
         events_path = d / "events.jsonl"
         report_path = ROOT / "reports" / f"trade_report_{day.isoformat()}.md"
         prep_metrics_path = ROOT / "reports" / f"next_day_prep_metrics_{day.isoformat()}.json"
-        y = _parse_daily_pnl(report_path)
+        y = _parse_daily_pnl(report_path, prep_metrics_path=prep_metrics_path)
         if y is None or not events_path.exists():
             continue
 

@@ -126,3 +126,20 @@ def test_gating_blocks_parameter_changes_when_wf_quality_fails(tmp_path, monkeyp
     gate = data["inputs"]["model"]["ml_reco_gate"]
     assert gate["ok"] is False
     assert data["recommendations"][0]["key"] == "keep_defaults"
+
+
+def test_parse_daily_pnl_prefers_prep_metrics_json(tmp_path):
+    import scripts.recommend_next_day as r
+
+    report = tmp_path / "reports" / "trade_report_2026-02-20.md"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text("- 당일 손익(추정, KRW): **1,000원**\n", encoding="utf-8")
+
+    prep = tmp_path / "reports" / "next_day_prep_metrics_2026-02-20.json"
+    prep.write_text(
+        json.dumps({"report": {"daily_pnl_est": 4321.0}}),
+        encoding="utf-8",
+    )
+
+    got = r._parse_daily_pnl(report, prep_metrics_path=prep)
+    assert got == 4321.0
