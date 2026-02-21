@@ -25,6 +25,37 @@
     "scoring": {
       "us_swing_entry_threshold": 68,
       "us_scalp_entry_threshold": 75
+    },
+    "use_orb_confirmation": false,
+    "allow_orb_retest_confirmation": true,
+    "orb_volume_power_threshold": 110.0,
+    "orb_retest_tolerance_pct": 0.002,
+    "use_indicator_gate_mode": false,
+    "strict_data_safety_mode": false,
+    "news_safety_mode": true,
+    "enable_dynamic_ml_threshold": true,
+    "microstructure_filter": {
+      "enabled": true,
+      "max_spread_pct": 0.006,
+      "max_book_age_sec": 6.0,
+      "min_quote_depth_ratio": 0.4
+    },
+    "slippage_guard": {
+      "enabled": true,
+      "rolling_window": 20,
+      "min_samples_before_block": 3,
+      "max_avg_slippage_bps": 80.0,
+      "max_worst_slippage_bps": 180.0,
+      "block_seconds": 600
+    },
+    "execution": {
+      "enable_smart_limit_exit": true,
+      "entry_poll_sec": 1.0,
+      "entry_max_cancel_attempts": 1,
+      "cancel_unfilled_entry": true,
+      "exit_retry_limit": 2,
+      "exit_poll_sec": 1.0,
+      "exit_max_cancel_attempts": 1
     }
   },
   "us_trading": {
