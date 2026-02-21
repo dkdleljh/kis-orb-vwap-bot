@@ -60,6 +60,9 @@ class _Engine:
         self.run_id = "test"
         self.peak_pnl_pct = {}
         self.snapshots = []
+        self.config = {"trading": {}}
+        self.slippage_stats_by_symbol = {}
+        self.slippage_block_until = {}
 
     def live_ordering_enabled(self) -> bool:
         return False
@@ -111,3 +114,32 @@ def test_order_executor_paper_entry_then_exit_emits_expected_events():
         "Fill",
     ]
     assert len(eng.snapshots) == 2
+
+
+def test_slippage_tracker_sets_blocklist_when_threshold_breached():
+    eng = _Engine()
+    eng.config = {
+        "trading": {
+            "slippage_guard": {
+                "enabled": True,
+                "rolling_window": 5,
+                "max_avg_slippage_bps": 50.0,
+                "max_worst_slippage_bps": 120.0,
+                "min_samples_before_block": 3,
+                "block_seconds": 300,
+            }
+        }
+    }
+    ex = OrderExecutor(eng)
+
+    for _ in range(3):
+        ex._track_slippage(  # noqa: SLF001 - intentional unit probe of internal rolling guard
+            symbol="005930",
+            side="BUY",
+            expected_price=100.0,
+            fill_price=102.0,
+            correlation_id="c",
+        )
+
+    assert "005930" in eng.slippage_block_until
+    assert eng.slippage_block_until["005930"] > 0

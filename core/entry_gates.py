@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Any, Dict, Protocol
 
@@ -56,6 +57,20 @@ class EntryGateEvaluator:
     def __init__(self, engine: _EngineLike) -> None:
         self.engine = engine
 
+    @staticmethod
+    def _age_seconds(ts: datetime | None) -> float | None:
+        if ts is None:
+            return None
+        try:
+            if ts.tzinfo is None:
+                ts_utc = ts.replace(tzinfo=timezone.utc)
+            else:
+                ts_utc = ts.astimezone(timezone.utc)
+            now_utc = datetime.now(timezone.utc)
+            return float((now_utc - ts_utc).total_seconds())
+        except Exception:
+            return None
+
     def build_risk_context(
         self,
         *,
@@ -101,6 +116,9 @@ class EntryGateEvaluator:
     async def evaluate(self, signal: Signal, book: OrderBookTop, *, idempotency_key: str, correlation_id: str) -> EntryGateDecision:
         symbol = str(signal.symbol)
         tcfg = self.engine.config.get("trading", {}) or {}
+        micro_cfg = (tcfg.get("microstructure_filter", {}) or {})
+        sl_cfg = (tcfg.get("slippage_guard", {}) or {})
+        news_safety_mode = bool(tcfg.get("news_safety_mode", False))
         bounds = resolve_entry_risk_bounds(tcfg)
         cash = 0.0
         exposure = 0.0
@@ -154,6 +172,71 @@ class EntryGateEvaluator:
         except Exception:
             pass
 
+        if bool(micro_cfg.get("enabled", False)):
+            max_spread_pct = float(micro_cfg.get("max_spread_pct", 0.003) or 0.003)
+            max_book_age_sec = float(micro_cfg.get("max_book_age_sec", 3.0) or 3.0)
+            min_depth_ratio = float(micro_cfg.get("min_quote_depth_ratio", 0.60) or 0.60)
+            spread_pct = 0.0
+            if float(book.ask) > 0 and float(book.bid) > 0:
+                spread_pct = (float(book.ask) - float(book.bid)) / float(book.ask)
+            quote_depth_ratio = 0.0
+            max_depth = max(float(book.bid_size or 0.0), float(book.ask_size or 0.0))
+            if max_depth > 0:
+                quote_depth_ratio = min(float(book.bid_size or 0.0), float(book.ask_size or 0.0)) / max_depth
+            book_age_sec = self._age_seconds(getattr(book, "timestamp", None))
+
+            micro_failed = (
+                spread_pct > max_spread_pct
+                or quote_depth_ratio < min_depth_ratio
+                or (book_age_sec is None)
+                or (book_age_sec > max_book_age_sec)
+            )
+            if micro_failed:
+                try:
+                    self.engine.event_store.append(
+                        ievents.RiskDecision(
+                            symbol=symbol,
+                            allowed=False,
+                            reason="microstructure_filter",
+                            idempotency_key=idempotency_key,
+                            correlation_id=correlation_id,
+                            module="engine_orb_vwap",
+                            context={
+                                "spread_pct": float(spread_pct),
+                                "max_spread_pct": float(max_spread_pct),
+                                "quote_depth_ratio": float(quote_depth_ratio),
+                                "min_quote_depth_ratio": float(min_depth_ratio),
+                                "book_age_sec": book_age_sec,
+                                "max_book_age_sec": float(max_book_age_sec),
+                            },
+                        ).to_event(run_id=self.engine.run_id)
+                    )
+                except Exception:
+                    pass
+                return EntryGateDecision(False, "microstructure_filter", 0, cash, budget)
+
+        if bool(sl_cfg.get("enabled", False)):
+            block_map = getattr(self.engine, "slippage_block_until", None)
+            block_until = 0.0
+            if isinstance(block_map, dict):
+                block_until = float(block_map.get(symbol, 0.0) or 0.0)
+            if block_until and time.time() < block_until:
+                try:
+                    self.engine.event_store.append(
+                        ievents.RiskDecision(
+                            symbol=symbol,
+                            allowed=False,
+                            reason="slippage_blocklist",
+                            idempotency_key=idempotency_key,
+                            correlation_id=correlation_id,
+                            module="engine_orb_vwap",
+                            context={"block_until_epoch": float(block_until)},
+                        ).to_event(run_id=self.engine.run_id)
+                    )
+                except Exception:
+                    pass
+                return EntryGateDecision(False, "slippage_blocklist", 0, cash, budget)
+
         if symbol != self.engine.symbol_inverse:
             try:
                 news_result = await asyncio.wait_for(
@@ -161,9 +244,16 @@ class EntryGateEvaluator:
                     timeout=3.0,
                 )
                 score = news_result.get("score", 0)
-                self.engine.logger.info(
-                    f"[News Filter] {symbol} Score: {score} ({news_result.get('summary')})"
+                summary = str(news_result.get("summary") or "")
+                news_unavailable = (
+                    summary in {"HTTP_ERROR", "ERROR", "NO_NEWS"}
+                    or "429" in summary
                 )
+                self.engine.logger.info(
+                    f"[News Filter] {symbol} Score: {score} ({summary})"
+                )
+                if news_safety_mode and news_unavailable:
+                    score = 0
                 if score < -20:
                     self.engine.logger.warning(
                         f"[News Filter] BLOCKED: Sentiment is too negative ({score})"

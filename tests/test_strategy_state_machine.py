@@ -294,6 +294,46 @@ class TestStrategyStateMachine:
         # Should generate signal (score >= 50)
         assert result.side == "BUY"
 
+    def test_evaluate_entry_orb_confirmation_blocks_fakeout(self):
+        self.sm.set_state(State.WAIT_SIGNAL)
+        self.sm.update_or(
+            "005930",
+            Bar1m(datetime(2024, 1, 1, 9, 0), 10000, 10500, 9900, 10300, 1000),
+        )
+
+        result = self.sm.evaluate_entry(
+            bar=Bar1m(datetime(2024, 1, 1, 9, 5), 10500, 10700, 10400, 10600, 1500),
+            last_price=10600,
+            vwap=10550,
+            book=OrderBookTop(
+                symbol="005930",
+                bid=10600,
+                ask=10610,
+                bid_size=150,
+                ask_size=100,
+                timestamp=datetime.now(),
+            ),
+            lever_symbol="122630",
+            inverse_symbol="114800",
+            max_spread_pct=0.005,
+            indicators={
+                "rsi": 45,
+                "ma20": 10450,
+                "vol_ma20": 1300,
+                "volume_power": 105,  # below confirmation threshold
+                "prev_close": 10000,
+                "news_score": 0,
+                "macd_line": 100,
+                "macd_signal": 80,
+                "macd_hist": 20,
+                "atr_percent": 1.0,
+            },
+            use_orb_confirmation=True,
+            orb_volume_power_threshold=120.0,
+            allow_orb_retest_confirmation=False,
+        )
+        assert result.side is None
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

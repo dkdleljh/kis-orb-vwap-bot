@@ -31,7 +31,38 @@
     "max_total_position_pct": 0.60,
     "max_symbol_position_pct": 0.08,
     "cash_reserve_pct": 0.20,
-    "max_new_entries_per_minute": 2
+    "max_new_entries_per_minute": 2,
+    "strict_data_safety_mode": false,
+    "news_safety_mode": false,
+    "enable_dynamic_ml_threshold": false,
+    "use_orb_confirmation": false,
+    "allow_orb_retest_confirmation": false,
+    "use_indicator_gate_mode": false,
+    "orb_volume_power_threshold": 120.0,
+    "orb_retest_tolerance_pct": 0.001,
+    "microstructure_filter": {
+      "enabled": false,
+      "max_spread_pct": 0.003,
+      "max_book_age_sec": 3.0,
+      "min_quote_depth_ratio": 0.60
+    },
+    "slippage_guard": {
+      "enabled": false,
+      "rolling_window": 20,
+      "min_samples_before_block": 5,
+      "max_avg_slippage_bps": 35.0,
+      "max_worst_slippage_bps": 80.0,
+      "block_seconds": 1800
+    },
+    "execution": {
+      "enable_smart_limit_exit": false,
+      "entry_poll_sec": 2.0,
+      "entry_max_cancel_attempts": 1,
+      "cancel_unfilled_entry": true,
+      "exit_retry_limit": 2,
+      "exit_poll_sec": 2.0,
+      "exit_max_cancel_attempts": 1
+    }
   },
   "time_rules": {
     "observe_start": "08:59:00",

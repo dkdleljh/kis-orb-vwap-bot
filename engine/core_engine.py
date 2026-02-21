@@ -364,6 +364,9 @@ class TradingEngine:
         # 뉴스 점수 캐시(비동기 갱신)
         self.news_score_by_symbol: Dict[str, int] = {}
         self.news_score_updated_at: Dict[str, float] = {}
+        self.news_status_by_symbol: Dict[str, Dict[str, Any]] = {}
+        self.slippage_stats_by_symbol: Dict[str, Any] = {}
+        self.slippage_block_until: Dict[str, float] = {}
 
         # 11) Production safety defaults
         self.live_enabled = os.environ.get("KIS_LIVE_ENABLED", "0") == "1"

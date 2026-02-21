@@ -243,6 +243,8 @@ class Fill:
     fee: float = 0.0
     correlation_id: str = ""
     module: str = ""  # human-friendly strategy/module tag
+    expected_price: Optional[float] = None
+    slippage_bps: Optional[float] = None
 
     def to_event(self, run_id: Optional[str] = None) -> Event:
         payload: Dict[str, Any] = {
@@ -257,6 +259,10 @@ class Fill:
             payload["correlation_id"] = self.correlation_id
         if self.module:
             payload["module"] = self.module
+        if self.expected_price is not None:
+            payload["expected_price"] = float(self.expected_price)
+        if self.slippage_bps is not None:
+            payload["slippage_bps"] = float(self.slippage_bps)
         return Event.make(
             type="Fill",
             payload=payload,

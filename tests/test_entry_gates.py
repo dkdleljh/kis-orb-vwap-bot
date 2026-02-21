@@ -113,3 +113,55 @@ def test_entry_gates_allows_and_computes_qty_from_budget_rules():
     assert out.allowed is True
     # Default max_symbol_position_pct(0.08) caps 10,000 equity at 800 => qty=8 at ask=100.
     assert out.qty == 8
+
+
+def test_entry_gates_microstructure_filter_blocks_stale_book():
+    eng = _Engine()
+    eng.config = {
+        "trading": {
+            "microstructure_filter": {
+                "enabled": True,
+                "max_spread_pct": 0.02,
+                "max_book_age_sec": 0.1,
+                "min_quote_depth_ratio": 0.5,
+            }
+        }
+    }
+    evaluator = EntryGateEvaluator(eng)
+
+    stale_book = OrderBookTop(
+        symbol="INV",
+        bid=99.0,
+        ask=100.0,
+        bid_size=10,
+        ask_size=10,
+        timestamp=datetime(2020, 1, 1, 0, 0, 0),
+    )
+    out = asyncio.run(
+        evaluator.evaluate(
+            Signal(symbol="INV", side="BUY"),
+            stale_book,
+            idempotency_key="k3",
+            correlation_id="c3",
+        )
+    )
+    assert out.allowed is False
+    assert out.reason == "microstructure_filter"
+
+
+def test_entry_gates_slippage_blocklist_blocks_when_active():
+    eng = _Engine()
+    eng.config = {"trading": {"slippage_guard": {"enabled": True}}}
+    eng.slippage_block_until = {"INV": time.time() + 120.0}
+    evaluator = EntryGateEvaluator(eng)
+
+    out = asyncio.run(
+        evaluator.evaluate(
+            Signal(symbol="INV", side="BUY"),
+            _book("INV"),
+            idempotency_key="k4",
+            correlation_id="c4",
+        )
+    )
+    assert out.allowed is False
+    assert out.reason == "slippage_blocklist"

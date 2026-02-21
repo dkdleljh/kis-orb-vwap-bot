@@ -182,6 +182,11 @@ class StrategyStateMachine:
         indicators: dict[str, float] | None = None,
         market_regime: str = "NEUTRAL",  # BULL / BEAR / NEUTRAL
         min_score: float = 50.0,
+        use_orb_confirmation: bool = False,
+        orb_volume_power_threshold: float = 120.0,
+        allow_orb_retest_confirmation: bool = False,
+        orb_retest_tolerance_pct: float = 0.001,
+        use_indicator_gate_mode: bool = False,
     ) -> Signal:
         """Evaluate whether current market conditions trigger an entry signal.
 
@@ -284,13 +289,15 @@ class StrategyStateMachine:
                 score += 15
                 reasons.append(f"UP_TREND({day_return:.1%})")
 
-        if ma20 > 0 and last_price > ma20:
+        above_ma20 = bool(ma20 > 0 and last_price > ma20)
+        if above_ma20:
             score += 10
             reasons.append("ABOVE_MA20")
 
         # 2. [Strength] 체결강도 & VWAP 지지 (25점)
         vol_power = indicators_data.get("volume_power", 100.0)
-        if vol_power >= 120:
+        volume_ok = bool(vol_power >= 120)
+        if volume_ok:
             score += 15
             reasons.append(f"POWER({vol_power:.0f}%)")
 
@@ -300,11 +307,27 @@ class StrategyStateMachine:
 
         # 3. [Pattern] OR 돌파 또는 눌림목 양봉 (20점)
         is_breakout = bar.close > or_state.or_high
+        retest_hi = float(or_state.or_high) * (1.0 + float(orb_retest_tolerance_pct))
+        retest_condition = (
+            bool(allow_orb_retest_confirmation)
+            and bar.low <= retest_hi
+            and bar.close > float(or_state.or_high)
+            and bar.close > bar.open
+        )
+        breakout_confirmed = (
+            bool(is_breakout)
+            and bool(vwap_above)
+            and (bool(vol_power >= float(orb_volume_power_threshold)) or bool(retest_condition))
+        )
         is_pullback_bull = (last_price > ma20) and (bar.close > bar.open)
 
         if is_breakout:
             score += 20
             reasons.append("OR_BREAKOUT")
+            if breakout_confirmed:
+                reasons.append("ORB_CONFIRMED")
+            elif use_orb_confirmation:
+                reasons.append("ORB_UNCONFIRMED")
         elif is_pullback_bull:
             score += 20
             reasons.append("PULLBACK_BUY")
@@ -346,6 +369,25 @@ class StrategyStateMachine:
         if prev_close > 0 and (last_price / prev_close) > 1.20:
             score -= 50
             reasons.append("TOO_HIGH")
+
+        if use_orb_confirmation and book.symbol != inverse_symbol and is_breakout and (not breakout_confirmed):
+            if self.logger:
+                self.logger.info(
+                    f"[ORB Confirm] blocked {book.symbol}: breakout without confirmation "
+                    f"(vwap_above={vwap_above} volume={vol_power:.1f} retest={retest_condition})"
+                )
+            return Signal()
+
+        if use_indicator_gate_mode and book.symbol != inverse_symbol:
+            # De-correlate additive scoring by enforcing base trend-strength prerequisites.
+            if not above_ma20:
+                return Signal()
+            if not vwap_above:
+                return Signal()
+            if not (macd_bullish or is_breakout):
+                return Signal()
+            if not (volume_ok or is_breakout):
+                return Signal()
 
         # --- 최종 판정 (Decision) ---
         # min_score는 외부에서 동적으로 조정 가능(변동성/스프레드/시장국면 기반)

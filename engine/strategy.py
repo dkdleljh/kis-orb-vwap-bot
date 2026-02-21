@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict
 
 from bars_vwap import BarBuilder1m, VwapCalculator
 from candle_analysis import Candle
+from dynamic_thresholds import load_thresholds
 from indicators import atr, bollinger_bands, ema, envelope, macd, rsi, sma
 from ml_score import calculate_ml_score
 from models import Bar1m, OrderBookTop, Position, TradeTick
@@ -15,6 +17,19 @@ from us_prev_day import fetch_us_prev_daily
 from utils_time import is_after, is_between, now_local
 
 from core import events as ievents
+
+
+def _age_seconds(ts: datetime | None) -> float | None:
+    if ts is None:
+        return None
+    try:
+        if ts.tzinfo is None:
+            ts_utc = ts.replace(tzinfo=timezone.utc)
+        else:
+            ts_utc = ts.astimezone(timezone.utc)
+        return float((datetime.now(timezone.utc) - ts_utc).total_seconds())
+    except Exception:
+        return None
 
 
 def on_tick(self, tick: TradeTick) -> None:
@@ -192,23 +207,59 @@ def on_bar_close(self, symbol: str, bar: Bar1m) -> None:
         )
         return
 
+    tcfg = self.config.get("trading", {}) or {}
+    strict_data_safety_mode = bool(tcfg.get("strict_data_safety_mode", False))
+    if strict_data_safety_mode:
+        max_book_stale_sec = float(tcfg.get("strict_max_book_stale_sec", 3.0) or 3.0)
+        max_bar_stale_sec = float(tcfg.get("strict_max_bar_stale_sec", 120.0) or 120.0)
+        book_age_sec = _age_seconds(getattr(book, "timestamp", None))
+        bar_age_sec = _age_seconds(getattr(bar, "start", None))
+        if book_age_sec is None or book_age_sec > max_book_stale_sec:
+            self.logger.debug(
+                "[Entry] strict data gate blocked by stale book symbol=%s age=%.2f max=%.2f",
+                symbol,
+                float(book_age_sec or -1.0),
+                float(max_book_stale_sec),
+            )
+            return
+        if bar_age_sec is None or bar_age_sec > max_bar_stale_sec:
+            self.logger.debug(
+                "[Entry] strict data gate blocked by stale bar symbol=%s age=%.2f max=%.2f",
+                symbol,
+                float(bar_age_sec or -1.0),
+                float(max_bar_stale_sec),
+            )
+            return
+
     closes = list(self.bar_history[symbol]["closes"])
     volumes = list(self.bar_history[symbol]["volumes"])
     highs = list(self.bar_history[symbol]["highs"])
     lows = list(self.bar_history[symbol]["lows"])
 
     indicators: Dict[str, Any] = {}
+    news_unavailable = False
+    news_unavailable_reason = ""
 
     try:
         indicators["prev_close"] = float(
             self.prev_close_by_symbol.get(symbol, 0.0) or 0.0
         )
-        indicators["news_score"] = int(
-            self.news_score_by_symbol.get(symbol, 0) or 0
-        )
+        news_score_raw = self.news_score_by_symbol.get(symbol, None)
+        indicators["news_score"] = int(news_score_raw or 0)
         indicators["volume_power"] = 100.0
 
         self._maybe_refresh_news_score(symbol)
+        if bool(tcfg.get("news_safety_mode", False)):
+            status_map = getattr(self, "news_status_by_symbol", {})
+            status = status_map.get(symbol, {}) if isinstance(status_map, dict) else {}
+            if news_score_raw is None:
+                news_unavailable = True
+                news_unavailable_reason = "cache_miss"
+                indicators["news_score"] = 0
+            elif bool(status.get("unavailable")):
+                news_unavailable = True
+                news_unavailable_reason = str(status.get("reason") or "provider_unavailable")
+                indicators["news_score"] = 0
 
         if len(closes) >= 5:
             indicators["ma5"] = sma(closes, 5)
@@ -265,7 +316,14 @@ def on_bar_close(self, symbol: str, bar: Bar1m) -> None:
 
     try:
         ml_score = indicators.get("ml_score", 50)
-        if ml_score < 40:
+        ml_threshold = 40.0
+        if bool(tcfg.get("enable_dynamic_ml_threshold", False)):
+            market_key = "kr_scalp" if str(symbol).isdigit() else "us_scalp"
+            dyn = load_thresholds("logs/dynamic_thresholds.json") or {}
+            dyn_thr = float(dyn.get(market_key, 0) or 0)
+            if dyn_thr > 0:
+                ml_threshold = max(35.0, min(70.0, dyn_thr - 30.0))
+        if ml_score < ml_threshold:
             self.logger.debug(f"[ML Filter] {symbol} ML score too low: {ml_score}")
             return
 
@@ -318,10 +376,15 @@ def on_bar_close(self, symbol: str, bar: Bar1m) -> None:
             lever_symbol=self.symbol_lever,
             inverse_symbol=self.symbol_inverse,
             max_spread_pct=self.max_spread_pct,
-            indicators=indicators,
-            market_regime=self.market_regime,
-            min_score=min_score,
-        )
+                indicators=indicators,
+                market_regime=self.market_regime,
+                min_score=min_score,
+                use_orb_confirmation=bool(tcfg.get("use_orb_confirmation", False)),
+                orb_volume_power_threshold=float(tcfg.get("orb_volume_power_threshold", 120.0) or 120.0),
+                allow_orb_retest_confirmation=bool(tcfg.get("allow_orb_retest_confirmation", False)),
+                orb_retest_tolerance_pct=float(tcfg.get("orb_retest_tolerance_pct", 0.001) or 0.001),
+                use_indicator_gate_mode=bool(tcfg.get("use_indicator_gate_mode", False)),
+            )
         if signal.side:
             signal_symbol = str(signal.symbol or symbol)
             signal_side = str(signal.side or "BUY")
@@ -348,11 +411,15 @@ def on_bar_close(self, symbol: str, bar: Bar1m) -> None:
                 "ml_score": float(indicators.get("ml_score", 50) or 50),
                 "score": float(getattr(signal, "score", 0.0) or 0.0),
                 "min_score": float(min_score),
+                "ml_threshold": float(ml_threshold),
                 "reasons": list(getattr(signal, "reasons", []) or []),
                 "reason_short": ",".join(list(getattr(signal, "reasons", []) or [])[:6]),
                 "atr": float(indicators.get("atr", 0) or 0),
                 "atr_percent": float(indicators.get("atr_percent", 0) or 0),
                 "market_regime": str(self.market_regime or ""),
+                "news_unavailable": bool(news_unavailable),
+                "news_unavailable_reason": str(news_unavailable_reason or ""),
+                "strict_data_safety_mode": bool(strict_data_safety_mode),
             }
             self._last_signal_context_by_symbol[signal_symbol] = dict(signal_context)
             try:
@@ -628,9 +695,24 @@ def _maybe_refresh_news_score(self, symbol: str) -> None:
         try:
             res = await self.state_machine.news_analyzer.get_sentiment_score(symbol)
             score = int(res.get("score", 0) or 0)
+            summary = str(res.get("summary") or "")
             self.news_score_by_symbol[symbol] = score
+            if getattr(self, "news_status_by_symbol", None) is None:
+                self.news_status_by_symbol = {}
+            self.news_status_by_symbol[symbol] = {
+                "unavailable": bool(summary in {"HTTP_ERROR", "ERROR", "NO_NEWS"} or "429" in summary),
+                "reason": summary,
+                "updated_at": float(time.time()),
+            }
             self.logger.info(f"[News Cache] {symbol} score={score}")
         except Exception as e:
+            if getattr(self, "news_status_by_symbol", None) is None:
+                self.news_status_by_symbol = {}
+            self.news_status_by_symbol[symbol] = {
+                "unavailable": True,
+                "reason": str(e),
+                "updated_at": float(time.time()),
+            }
             self.logger.debug(f"[News Cache] update failed {symbol}: {e}")
 
     try:
