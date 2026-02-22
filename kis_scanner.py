@@ -1,4 +1,6 @@
+import asyncio
 import logging
+import random
 from typing import List
 
 import aiohttp
@@ -55,58 +57,84 @@ class KisScanner:
         try:
             async with aiohttp.ClientSession() as session:
                 last_err = ""
+
+                # Scanner is used during module initialization, and KIS OpenAPI is
+                # sensitive to short bursts (EGW00201 = per-second rate limit).
+                # We retry with jittered backoff to avoid failing the universe build
+                # just because the bot started up.
+                max_attempts_per_variant = 4
+                base_backoff_sec = 0.7
+
                 for key_name, params in params_variants:
-                    async with session.get(url, headers=headers, params=params, timeout=10) as resp:
-                        try:
-                            data = await resp.json()
-                        except Exception:
-                            text = await resp.text()
-                            last_err = f"non-json resp status={resp.status} text={text[:200]}"
-                            LOGGER.error(f"Scanner fetch failed({key_name}): {last_err}")
-                            continue
-
-                    rt_cd = str(data.get("rt_cd", ""))
-                    if resp.status != 200 or rt_cd != "0":
-                        msg_cd = data.get("msg_cd", "")
-                        msg1 = data.get("msg1", "")
-                        msg = msg1 or msg_cd or "Unknown"
-                        last_err = f"status={resp.status} rt_cd={rt_cd} msg_cd={msg_cd} msg={msg}"
-
-                        # 특정 입력필드 오류면 다음 variant 시도
-                        if "INPUT" in msg or "FIELD" in msg or "FID_COND_SCR" in msg:
-                            LOGGER.error(f"Scanner fetch failed({key_name}): {last_err} -> trying next")
-                            continue
-
-                        LOGGER.error(f"Scanner fetch failed({key_name}): {last_err}")
-                        break
-
-                    output = data.get("output", [])
-                    symbols: List[str] = []
-                    for item in output:
-                        sym = item.get("mksc_shrn_iscd")
-                        name = item.get("hts_kor_isnm", "")
-
-                        price_candidates = ["stck_prpr", "stck_prpr_unpr", "prpr"]
-                        price = 0.0
-                        for k in price_candidates:
-                            v = item.get(k)
-                            if v:
-                                price = float(v)
+                    for attempt in range(1, max_attempts_per_variant + 1):
+                        async with session.get(url, headers=headers, params=params, timeout=10) as resp:
+                            try:
+                                data = await resp.json()
+                            except Exception:
+                                text = await resp.text()
+                                last_err = f"non-json resp status={resp.status} text={text[:200]}"
+                                LOGGER.error(f"Scanner fetch failed({key_name}): {last_err}")
                                 break
 
-                        if price < 1000:
-                            continue
-                        if not sym or not sym.isdigit():
-                            continue
-                        if "스팩" in name:
-                            continue
+                        rt_cd = str(data.get("rt_cd", ""))
+                        if resp.status != 200 or rt_cd != "0":
+                            msg_cd = data.get("msg_cd", "")
+                            msg1 = data.get("msg1", "")
+                            msg = msg1 or msg_cd or "Unknown"
+                            last_err = f"status={resp.status} rt_cd={rt_cd} msg_cd={msg_cd} msg={msg}"
 
-                        symbols.append(sym)
-                        if len(symbols) >= limit:
+                            # KIS per-second rate limit: wait and retry same variant
+                            if "EGW00201" in msg or "초당" in msg:
+                                if attempt < max_attempts_per_variant:
+                                    sleep_s = min(6.0, base_backoff_sec * (2 ** (attempt - 1)))
+                                    sleep_s = sleep_s * random.uniform(0.8, 1.4)
+                                    LOGGER.warning(
+                                        f"Scanner rate-limited({key_name}) attempt={attempt}/{max_attempts_per_variant}; "
+                                        f"backoff {sleep_s:.2f}s: {last_err}"
+                                    )
+                                    await asyncio.sleep(sleep_s)
+                                    continue
+                                LOGGER.error(f"Scanner fetch failed({key_name}) after retries: {last_err}")
+                                break
+
+                            # 특정 입력필드 오류면 다음 variant 시도
+                            if "INPUT" in msg or "FIELD" in msg or "FID_COND_SCR" in msg:
+                                LOGGER.error(f"Scanner fetch failed({key_name}): {last_err} -> trying next")
+                                break
+
+                            LOGGER.error(f"Scanner fetch failed({key_name}): {last_err}")
                             break
 
-                    LOGGER.info(f"Scanned Top {len(symbols)} stocks ({key_name}): {symbols}")
-                    return symbols
+                        output = data.get("output", [])
+                        symbols: List[str] = []
+                        for item in output:
+                            sym = item.get("mksc_shrn_iscd")
+                            name = item.get("hts_kor_isnm", "")
+
+                            price_candidates = ["stck_prpr", "stck_prpr_unpr", "prpr"]
+                            price = 0.0
+                            for k in price_candidates:
+                                v = item.get(k)
+                                if v:
+                                    price = float(v)
+                                    break
+
+                            if price < 1000:
+                                continue
+                            if not sym or not sym.isdigit():
+                                continue
+                            if "스팩" in name:
+                                continue
+
+                            symbols.append(sym)
+                            if len(symbols) >= limit:
+                                break
+
+                        LOGGER.info(f"Scanned Top {len(symbols)} stocks ({key_name}): {symbols}")
+                        return symbols
+
+                    # small stagger between variants to reduce burst
+                    await asyncio.sleep(random.uniform(0.15, 0.35))
 
                 self.last_error = last_err
                 if last_err:

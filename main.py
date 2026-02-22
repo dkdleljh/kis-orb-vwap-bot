@@ -294,8 +294,12 @@ async def run_module_system(base_dir: str) -> None:
         logger.warning("No modules enabled. Exiting.")
         return
 
-    for name, mod in modules.items():
+    # Stagger module initialization to avoid short request bursts to KIS OpenAPI
+    # (EGW00201 = per-second rate limit), especially right after restart.
+    for idx, (name, mod) in enumerate(modules.items()):
         await mod.initialize()
+        if idx < len(modules) - 1:
+            await asyncio.sleep(1.0)
 
     tasks = []
     for name, mod in modules.items():
