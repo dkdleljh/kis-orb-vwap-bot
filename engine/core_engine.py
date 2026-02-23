@@ -291,6 +291,16 @@ class TradingEngine:
 
         self.target_symbols = list(dict.fromkeys(self.base_universe))
 
+        # Prevent websocket subscribe overflow (OPSP0008) by limiting symbols.
+        # Tunable via env for temporary ops.
+        try:
+            max_ws = int(os.environ.get("KIS_WS_MAX_SYMBOLS", "0") or 0)
+        except Exception:
+            max_ws = 0
+        if max_ws and max_ws > 0:
+            self.target_symbols = self.target_symbols[:max_ws]
+            self.logger.warning(f"WS symbol cap applied: {max_ws} -> subscribing {len(self.target_symbols)} symbols")
+
         # 8) 웹소켓
         ws_url = self.config.get("ws.url", "")
         if not ws_url:
