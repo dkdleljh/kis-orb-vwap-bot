@@ -186,33 +186,119 @@ def _read_json(path: Path) -> dict[str, Any] | None:
         return None
 
 
-def _news_stats_from_cache(base_dir: Path, market: str, ymd: str, symbols: list[str], cap: int) -> dict | None:
-    path = base_dir / "data" / f"news_cache_{market.lower()}" / f"{ymd}.json"
-    cached = _read_json(path)
-    if not cached:
+def _news_stats_from_cache(
+    base_dir: Path,
+    market: str,
+    ymd: str,
+    symbols: list[str],
+    cap: int,
+    *,
+    min_samples: int = 10,
+    lookback_days: int = 3,
+) -> dict | None:
+    """Read news sentiment cache with a simple fallback policy.
+
+    - Prefer the requested ymd.
+    - If sample_count is too small, look back up to `lookback_days` (approx 72h).
+    - Merge by symbol (newest wins) to increase coverage on weekends/quiet days.
+
+    Returns a dict compatible with _news_stats plus extra meta fields:
+      - ymd_used: str
+      - ymds_used: list[str]
+      - cache_updated_at: str | None
+    """
+
+    data_dir = base_dir / "data" / f"news_cache_{market.lower()}"
+    if not data_dir.exists():
         return None
-    scores = cached.get("scores")
-    if not isinstance(scores, dict):
-        return None
+
+    # Build a descending list of candidate ymds (today -> past)
+    try:
+        dt0 = datetime.strptime(ymd, "%Y%m%d")
+    except Exception:
+        dt0 = datetime.now()
+
+    candidates: list[str] = []
+    for i in range(max(1, int(lookback_days))):
+        d = dt0
+        try:
+            from datetime import timedelta
+
+            d = dt0 - timedelta(days=i)
+        except Exception:
+            pass
+        candidates.append(d.strftime("%Y%m%d"))
+
+    merged: dict[str, float] = {}
+    ymds_used: list[str] = []
+    cache_updated_at: str | None = None
 
     targets = symbols[: max(1, cap)]
-    vals: list[float] = []
-    for sym in targets:
-        try:
-            if sym in scores:
-                vals.append(float(scores.get(sym)))
-        except Exception:
+
+    for cy in candidates:
+        path = data_dir / f"{cy}.json"
+        cached = _read_json(path)
+        if not cached:
             continue
 
-    if not vals:
-        for v in scores.values():
+        if cache_updated_at is None:
             try:
-                vals.append(float(v))
+                cache_updated_at = str(cached.get("updated_at") or "") or None
             except Exception:
-                continue
+                cache_updated_at = None
 
+        scores = cached.get("scores")
+        if not isinstance(scores, dict) or not scores:
+            continue
+
+        # Track that we used this day if it contributes anything.
+        used_this_day = False
+
+        # Fill only missing symbols (newest day wins)
+        for sym in targets:
+            if sym in merged:
+                continue
+            if sym in scores:
+                try:
+                    merged[sym] = float(scores.get(sym))
+                    used_this_day = True
+                except Exception:
+                    continue
+
+        # If we have too few samples, broaden by using any cached scores as a fallback.
+        # This keeps weekend/quiet-day news features from collapsing to tiny counts.
+        if len(merged) < int(min_samples):
+            for k, v in scores.items():
+                if str(k) in merged:
+                    continue
+                try:
+                    merged[str(k)] = float(v)
+                    used_this_day = True
+                except Exception:
+                    continue
+                if len(merged) >= int(min_samples):
+                    break
+
+        if used_this_day:
+            ymds_used.append(cy)
+
+        if len(merged) >= int(min_samples):
+            break
+
+    if not merged:
+        return None
+
+    vals = list(merged.values())
     attempts = len(targets) if targets else len(vals)
-    return _news_stats(vals, attempts)
+    out = _news_stats(vals, attempts)
+    out.update(
+        {
+            "ymd_used": (ymds_used[0] if ymds_used else ymd),
+            "ymds_used": ymds_used,
+            "cache_updated_at": cache_updated_at,
+        }
+    )
+    return out
 
 
 def _normalize_premarket_trend(value: Any) -> str | None:
@@ -259,7 +345,15 @@ def _apply_cached_overrides(
     out["chart"] = dict(out.get("chart") or {})
     out["atr"] = dict(out.get("atr") or {})
 
-    cached_news = _news_stats_from_cache(base_dir, market, ymd, symbols, news_cap)
+    cached_news = _news_stats_from_cache(
+        base_dir,
+        market,
+        ymd,
+        symbols,
+        news_cap,
+        min_samples=(20 if market.upper() == "KR" else 10),
+        lookback_days=3,
+    )
     if cached_news:
         out["news"] = {
             "sentiment_avg": cached_news.get("avg"),
@@ -267,6 +361,10 @@ def _apply_cached_overrides(
             "coverage": cached_news.get("coverage", 0.0),
             "success_rate": cached_news.get("success_rate", 0.0),
             "std": cached_news.get("std"),
+            # meta (useful for debugging)
+            "ymd_used": cached_news.get("ymd_used"),
+            "ymds_used": cached_news.get("ymds_used"),
+            "cache_updated_at": cached_news.get("cache_updated_at"),
         }
 
     pm = _select_premarket_metric(
@@ -521,16 +619,49 @@ async def main() -> int:
     cfg = json.loads((base_dir / "config.json").read_text(encoding="utf-8"))
     modules = cfg.get("modules", {}) or {}
     kuk = modules.get("kukjang", {}) or {}
-    # KR symbols: always_include + lever/inverse
+    # KR symbols: always_include + a small stable set of liquid representatives.
+    # The dynamic_universe always_include list can be tiny (e.g. only lever/inverse ETFs),
+    # which makes the news sample_count misleadingly low.
     dyn = (kuk.get("dynamic_universe", {}) or {})
     kr_syms = list(dyn.get("always_include", []) or [])
+    kr_defaults = [
+        "069500",  # KODEX 200
+        "122630",  # KODEX 레버리지
+        "114800",  # KODEX 인버스
+        "005930",  # 삼성전자
+        "000660",  # SK하이닉스
+        "035420",  # NAVER
+        "035720",  # 카카오
+        "051910",  # LG화학
+        "068270",  # 셀트리온
+        "005380",  # 현대차
+        "000270",  # 기아
+        "207940",  # 삼성바이오로직스
+        "005490",  # POSCO홀딩스
+        "105560",  # KB금융
+        "055550",  # 신한지주
+        "015760",  # 한국전력
+        "034020",  # 두산에너빌리티
+        "028300",  # HLB
+        "096770",  # SK이노베이션
+        "066570",  # LG전자
+    ]
 
-    # If empty, fall back to some well-known KR symbols.
-    if not kr_syms:
-        kr_syms = ["005930", "000660", "035420", "035720", "051910", "068270"]
+    # Ensure at least 20 symbols for KR news sampling
+    for s in kr_defaults:
+        if s not in kr_syms:
+            kr_syms.append(s)
+        if len(kr_syms) >= 20:
+            break
 
     us = modules.get("us_swing", {}) or {}
     us_syms = list(us.get("symbols", ["AAPL", "MSFT", "NVDA", "TSLA"]) or [])
+    us_defaults = ["VOO", "SPY", "QQQ", "IWM", "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "TSLA"]
+    for s in us_defaults:
+        if s not in us_syms:
+            us_syms.append(s)
+        if len(us_syms) >= 10:
+            break
 
     an = NewsSentimentAnalyzer(max_news_age_hours=24)
 
@@ -551,7 +682,13 @@ async def main() -> int:
     kr_rep = "069500"
     kr_chart = _kr_chart_metrics(base_dir, kr_rep)
     us_chart = _us_chart_metrics(base_dir, "VOO")
-    ymd = datetime.now().strftime("%Y%m%d")
+    # Use KST date for cache lookups (cron runs in KST environment but be explicit).
+    try:
+        from zoneinfo import ZoneInfo
+
+        ymd = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d")
+    except Exception:
+        ymd = datetime.now().strftime("%Y%m%d")
 
     vix_block = {"vix_last": (fg or {}).get("vix_last"), "vix_ma50": (fg or {}).get("vix_ma50"), "vix_gap": (fg or {}).get("vix_gap")}
     fg_block = {"fg_score": (fg or {}).get("fg_score"), "fg_rating": (fg or {}).get("fg_rating"), "fg_ts_utc": (fg or {}).get("fg_ts_utc")}
@@ -634,6 +771,13 @@ async def main() -> int:
             "kr_chart_date": kr_chart.get("kr_chart_date"),
             "us_chart_date": us_chart.get("us_chart_date"),
             "kr_chart_tf": kr_chart.get("kr_chart_tf"),
+            # Debug meta: whether weekend/news fallback was used
+            "kr_news_ymd_used": (kr_inputs.get("news") or {}).get("ymd_used"),
+            "kr_news_cache_updated_at": (kr_inputs.get("news") or {}).get("cache_updated_at"),
+            "kr_news_sample_count": (kr_inputs.get("news") or {}).get("sample_count"),
+            "us_news_ymd_used": (us_inputs.get("news") or {}).get("ymd_used"),
+            "us_news_cache_updated_at": (us_inputs.get("news") or {}).get("cache_updated_at"),
+            "us_news_sample_count": (us_inputs.get("news") or {}).get("sample_count"),
         }
     }
 
@@ -663,6 +807,18 @@ async def main() -> int:
                     "kr_swing": out.kr_swing,
                     "us_scalp": out.us_scalp,
                     "us_swing": out.us_swing,
+                },
+                "news_meta": {
+                    "kr": {
+                        "ymd_used": (kr_inputs.get("news") or {}).get("ymd_used"),
+                        "sample_count": (kr_inputs.get("news") or {}).get("sample_count"),
+                        "cache_updated_at": (kr_inputs.get("news") or {}).get("cache_updated_at"),
+                    },
+                    "us": {
+                        "ymd_used": (us_inputs.get("news") or {}).get("ymd_used"),
+                        "sample_count": (us_inputs.get("news") or {}).get("sample_count"),
+                        "cache_updated_at": (us_inputs.get("news") or {}).get("cache_updated_at"),
+                    },
                 },
             },
             ensure_ascii=False,
