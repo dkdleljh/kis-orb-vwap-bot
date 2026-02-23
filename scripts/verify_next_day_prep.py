@@ -193,6 +193,14 @@ def main() -> int:
     day_s = day.isoformat()
     ymd = day.strftime("%Y%m%d")
 
+    # If it's a weekend (KST), markets are closed and the event stream may be empty.
+    # In that case, treat verification as PASS to avoid noisy failures.
+    if day.weekday() >= 5:
+        print(f"date={day_s}")
+        print("weekend=YES (market closed)")
+        print("KIS NextDayPrep Verification: PASS (weekend)")
+        return 0
+
     base_events_path = Path(args.events_path) if args.events_path else (ROOT / "logs" / "events" / ymd / "events.jsonl")
     enriched_events_path = base_events_path.with_name("events.enriched.jsonl")
 
