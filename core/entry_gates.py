@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from datetime import datetime, timezone
 from dataclasses import dataclass
@@ -171,6 +172,12 @@ class EntryGateEvaluator:
                 return EntryGateDecision(False, "entry_rate_limit", 0, cash, budget)
         except Exception:
             pass
+
+        # Allow a temporary override (e.g. "today only") to force-enable entries.
+        # NOTE: This increases slippage/false entries risk.
+        if str(os.environ.get("KIS_DISABLE_MICROSTRUCTURE_FILTER", "0")).strip() in {"1", "true", "TRUE", "yes", "YES"}:
+            micro_cfg = dict(micro_cfg)
+            micro_cfg["enabled"] = False
 
         if bool(micro_cfg.get("enabled", False)):
             max_spread_pct = float(micro_cfg.get("max_spread_pct", 0.003) or 0.003)
