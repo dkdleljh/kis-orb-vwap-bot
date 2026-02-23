@@ -807,28 +807,42 @@ class TradingEngine:
             if self.state_machine.state == State.BUILD_OR:
                 self.state_machine.set_state(State.WAIT_SIGNAL)
 
+        debug_skips = str(os.environ.get("KIS_DEBUG_ENTRY_SKIPS", "0")).strip() in {"1","true","TRUE","yes","YES"}
+
         if self.state_machine.state != State.WAIT_SIGNAL:
+            if debug_skips:
+                self._skip_reason_counts["state_not_wait_signal"] += 1
             self.logger.debug(f"[Entry] skipped: state={self.state_machine.state}")
             return
 
         if self.kill_switch_on():
+            if debug_skips:
+                self._skip_reason_counts["kill_switch"] += 1
             self.logger.debug("[Entry] skipped: kill switch on")
             return
 
         if not self.ws_connected:
+            if debug_skips:
+                self._skip_reason_counts["ws_not_connected"] += 1
             self.logger.debug("[Entry] skipped: ws not connected")
             return
 
         if not self.risk.can_enter():
+            if debug_skips:
+                self._skip_reason_counts["risk_cannot_enter"] += 1
             self.logger.debug("[Entry] skipped: risk cannot enter")
             self.state_machine.set_state(State.DONE_TODAY)
             return
 
         if self.state_machine.in_position(symbol):
+            if debug_skips:
+                self._skip_reason_counts["already_in_position"] += 1
             self.logger.debug("[Entry] skipped: already in position symbol=%s", symbol)
             return
 
         if self.state_machine.active_position_count() >= self.max_concurrent_positions:
+            if debug_skips:
+                self._skip_reason_counts["max_positions"] += 1
             self.logger.debug(
                 "[Entry] skipped: max_concurrent_positions reached (%s/%s)",
                 self.state_machine.active_position_count(),
@@ -841,9 +855,13 @@ class TradingEngine:
         vwap_calc = self.vwap_by_symbol.get(symbol)
         vwap = vwap_calc.vwap() if vwap_calc else None
         if last_price is None or book is None:
+            if debug_skips:
+                self._skip_reason_counts["no_price_book"] += 1
             self.logger.debug("[Entry] skipped: no price/book data")
             return
         if last_price <= 0 or book.ask <= 0 or book.bid <= 0:
+            if debug_skips:
+                self._skip_reason_counts["invalid_price_book"] += 1
             self.logger.debug(
                 f"[Entry] skipped: invalid price/book: last_price={last_price} ask={book.ask} bid={book.bid}"
             )
