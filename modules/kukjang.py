@@ -309,9 +309,13 @@ class KukjangModule(BaseTradingModule):
                 self.perfect_strategy.set_state(State.WAIT_SIGNAL)
 
         if self.perfect_strategy.state != State.WAIT_SIGNAL:
+            if os.environ.get("KIS_DEBUG_ENTRY_SKIPS", "0").strip() == "1":
+                self.log_info(f"[SKIP] {symbol} state={self.perfect_strategy.state} (not WAIT_SIGNAL)")
             return
 
         if not self.risk.can_enter():
+            if os.environ.get("KIS_DEBUG_ENTRY_SKIPS", "0").strip() == "1":
+                self.log_warning(f"[SKIP] risk.can_enter=False -> DONE_TODAY")
             self.perfect_strategy.set_state(State.DONE_TODAY)
             return
 
@@ -343,12 +347,18 @@ class KukjangModule(BaseTradingModule):
                 pass
 
         if last_price is None or book is None or vwap is None:
+            if os.environ.get("KIS_DEBUG_ENTRY_SKIPS", "0").strip() == "1":
+                self.log_info(f"[SKIP] {symbol} missing inputs last_price/book/vwap")
             return
         if last_price <= 0 or book.ask <= 0 or book.bid <= 0:
+            if os.environ.get("KIS_DEBUG_ENTRY_SKIPS", "0").strip() == "1":
+                self.log_info(f"[SKIP] {symbol} invalid prices last={last_price} bid={book.bid} ask={book.ask}")
             return
 
         indicators = await self._calculate_indicators(symbol, bar)
         if not indicators:
+            if os.environ.get("KIS_DEBUG_ENTRY_SKIPS", "0").strip() == "1":
+                self.log_info(f"[SKIP] {symbol} indicators empty")
             return
 
         try:

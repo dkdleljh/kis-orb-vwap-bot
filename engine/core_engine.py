@@ -913,9 +913,15 @@ class TradingEngine:
             return
 
         try:
+            # Optional debug of skip reasons (today-only troubleshooting)
+            debug_skips = str(os.environ.get("KIS_DEBUG_ENTRY_SKIPS", "0")).strip() in {"1","true","TRUE","yes","YES"}
+
             ml_score = indicators.get("ml_score", 50)
             if ml_score < 40:
-                self.logger.debug(f"[ML Filter] {symbol} ML score too low: {ml_score}")
+                if str(os.environ.get("KIS_DEBUG_ENTRY_SKIPS", "0")).strip() in {"1","true","TRUE","yes","YES"}:
+                    self.logger.info(f"[SKIP] {symbol} ML score too low: {ml_score}")
+                else:
+                    self.logger.debug(f"[ML Filter] {symbol} ML score too low: {ml_score}")
                 return
 
             # --- Dynamic entry threshold (recommended defaults) ---
@@ -938,12 +944,20 @@ class TradingEngine:
             # Filter: avoid low-ATR names where fees dominate (reduces buy-high/sell-low churn).
             try:
                 if float(atr_pct) > 0 and float(atr_pct) < float(self.atr_min_percent):
-                    self.logger.debug(
-                        "[ATR Filter] %s atr_pct=%.3f < min=%.3f -> skip",
-                        symbol,
-                        float(atr_pct),
-                        float(self.atr_min_percent),
-                    )
+                    if str(os.environ.get("KIS_DEBUG_ENTRY_SKIPS", "0")).strip() in {"1","true","TRUE","yes","YES"}:
+                        self.logger.info(
+                            "[SKIP] %s ATR too low: atr_pct=%.3f < min=%.3f",
+                            symbol,
+                            float(atr_pct),
+                            float(self.atr_min_percent),
+                        )
+                    else:
+                        self.logger.debug(
+                            "[ATR Filter] %s atr_pct=%.3f < min=%.3f -> skip",
+                            symbol,
+                            float(atr_pct),
+                            float(self.atr_min_percent),
+                        )
                     return
             except Exception:
                 pass
@@ -965,6 +979,11 @@ class TradingEngine:
                 adj += 10.0
 
             min_score = max(45.0, min(85.0, base_thr + adj))
+
+            if debug_skips and (book is None or vwap is None or last_price <= 0):
+                self.logger.info(
+                    f"[SKIP] {symbol} missing inputs book={book is not None} vwap={vwap is not None} last_price={last_price}"
+                )
 
             signal = self.state_machine.evaluate_entry(
                 bar=bar,
