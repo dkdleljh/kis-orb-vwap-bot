@@ -319,6 +319,28 @@ class KukjangModule(BaseTradingModule):
         vwap_calc = self.vwap_by_symbol.get(symbol)
         vwap = vwap_calc.vwap() if vwap_calc else None
 
+        # If websocket orderbook is missing/stale, fall back to REST quote so
+        # signal generation doesn't completely stall after a restart.
+        if book is None or (getattr(book, "ask", 0) or 0) <= 0 or (getattr(book, "bid", 0) or 0) <= 0:
+            try:
+                q = await self.get_quote(symbol)
+                out = (q or {}).get("output", {}) or {}
+                ask = float(out.get("askp1") or 0)
+                bid = float(out.get("bidp1") or 0)
+                if ask > 0 and bid > 0:
+                    from models import OrderBookTop
+
+                    book = OrderBookTop(
+                        symbol=symbol,
+                        bid=bid,
+                        ask=ask,
+                        bid_size=0.0,
+                        ask_size=0.0,
+                        timestamp=datetime.now(),
+                    )
+            except Exception:
+                pass
+
         if last_price is None or book is None or vwap is None:
             return
         if last_price <= 0 or book.ask <= 0 or book.bid <= 0:
