@@ -540,9 +540,14 @@ class TradingEngine:
         if hot_stocks:
             # 기본 유니버스 + 핫한 종목 합치기 (중복 제거)
             new_targets = list(set(self.base_universe + hot_stocks))
-            # WS 구독 한도(40개) 고려하여 자르기
-            if len(new_targets) > 40:
-                new_targets = new_targets[:40]
+            # WS 구독 한도 고려하여 자르기 (env로 조정 가능)
+            try:
+                ws_cap = int(os.environ.get("KIS_WS_MAX_SYMBOLS", "40") or 40)
+            except Exception:
+                ws_cap = 40
+            ws_cap = max(1, ws_cap)
+            if len(new_targets) > ws_cap:
+                new_targets = new_targets[:ws_cap]
 
             self.target_symbols = new_targets
             self.logger.info(
