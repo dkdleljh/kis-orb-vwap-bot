@@ -135,10 +135,28 @@ async def run_module_system(base_dir: str) -> None:
     from us_scanner import USStockScanner
 
     config = load_config(base_dir)
+
+    # Log effective scoring thresholds on startup (helps confirm day overrides)
+    try:
+        sc = (config.get("trading", {}) or {}).get("scoring", {}) or {}
+        logger_tmp = None
+        # logger not ready yet; print once logger is initialized below.
+        _startup_scoring = {
+            "kr_scalp_entry_threshold": sc.get("kr_scalp_entry_threshold"),
+            "kr_swing_entry_threshold": sc.get("kr_swing_entry_threshold"),
+            "us_scalp_entry_threshold": sc.get("us_scalp_entry_threshold"),
+            "us_swing_entry_threshold": sc.get("us_swing_entry_threshold"),
+        }
+    except Exception:
+        _startup_scoring = {}
+
     log_dir = config.get("logging.dir", "logs")
     if not os.path.isabs(log_dir):
         log_dir = os.path.join(base_dir, log_dir)
     logger = setup_logger(log_dir, config.get("timezone", "Asia/Seoul"))
+
+    if _startup_scoring:
+        logger.info(f"[Startup] scoring thresholds: {_startup_scoring}")
 
     app_key, app_secret, _hts_id = load_auth_from_env()
     if not app_key or not app_secret:

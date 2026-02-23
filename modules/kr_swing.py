@@ -99,6 +99,9 @@ class KRSwingModule(BaseTradingModule):
         self._scanner = scanner
 
     async def _on_initialize(self) -> None:
+        # Log effective entry threshold so we can confirm day overrides are applied.
+        self.logger.info(f"[kr_swing] entry_threshold(min_score)={self.entry_threshold}")
+
         if self.dynamic_enabled:
             await self._refresh_universe()
         else:
