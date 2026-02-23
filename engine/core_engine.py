@@ -371,6 +371,10 @@ class TradingEngine:
         # Best-effort error counters for health/status (never used for control-flow)
         self._error_counts: dict[str, int] = defaultdict(int)
 
+        # Debug counters for "why no trades" diagnosis (enabled via KIS_DEBUG_ENTRY_SKIPS=1)
+        self._skip_reason_counts: dict[str, int] = defaultdict(int)
+        self._skip_last_report_ts: float = 0.0
+
         # 뉴스 점수 캐시(비동기 갱신)
         self.news_score_by_symbol: Dict[str, int] = {}
         self.news_score_updated_at: Dict[str, float] = {}
@@ -933,7 +937,8 @@ class TradingEngine:
 
             ml_score = indicators.get("ml_score", 50)
             if ml_score < 40:
-                if str(os.environ.get("KIS_DEBUG_ENTRY_SKIPS", "0")).strip() in {"1","true","TRUE","yes","YES"}:
+                if debug_skips:
+                    self._skip_reason_counts["ml_too_low"] += 1
                     self.logger.info(f"[SKIP] {symbol} ML score too low: {ml_score}")
                 else:
                     self.logger.debug(f"[ML Filter] {symbol} ML score too low: {ml_score}")
@@ -959,7 +964,8 @@ class TradingEngine:
             # Filter: avoid low-ATR names where fees dominate (reduces buy-high/sell-low churn).
             try:
                 if float(atr_pct) > 0 and float(atr_pct) < float(self.atr_min_percent):
-                    if str(os.environ.get("KIS_DEBUG_ENTRY_SKIPS", "0")).strip() in {"1","true","TRUE","yes","YES"}:
+                    if debug_skips:
+                        self._skip_reason_counts["atr_too_low"] += 1
                         self.logger.info(
                             "[SKIP] %s ATR too low: atr_pct=%.3f < min=%.3f",
                             symbol,
@@ -1076,6 +1082,9 @@ class TradingEngine:
                 asyncio.create_task(
                     self.handle_entry(signal, book, bar_start=bar.start)
                 )
+            else:
+                if debug_skips:
+                    self._skip_reason_counts["no_signal"] += 1
         except Exception as e:
             self.logger.error(f"Evaluate entry failed for {symbol}: {e}")
 
@@ -1330,6 +1339,20 @@ class TradingEngine:
             self.update_state_by_time()
             # Best-effort daily baseline capture for return reporting
             await self._maybe_write_daily_baseline()
+
+            # Periodic skip-reason summary (when enabled)
+            try:
+                debug_skips = str(os.environ.get("KIS_DEBUG_ENTRY_SKIPS", "0")).strip() in {"1","true","TRUE","yes","YES"}
+                now_ts = time.time()
+                if debug_skips and (now_ts - float(self._skip_last_report_ts or 0.0)) >= 60.0:
+                    if self._skip_reason_counts:
+                        top = sorted(self._skip_reason_counts.items(), key=lambda x: x[1], reverse=True)[:8]
+                        self.logger.info(f"[SKIP-SUMMARY] last~60s: {dict(top)}")
+                        self._skip_reason_counts = defaultdict(int)
+                    self._skip_last_report_ts = now_ts
+            except Exception:
+                pass
+
             await asyncio.sleep(1)
 
     def update_state_by_time(self) -> None:
