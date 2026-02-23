@@ -219,6 +219,24 @@ class OrderExecutor:
         idempotency_key: str,
         correlation_id: str,
     ) -> EntryExecutionResult:
+        ecfg = self._execution_cfg()
+        min_qty = max(1, int(ecfg.get("min_qty", 1) or 1))
+        min_order_value_krw = max(
+            0.0, float(ecfg.get("min_order_value_krw", 1000.0) or 1000.0)
+        )
+        notional = float(qty) * float(ask)
+        if int(qty) < min_qty or notional < min_order_value_krw:
+            self.engine.logger.warning(
+                "entry rejected by min qty/notional symbol=%s qty=%s ask=%s notional=%.2f min_qty=%s min_notional=%.2f",
+                symbol,
+                qty,
+                ask,
+                notional,
+                min_qty,
+                min_order_value_krw,
+            )
+            return EntryExecutionResult(filled=False)
+
         if not self.engine.live_ordering_enabled():
             pos = Position(
                 symbol=symbol,
@@ -272,7 +290,6 @@ class OrderExecutor:
             self.engine.peak_pnl_pct[symbol] = -0.01
             return EntryExecutionResult(filled=True)
 
-        ecfg = self._execution_cfg()
         poll_sec = max(0.2, float(ecfg.get("entry_poll_sec", 2.0) or 2.0))
         cancel_enabled = bool(ecfg.get("cancel_unfilled_entry", True))
         max_cancel_attempts = max(0, int(ecfg.get("entry_max_cancel_attempts", 1) or 1))

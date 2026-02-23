@@ -143,3 +143,23 @@ def test_slippage_tracker_sets_blocklist_when_threshold_breached():
 
     assert "005930" in eng.slippage_block_until
     assert eng.slippage_block_until["005930"] > 0
+
+
+def test_order_executor_rejects_entry_below_min_order_value_krw():
+    eng = _Engine()
+    eng.config = {"trading": {"execution": {"min_order_value_krw": 1000.0}}}
+    ex = OrderExecutor(eng)
+
+    entry = asyncio.run(
+        ex.execute_entry(
+            symbol="005930",
+            qty=1,
+            ask=500.0,
+            idempotency_key="k3",
+            correlation_id="c3",
+        )
+    )
+
+    assert entry.filled is False
+    assert eng.state_machine.get_position("005930") is None
+    assert eng.event_store.events == []

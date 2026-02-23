@@ -48,8 +48,8 @@
     "atr_multiplier": 2.7,
     "enable_time_filter": true,
     "scoring": {
-      "kr_scalp_entry_threshold": 77.0,
-      "kr_swing_entry_threshold": 65,
+      "kr_scalp_entry_threshold": 50,
+      "kr_swing_entry_threshold": 50,
       "us_scalp_entry_threshold": 75,
       "us_swing_entry_threshold": 68
     },

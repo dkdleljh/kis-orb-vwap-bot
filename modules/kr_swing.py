@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import statistics
 from collections import defaultdict, deque
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -94,6 +95,53 @@ class KRSwingModule(BaseTradingModule):
             min_win_rate=0.53,
             min_r_ratio=1.2,
         )
+        self.market_regime: Optional[str] = None
+
+    def detect_market_regime(self, symbol: str) -> str:
+        """Detect market regime using 15m KOSPI proxy vs SMA20 and slope."""
+        kospi_candidates = ("KOSPI", "KOSPI200", "069500", "102110")
+        closes: List[float] = []
+
+        for candidate in kospi_candidates:
+            data = self.hist.get(candidate)
+            if not data:
+                continue
+            candidate_closes = list(data.get("closes", []))
+            if len(candidate_closes) >= 21:
+                closes = candidate_closes
+                break
+
+        if not closes:
+            fallback = list(self.hist[symbol]["closes"])
+            closes = fallback if len(fallback) >= 21 else []
+
+        if len(closes) < 21:
+            return "NEUTRAL"
+
+        sma20_now = sma(closes, 20)
+        sma20_prev = sma(closes[:-1], 20)
+        if sma20_now <= 0 or sma20_prev <= 0:
+            return "NEUTRAL"
+
+        slope = (sma20_now - sma20_prev) / sma20_prev
+        kospi_now = float(closes[-1])
+
+        rets = []
+        lookback = closes[-20:]
+        for i in range(1, len(lookback)):
+            prev = float(lookback[i - 1])
+            curr = float(lookback[i])
+            if prev > 0:
+                rets.append((curr - prev) / prev)
+        vix_proxy = statistics.pstdev(rets) * 100.0 if len(rets) >= 2 else 0.0
+
+        if kospi_now > sma20_now * 1.01 and slope >= 0:
+            return "BULL"
+        if kospi_now < sma20_now * 0.99 and slope <= 0:
+            return "BEAR"
+        if abs(slope) < 0.0005 and vix_proxy >= 1.2:
+            return "RANGE"
+        return "NEUTRAL"
 
     def set_scanner(self, scanner) -> None:
         self._scanner = scanner
@@ -207,6 +255,7 @@ class KRSwingModule(BaseTradingModule):
         closes = list(self.hist[symbol]["closes"])
         highs = list(self.hist[symbol]["highs"])
         lows = list(self.hist[symbol]["lows"])
+        volumes = list(self.hist[symbol]["volumes"])
         if len(closes) < 40:
             return
 
@@ -220,6 +269,18 @@ class KRSwingModule(BaseTradingModule):
         if last_price is None or book is None or vwap is None:
             return
 
+        vol_sma20 = sma(volumes, 20) if len(volumes) >= 20 else 0.0
+        curr_vol = float(volumes[-1]) if volumes else 0.0
+        volume_power = (curr_vol / vol_sma20 * 100.0) if vol_sma20 and vol_sma20 > 0 else 100.0
+
+        news_score = 0
+        news_provider = getattr(self, "news", None)
+        if news_provider is not None and hasattr(news_provider, "get_score"):
+            try:
+                news_score = int(news_provider.get_score(symbol))
+            except Exception:
+                news_score = 0
+
         # Minimal indicators for scoring reasons
         ind: Dict[str, Any] = {
             "rsi": rsi(closes, 14),
@@ -227,8 +288,8 @@ class KRSwingModule(BaseTradingModule):
             "ema21": ema(closes, 21),
             "ma20": sma(closes, 20),
             "prev_close": closes[-2],
-            "volume_power": 120,
-            "news_score": 0,
+            "volume_power": volume_power,
+            "news_score": news_score,
             "atr": atr(highs, lows, closes, 14),
         }
         _, _, m_hist = macd(closes, 12, 26, 9)
@@ -247,6 +308,14 @@ class KRSwingModule(BaseTradingModule):
         # Perfect100Strategy uses OR; for swing we treat it as optional. Ensure state is WAIT_SIGNAL.
         self.strategy.set_state(State.WAIT_SIGNAL)
         self.strategy.update_or(symbol, bar)  # best-effort (won't hurt)
+        self.market_regime = self.detect_market_regime(symbol)
+        market_regime = (self.market_regime or "").strip().upper()
+        if not market_regime:
+            market_regime = "NEUTRAL"
+            self.log_warning(
+                f"[kr_swing] market_regime missing for {symbol}; defaulting to NEUTRAL"
+            )
+        self.market_regime = market_regime
 
         sig = self.strategy.evaluate_entry(
             bar=bar,
@@ -256,7 +325,7 @@ class KRSwingModule(BaseTradingModule):
             lever_symbol=self.symbol_lever,
             inverse_symbol=self.symbol_inverse,
             indicators=ind,
-            market_regime="NEUTRAL",
+            market_regime=self.market_regime,
         )
 
         # Convert to standardized score output
@@ -268,7 +337,7 @@ class KRSwingModule(BaseTradingModule):
                 "RR": 30,
             }
         )
-        score = float(sig.score if getattr(sig, "score", 0) else breakdown.total)
+        score = float(getattr(sig, "score", 0) or 0)
 
         out = SignalScore(
             symbol=symbol,

@@ -69,7 +69,10 @@ class Perfect100Strategy:
         self.position: Optional[Position] = None
         self.logger = logger
 
+        self.base_min_score = min_score
         self.min_score = min_score
+        self.base_risk_budget = 1.0
+        self.risk_budget = self.base_risk_budget
         self.max_spread_pct = max_spread_pct
         self.min_bid_ask_ratio = min_bid_ask_ratio
         self.min_win_rate = min_win_rate
@@ -85,6 +88,22 @@ class Perfect100Strategy:
 
         self._peak_price: float = 0.0
         self._entry_price: float = 0.0
+
+    def _get_regime_params(self, market_regime: str) -> tuple[int, float]:
+        regime = str(market_regime or "NEUTRAL").upper()
+        min_score = self.base_min_score
+        risk_budget = self.base_risk_budget
+
+        if regime == "BEAR":
+            min_score += 10
+            risk_budget *= 0.70
+        elif regime == "RANGE":
+            min_score += 5
+            risk_budget *= 0.85
+        elif regime == "BULL":
+            risk_budget *= 1.10
+
+        return min_score, risk_budget
 
     def set_state(self, new_state: State) -> None:
         if self.state != new_state:
@@ -158,6 +177,10 @@ class Perfect100Strategy:
         if or_state is None:
             return PerfectSignal()
 
+        regime_min_score, regime_risk_budget = self._get_regime_params(market_regime)
+        self.min_score = regime_min_score
+        self.risk_budget = regime_risk_budget
+
         score = 0
         reasons = []
 
@@ -171,7 +194,7 @@ class Perfect100Strategy:
 
         if rsi_val >= 72:
             reasons.append(f"RSI_OVERBOUGHT({rsi_val:.0f})")
-            if score < self.min_score + 15:
+            if score < regime_min_score + 15:
                 return PerfectSignal()
         elif 50 <= rsi_val <= 68:
             score += 10
@@ -215,12 +238,21 @@ class Perfect100Strategy:
             score += 10
             reasons.append("VWAP+")
 
-        is_breakout = or_state.or_high is not None and bar.close > or_state.or_high
+        atr = indicators.get("atr", 0)
+        breakout_buffer = (atr * 0.2) if atr > 0 else 0.0
+        is_breakout = (
+            or_state.or_high is not None
+            and bar.close > (or_state.or_high + breakout_buffer)
+            and vol_power >= 120
+        )
         is_pullback = (last_price > ma20 > 0) and (bar.close > bar.open)
 
         if is_breakout:
             score += 25
             reasons.append("BREAKOUT")
+            if market_regime == "BULL" and book.symbol != inverse_symbol:
+                score += 10
+                reasons.append("REGIME_BULL_BONUS")
         elif is_pullback:
             score += 20
             reasons.append("PULLBACK")
@@ -249,10 +281,15 @@ class Perfect100Strategy:
             score -= 30
             reasons.append("OVER+")
 
-        if market_regime == "BEAR" and book.symbol != inverse_symbol:
-            return PerfectSignal()
+        if (
+            market_regime == "BEAR"
+            and book.symbol != inverse_symbol
+            and news_score <= 50
+            and score > 80
+        ):
+            score = 80
+            reasons.append("REGIME_BEAR_CAP")
 
-        atr = indicators.get("atr", 0)
         stop_loss = last_price - (atr * 2) if atr > 0 else last_price * 0.985
         take_profit = last_price + (atr * 3) if atr > 0 else last_price * 1.03
 
@@ -262,19 +299,22 @@ class Perfect100Strategy:
 
         if net_rr < self.min_r_ratio:
             reasons.append(f"RR-({net_rr:.1f})")
-            if score < self.min_score + 10:
+            if score < regime_min_score + 10:
                 return PerfectSignal()
 
-        if score >= self.min_score:
+        if score >= regime_min_score:
             estimated_win_rate = min(0.95, 0.40 + (score / 200) + (net_rr / 10))
 
             return PerfectSignal(
                 side="BUY",
                 symbol=book.symbol,
                 score=score,
-                reasons=reasons,
+                reasons=reasons + [f"RISK_BUDGET({regime_risk_budget:.2f}x)"],
                 expected_win_rate=estimated_win_rate,
-                expected_r=net_rr * estimated_win_rate - (1 - estimated_win_rate),
+                expected_r=(
+                    net_rr * estimated_win_rate - (1 - estimated_win_rate)
+                )
+                * regime_risk_budget,
                 risk_reward_ratio=net_rr,
                 slippage_adjusted=True,
                 fee_adjusted=True,
@@ -289,12 +329,14 @@ class Perfect100Strategy:
             indicators=indicators,
             market_regime=market_regime,
             inverse_symbol=inverse_symbol,
+            min_score=regime_min_score,
+            risk_budget=regime_risk_budget,
         )
 
-        if sell_score and sell_score.score >= self.min_score:
+        if sell_score and sell_score.score >= regime_min_score:
             return sell_score
 
-        return PerfectSignal()
+        return PerfectSignal(side=None, score=0)
 
     def _evaluate_sell_entry(
         self,
@@ -306,6 +348,8 @@ class Perfect100Strategy:
         indicators: Dict,
         market_regime: str,
         inverse_symbol: str,
+        min_score: int,
+        risk_budget: float,
     ) -> Optional[PerfectSignal]:
         if book.symbol == inverse_symbol:
             return None
@@ -326,7 +370,7 @@ class Perfect100Strategy:
 
         if rsi_val <= 28:
             reasons.append(f"RSI_OVERSOLD({rsi_val:.0f})")
-            if score < self.min_score + 15:
+            if score < min_score + 15:
                 return None
         elif 32 <= rsi_val <= 50:
             score += 10
@@ -408,19 +452,20 @@ class Perfect100Strategy:
 
         if net_rr < self.min_r_ratio:
             reasons.append(f"RR-({net_rr:.1f})")
-            if score < self.min_score + 10:
+            if score < min_score + 10:
                 return None
 
-        if score >= self.min_score:
+        if score >= min_score:
             estimated_win_rate = min(0.95, 0.40 + (score / 200) + (net_rr / 10))
 
             return PerfectSignal(
                 side="SELL",
                 symbol=book.symbol,
                 score=score,
-                reasons=reasons,
+                reasons=reasons + [f"RISK_BUDGET({risk_budget:.2f}x)"],
                 expected_win_rate=estimated_win_rate,
-                expected_r=net_rr * estimated_win_rate - (1 - estimated_win_rate),
+                expected_r=(net_rr * estimated_win_rate - (1 - estimated_win_rate))
+                * risk_budget,
                 risk_reward_ratio=net_rr,
                 slippage_adjusted=True,
                 fee_adjusted=True,
@@ -434,25 +479,85 @@ class Perfect100Strategy:
         entry_price: float,
         atr: float,
         side: str = "BUY",
+        stop_distance: Optional[float] = None,
     ) -> tuple[bool, str]:
-        gross_pnl = (current_price - entry_price) / entry_price
+        targets = self.get_atr_targets(
+            entry_price=entry_price,
+            atr=atr,
+            side=side,
+            stop_distance=stop_distance,
+        )
+        side_norm = str(side).upper()
+        is_sell = side_norm == "SELL" or str(side).strip() == "-1"
 
-        net_pnl = gross_pnl - self.total_cost_rate
-
-        if side == "SELL":
-            net_pnl = -net_pnl
-
-        tp_levels = [
-            (0.015, "TP1"),
-            (0.025, "TP2"),
-            (0.035, "TP3"),
-        ]
-
-        for tp_pct, label in tp_levels:
-            if net_pnl >= tp_pct:
+        for label, target_price in reversed(targets):
+            if (not is_sell and current_price >= target_price) or (
+                is_sell and current_price <= target_price
+            ):
                 return True, label
 
         return False, ""
+
+    def get_atr_targets(
+        self,
+        entry_price: float,
+        atr: float,
+        side: str = "BUY",
+        stop_distance: Optional[float] = None,
+    ) -> list[tuple[str, float]]:
+        side_norm = str(side).upper()
+        is_sell = side_norm == "SELL" or str(side).strip() == "-1"
+        if stop_distance is not None and stop_distance > 0:
+            r_unit = stop_distance
+        elif atr > 0:
+            r_unit = atr
+        else:
+            r_unit = entry_price * 0.01
+
+        tp1_dist = r_unit * 2
+        tp2_dist = r_unit * 4
+        tp3_dist = r_unit * 6
+
+        if is_sell:
+            return [
+                ("TP1", entry_price - tp1_dist),
+                ("TP2", entry_price - tp2_dist),
+                ("TP3", entry_price - tp3_dist),
+            ]
+
+        return [
+            ("TP1", entry_price + tp1_dist),
+            ("TP2", entry_price + tp2_dist),
+            ("TP3", entry_price + tp3_dist),
+        ]
+
+    def update_trailing_stop(
+        self,
+        current_price: float,
+        high_since_entry: float,
+        atr: float,
+        side: str = "BUY",
+        tp1_hit: bool = False,
+        entry_price: Optional[float] = None,
+    ) -> float:
+        side_norm = str(side).upper()
+        is_sell = side_norm == "SELL" or str(side).strip() == "-1"
+        if atr <= 0:
+            return entry_price if entry_price is not None else current_price
+
+        trail_mult = 1.5 if tp1_hit else 3.0
+        distance = atr * trail_mult
+
+        if not is_sell:
+            trail_stop = high_since_entry - distance
+            if tp1_hit and entry_price is not None:
+                trail_stop = max(trail_stop, entry_price)
+            return trail_stop
+
+        trail_stop = high_since_entry + distance
+        if tp1_hit and entry_price is not None:
+            trail_stop = min(trail_stop, entry_price)
+        return trail_stop
 
     def should_trailing_stop(
         self,
@@ -461,16 +566,28 @@ class Perfect100Strategy:
         entry_price: float,
         atr: float,
         side: str = "BUY",
+        tp1_hit: bool = False,
     ) -> tuple[bool, str]:
-        if side == "BUY":
-            trailing_distance = peak_price - current_price
-            atr_trailing = atr * 2.5
-            if peak_price > entry_price and trailing_distance >= atr_trailing:
+        side_norm = str(side).upper()
+        is_sell = side_norm == "SELL" or str(side).strip() == "-1"
+        trailing_stop = self.update_trailing_stop(
+            current_price=current_price,
+            high_since_entry=peak_price,
+            atr=atr,
+            side=side,
+            tp1_hit=tp1_hit,
+            entry_price=entry_price,
+        )
+
+        if not is_sell:
+            if tp1_hit and current_price <= entry_price and trailing_stop >= entry_price:
+                return True, "TRAIL_BE"
+            if peak_price > entry_price and current_price <= trailing_stop:
                 return True, "TRAIL"
         else:
-            trailing_distance = current_price - peak_price
-            atr_trailing = atr * 2.5
-            if peak_price < entry_price and trailing_distance >= atr_trailing:
+            if tp1_hit and current_price >= entry_price and trailing_stop <= entry_price:
+                return True, "TRAIL_BE"
+            if peak_price < entry_price and current_price >= trailing_stop:
                 return True, "TRAIL"
 
         return False, ""
@@ -480,20 +597,34 @@ class Perfect100Strategy:
         current_price: float,
         entry_price: float,
         atr: float,
+        side: str = "BUY",
+        stop_distance: Optional[float] = None,
     ) -> list[tuple[float, float, int]]:
         levels = []
 
-        tp_prices = [
-            (entry_price * 1.015, 0.30),
-            (entry_price * 1.025, 0.30),
-            (entry_price * 1.035, 0.40),
-        ]
+        targets = self.get_atr_targets(
+            entry_price=entry_price,
+            atr=atr,
+            side=side,
+            stop_distance=stop_distance,
+        )
+        portions = {"TP1": 0.30, "TP2": 0.30, "TP3": 0.40}
+        side_norm = str(side).upper()
+        is_sell = side_norm == "SELL" or str(side).strip() == "-1"
 
-        for tp_price, portion in tp_prices:
-            if current_price >= tp_price:
+        for label, tp_price in targets:
+            portion = portions[label]
+            if (not is_sell and current_price >= tp_price) or (
+                is_sell and current_price <= tp_price
+            ):
                 levels.append((tp_price, portion, int(portion * 100)))
 
         return levels
+
+    def should_time_stop(self, bars_held: int, pnl: float) -> tuple[bool, str]:
+        if bars_held > 12 and pnl < 0.005:
+            return True, "TIME_STOP"
+        return False, ""
 
     def should_stop_loss(
         self,
@@ -502,11 +633,13 @@ class Perfect100Strategy:
         atr: float,
         side: str = "BUY",
     ) -> tuple[bool, str]:
+        side_norm = str(side).upper()
+        is_sell = side_norm == "SELL" or str(side).strip() == "-1"
         gross_pnl = (current_price - entry_price) / entry_price
 
         net_pnl = gross_pnl - self.total_cost_rate
 
-        if side == "SELL":
+        if is_sell:
             net_pnl = -net_pnl
 
         sl_levels = [
@@ -521,9 +654,11 @@ class Perfect100Strategy:
 
         if atr > 0:
             atr_stop = entry_price - (atr * 2)
-            if side == "SELL":
+            if is_sell:
                 atr_stop = entry_price + (atr * 2)
-            if current_price <= atr_stop:
+            if (not is_sell and current_price <= atr_stop) or (
+                is_sell and current_price >= atr_stop
+            ):
                 return True, "ATR_SL"
 
         return False, ""

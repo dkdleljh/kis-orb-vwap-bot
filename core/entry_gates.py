@@ -550,7 +550,32 @@ class EntryGateEvaluator:
             )
             return EntryGateDecision(False, "max_trades_per_symbol", 0, cash, budget)
 
-        if self.engine.state_machine.active_position_count() >= self.engine.max_concurrent_positions:
+        max_concurrent_exposures = max(
+            1, int(tcfg.get("max_concurrent_exposures", 3) or 3)
+        )
+        open_positions = self.engine._active_positions()
+        if len(open_positions) >= max_concurrent_exposures:
+            try:
+                self.engine.event_store.append(
+                    ievents.RiskDecision(
+                        symbol=symbol,
+                        allowed=False,
+                        reason="max_concurrent_exposures",
+                        idempotency_key=idempotency_key,
+                        correlation_id=correlation_id,
+                        module="engine_orb_vwap",
+                    ).to_event(run_id=self.engine.run_id)
+                )
+            except Exception:
+                pass
+            self.engine.logger.warning(
+                "entry blocked by max_concurrent_exposures (%s/%s)",
+                len(open_positions),
+                max_concurrent_exposures,
+            )
+            return EntryGateDecision(False, "max_concurrent_exposures", 0, cash, budget)
+
+        if len(open_positions) >= self.engine.max_concurrent_positions:
             try:
                 self.engine.event_store.append(
                     ievents.RiskDecision(

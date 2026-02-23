@@ -6,7 +6,7 @@ from datetime import datetime
 from types import SimpleNamespace
 
 from core.entry_gates import EntryGateEvaluator
-from models import OrderBookTop
+from models import OrderBookTop, Position
 from strategy_state_machine import Signal, State, StrategyStateMachine
 
 
@@ -165,3 +165,23 @@ def test_entry_gates_slippage_blocklist_blocks_when_active():
     )
     assert out.allowed is False
     assert out.reason == "slippage_blocklist"
+
+
+def test_entry_gates_blocks_when_max_concurrent_exposures_reached():
+    eng = _Engine()
+    eng.config = {"trading": {"max_concurrent_exposures": 3}}
+    eng.state_machine.set_position(Position(symbol="A", qty=1, avg_price=100.0))
+    eng.state_machine.set_position(Position(symbol="B", qty=1, avg_price=100.0))
+    eng.state_machine.set_position(Position(symbol="C", qty=1, avg_price=100.0))
+    evaluator = EntryGateEvaluator(eng)
+
+    out = asyncio.run(
+        evaluator.evaluate(
+            Signal(symbol="INV", side="BUY"),
+            _book("INV"),
+            idempotency_key="k5",
+            correlation_id="c5",
+        )
+    )
+    assert out.allowed is False
+    assert out.reason == "max_concurrent_exposures"

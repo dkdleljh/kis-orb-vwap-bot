@@ -20,6 +20,13 @@ class StrategyProfile:
     entry_threshold: int
 
 
+@dataclass(frozen=True)
+class RegimeMultipliers:
+    min_score: float = 1.0
+    stop_loss_atr: float = 1.0
+    take_profit_atr: float = 1.0
+
+
 # 추천 임계값 (보수적 기준)
 # - KR은 체결/호가 품질이 비교적 안정적이라 SCALP를 약간 낮게
 # - US는 스프레드/슬리피지 리스크가 커서 SCALP는 더 엄격
@@ -28,6 +35,33 @@ RECOMMENDED_PROFILES = {
     ("KR", "SWING"): StrategyProfile("KR", "SWING", entry_threshold=65),
     ("US", "SCALP"): StrategyProfile("US", "SCALP", entry_threshold=75),
     ("US", "SWING"): StrategyProfile("US", "SWING", entry_threshold=68),
+}
+
+REGIME_MULTIPLIERS = {
+    ("KR", "SCALP"): {
+        "BULL": RegimeMultipliers(min_score=0.95, stop_loss_atr=0.95, take_profit_atr=1.10),
+        "BEAR": RegimeMultipliers(min_score=1.10, stop_loss_atr=1.15, take_profit_atr=0.90),
+        "NEUTRAL": RegimeMultipliers(),
+        "RANGE": RegimeMultipliers(min_score=1.05, stop_loss_atr=0.90, take_profit_atr=0.95),
+    },
+    ("KR", "SWING"): {
+        "BULL": RegimeMultipliers(min_score=0.95, stop_loss_atr=0.90, take_profit_atr=1.15),
+        "BEAR": RegimeMultipliers(min_score=1.10, stop_loss_atr=1.20, take_profit_atr=0.85),
+        "NEUTRAL": RegimeMultipliers(),
+        "RANGE": RegimeMultipliers(min_score=1.05, stop_loss_atr=0.95, take_profit_atr=0.90),
+    },
+    ("US", "SCALP"): {
+        "BULL": RegimeMultipliers(min_score=0.95, stop_loss_atr=0.95, take_profit_atr=1.10),
+        "BEAR": RegimeMultipliers(min_score=1.12, stop_loss_atr=1.15, take_profit_atr=0.90),
+        "NEUTRAL": RegimeMultipliers(),
+        "RANGE": RegimeMultipliers(min_score=1.05, stop_loss_atr=0.90, take_profit_atr=0.95),
+    },
+    ("US", "SWING"): {
+        "BULL": RegimeMultipliers(min_score=0.95, stop_loss_atr=0.90, take_profit_atr=1.15),
+        "BEAR": RegimeMultipliers(min_score=1.12, stop_loss_atr=1.20, take_profit_atr=0.85),
+        "NEUTRAL": RegimeMultipliers(),
+        "RANGE": RegimeMultipliers(min_score=1.05, stop_loss_atr=0.95, take_profit_atr=0.90),
+    },
 }
 
 
@@ -67,3 +101,12 @@ def get_recommended_threshold(market: str, style: str) -> int:
         return int(dyn["us_swing"])
 
     return get_base_threshold(m, s)
+
+
+def get_regime_multipliers(market: str, style: str, regime: str) -> RegimeMultipliers:
+    m = market.upper()
+    s = style.upper()
+    r = regime.upper()
+
+    by_profile = REGIME_MULTIPLIERS.get((m, s), {})
+    return by_profile.get(r, by_profile.get("NEUTRAL", RegimeMultipliers()))
