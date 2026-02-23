@@ -1363,10 +1363,9 @@ class TradingEngine:
                 debug_skips = str(os.environ.get("KIS_DEBUG_ENTRY_SKIPS", "0")).strip() in {"1","true","TRUE","yes","YES"}
                 now_ts = time.time()
                 if debug_skips and (now_ts - float(self._skip_last_report_ts or 0.0)) >= 60.0:
-                    if self._skip_reason_counts:
-                        top = sorted(self._skip_reason_counts.items(), key=lambda x: x[1], reverse=True)[:8]
-                        self.logger.info(f"[SKIP-SUMMARY] last~60s: {dict(top)}")
-                        self._skip_reason_counts = defaultdict(int)
+                    top = sorted(self._skip_reason_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+                    self.logger.info(f"[SKIP-SUMMARY] last~60s: {dict(top)}")
+                    self._skip_reason_counts = defaultdict(int)
                     self._skip_last_report_ts = now_ts
             except Exception:
                 pass
