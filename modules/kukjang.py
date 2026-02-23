@@ -161,8 +161,9 @@ class KukjangModule(BaseTradingModule):
             is_overseas=False,
         )
 
-        # scoring threshold (recommended)
-        scoring_cfg = (config.get("scoring", {}) or {})
+        # scoring threshold
+        # Prefer config.trading.scoring.* (shared across engine/modules).
+        scoring_cfg = ((config.get("trading", {}) or {}).get("scoring", {}) or {})
         kr_scalp_th = int(scoring_cfg.get("kr_scalp_entry_threshold", 72))
 
         self.perfect_strategy = Perfect100Strategy(
