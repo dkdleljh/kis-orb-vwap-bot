@@ -103,6 +103,13 @@ class FillMsg:
 
 
 async def _fetch_fills() -> list[dict]:
+    """Fetch fills from broker.
+
+    KIS inquire-ccnl can behave inconsistently when PDNO is omitted. To improve
+    reliability, we query per-symbol based on current health snapshot (positions +
+    monitored universe) and merge results.
+    """
+
     # Local imports to avoid module overhead when called by cron
     from kis_auth import KISAuth, load_auth_from_env
     from kis_rest_orders import AccountInfo, KISRestOrders
@@ -121,6 +128,28 @@ async def _fetch_fills() -> list[dict]:
     if not acct_no or not acct_prdt:
         return []
 
+    # Collect symbols to query
+    symbols: list[str] = []
+    try:
+        health_path = ROOT / "logs" / "health_status.json"
+        if health_path.exists():
+            h = json.loads(health_path.read_text(encoding="utf-8"))
+            # positions
+            for p in h.get("positions") or []:
+                s = str(p.get("symbol") or "").strip()
+                if s:
+                    symbols.append(s)
+            # monitored universe
+            for s in h.get("symbols") or []:
+                s = str(s).strip()
+                if s:
+                    symbols.append(s)
+    except Exception:
+        pass
+
+    # de-dupe + cap
+    symbols = list(dict.fromkeys([s for s in symbols if s]))[:25]
+
     auth = KISAuth(base_url, app_key, app_secret, logger)
     account = AccountInfo(account_no=acct_no, product_code=acct_prdt)
     rest = KISRestOrders(base_url, auth, account, logger)
@@ -128,8 +157,24 @@ async def _fetch_fills() -> list[dict]:
     try:
         end = datetime.now(KST).strftime("%Y%m%d")
         start = (datetime.now(KST) - timedelta(days=2)).strftime("%Y%m%d")
-        fills = await rest.get_fills(start_date=start, end_date=end)
-        return fills or []
+
+        merged: list[dict] = []
+        seen_ids: set[str] = set()
+
+        for sym in symbols or [None]:
+            try:
+                fills = await rest.get_fills(symbol=sym, start_date=start, end_date=end)
+            except Exception:
+                fills = []
+            for f in fills or []:
+                fid = str(f.get("fill_id") or "")
+                if fid and fid in seen_ids:
+                    continue
+                if fid:
+                    seen_ids.add(fid)
+                merged.append(f)
+
+        return merged
     finally:
         try:
             await rest.aclose()
