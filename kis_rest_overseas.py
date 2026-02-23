@@ -19,9 +19,11 @@ from typing import Optional, Any
 import aiohttp
 import asyncio
 import json
+import random
 
 from models import OrderResult, Position
 from kis_rest_orders import AccountInfo
+from core.rate_limiter import get_global_rate_limiter
 
 
 # KIS exchange codes:
@@ -88,6 +90,7 @@ class KISOverseasRestOrders:
         self._timeout = aiohttp.ClientTimeout(total=timeout_sec)
         self._external_session = session is not None
         self._session: aiohttp.ClientSession | None = session
+        self._rate_limiter = get_global_rate_limiter()
 
     async def aclose(self) -> None:
         if self._session and not self._external_session and not self._session.closed:
@@ -112,6 +115,96 @@ class KISOverseasRestOrders:
             self.logger.error(f"{context} failed: rt_cd={rt_cd} msg={msg}")
             return msg
         return None
+
+    @staticmethod
+    def _is_rate_limit_error(data: dict) -> bool:
+        msg_cd = str(data.get("msg_cd", "") or "")
+        msg1 = str(data.get("msg1", "") or "")
+        merged = f"{msg_cd} {msg1}"
+        return ("EGW00201" in merged) or ("초당" in merged)
+
+    @staticmethod
+    def _is_cancel_retry_error(data: dict) -> bool:
+        msg_cd = str(data.get("msg_cd", "") or "")
+        msg1 = str(data.get("msg1", "") or "")
+        merged = f"{msg_cd} {msg1}"
+        return "IGW00019" in merged
+
+    @staticmethod
+    def _retry_delay(attempt: int, *, base: float = 0.5, cap: float = 8.0) -> float:
+        jitter = random.uniform(0.0, 0.35)
+        return min(cap, base * (2 ** max(0, attempt))) + jitter
+
+    async def _request_json(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: dict | None = None,
+        headers: dict | None = None,
+        data_payload: str | None = None,
+        context: str,
+        max_attempts: int = 1,
+        retry_on_rate_limit: bool = False,
+        retry_on_cancel_error: bool = False,
+        retry_on_transport: bool = False,
+    ) -> dict:
+        session = await self._get_session()
+        last_data: dict | None = None
+
+        for attempt in range(max(1, int(max_attempts))):
+            try:
+                await self._rate_limiter.acquire()
+                async with session.request(
+                    method=method.upper(),
+                    url=url,
+                    params=params,
+                    headers=headers,
+                    data=data_payload,
+                ) as resp:
+                    try:
+                        data = await resp.json()
+                    except Exception:
+                        text = await resp.text()
+                        try:
+                            data = json.loads(text) if text else {}
+                        except Exception:
+                            data = {
+                                "rt_cd": "1",
+                                "msg_cd": f"HTTP{resp.status}",
+                                "msg1": text[:200],
+                            }
+            except aiohttp.ClientError as e:
+                if retry_on_transport and attempt < (max_attempts - 1):
+                    wait = self._retry_delay(attempt)
+                    self.logger.warning(
+                        f"{context} transport retry {attempt + 1}/{max_attempts} in {wait:.2f}s: {e}"
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                raise
+
+            if not isinstance(data, dict):
+                data = {}
+            last_data = data
+
+            should_retry = False
+            if retry_on_rate_limit and self._is_rate_limit_error(data):
+                should_retry = True
+            if retry_on_cancel_error and self._is_cancel_retry_error(data):
+                should_retry = True
+
+            if should_retry and attempt < (max_attempts - 1):
+                wait = self._retry_delay(attempt)
+                self.logger.warning(
+                    f"{context} retryable broker error {attempt + 1}/{max_attempts} in {wait:.2f}s: msg_cd={data.get('msg_cd')} msg={data.get('msg1')}"
+                )
+                await asyncio.sleep(wait)
+                continue
+
+            return data
+
+        return last_data or {}
 
     def _get_tr_id(self, endpoint: str, is_paper: bool = False) -> str:
         tr_id_map = {
@@ -197,14 +290,17 @@ class KISOverseasRestOrders:
             return OrderResult(order_id="", filled_qty=0, status=f"hashkey_error: {e}")
 
         try:
-            session = await self._get_session()
             body = json.dumps(payload)
-            async with session.post(url, data=body, headers=headers) as resp:
-                try:
-                    data = await resp.json()
-                except Exception:
-                    text = await resp.text()
-                    return OrderResult(order_id="", filled_qty=0, status=f"http={resp.status} non-json: {text[:200]}")
+            data = await self._request_json(
+                "POST",
+                url,
+                data_payload=body,
+                headers=headers,
+                context=f"overseas_buy({symbol})",
+                max_attempts=4,
+                retry_on_rate_limit=True,
+                retry_on_transport=True,
+            )
 
             err = self._check_error(data, f"overseas_buy({symbol})")
             if err:
@@ -258,20 +354,28 @@ class KISOverseasRestOrders:
 
         headers = await self._auth_headers()
         headers.update({"tr_id": self._get_tr_id("order_sell"), "custtype": "P"})
-        try:
-            headers["hashkey"] = await self.auth.hashkey(payload)
-        except Exception as e:
-            return OrderResult(order_id="", filled_qty=0, status=f"hashkey_error: {e}")
 
         try:
-            session = await self._get_session()
-
             last_err: str | None = None
             for payload in payload_variants:
                 try:
+                    hdrs = dict(headers)
+                    try:
+                        hdrs["hashkey"] = await self.auth.hashkey(payload)
+                    except Exception as e:
+                        return OrderResult(order_id="", filled_qty=0, status=f"hashkey_error: {e}")
+
                     body = json.dumps(payload)
-                    async with session.post(url, data=body, headers=headers) as resp:
-                        data = await resp.json()
+                    data = await self._request_json(
+                        "POST",
+                        url,
+                        data_payload=body,
+                        headers=hdrs,
+                        context=f"overseas_sell({symbol})",
+                        max_attempts=4,
+                        retry_on_rate_limit=True,
+                        retry_on_transport=True,
+                    )
 
                     err = self._check_error(data, f"overseas_sell({symbol})")
                     if err:
@@ -322,10 +426,18 @@ class KISOverseasRestOrders:
             return False
 
         try:
-            session = await self._get_session()
             body = json.dumps(payload)
-            async with session.post(url, data=body, headers=headers) as resp:
-                data = await resp.json()
+            data = await self._request_json(
+                "POST",
+                url,
+                data_payload=body,
+                headers=headers,
+                context=f"overseas_cancel({order_id})",
+                max_attempts=4,
+                retry_on_rate_limit=True,
+                retry_on_cancel_error=True,
+                retry_on_transport=True,
+            )
 
             err = self._check_error(data, f"overseas_cancel({order_id})")
             if err:
@@ -370,7 +482,6 @@ class KISOverseasRestOrders:
         nk200 = ""
         out_rows: list[dict] = []
 
-        session = await self._get_session()
         for _ in range(max(1, int(max_pages))):
             params = {
                 "CANO": self.account.account_no,
@@ -380,8 +491,16 @@ class KISOverseasRestOrders:
                 "CTX_AREA_FK200": fk200,
                 "CTX_AREA_NK200": nk200,
             }
-            async with session.get(url, headers=headers, params=params) as resp:
-                data = await resp.json()
+            data = await self._request_json(
+                "GET",
+                url,
+                params=params,
+                headers=headers,
+                context=f"inquire_nccs({exchange})",
+                max_attempts=4,
+                retry_on_rate_limit=True,
+                retry_on_transport=True,
+            )
 
             err = self._check_error(data, f"inquire_nccs({exchange})")
             if err:
@@ -430,7 +549,6 @@ class KISOverseasRestOrders:
         nk200 = ""
         out_rows: list[dict] = []
 
-        session = await self._get_session()
         for _ in range(max(1, int(max_pages))):
             params = {
                 "CANO": self.account.account_no,
@@ -443,8 +561,16 @@ class KISOverseasRestOrders:
                 "CTX_AREA_FK200": fk200,
                 "CTX_AREA_NK200": nk200,
             }
-            async with session.get(url, headers=headers, params=params) as resp:
-                data = await resp.json()
+            data = await self._request_json(
+                "GET",
+                url,
+                params=params,
+                headers=headers,
+                context=f"order_resv_list_us({exchange})",
+                max_attempts=4,
+                retry_on_rate_limit=True,
+                retry_on_transport=True,
+            )
 
             err = self._check_error(data, f"order_resv_list_us({exchange})")
             if err:
@@ -495,9 +621,16 @@ class KISOverseasRestOrders:
         except Exception:
             pass
 
-        session = await self._get_session()
-        async with session.post(url, data=json.dumps(payload), headers=headers) as resp:
-            data = await resp.json()
+        data = await self._request_json(
+            "POST",
+            url,
+            data_payload=json.dumps(payload),
+            headers=headers,
+            context="order_resv_ccnl_us",
+            max_attempts=4,
+            retry_on_rate_limit=True,
+            retry_on_transport=True,
+        )
 
         # best-effort error logging
         self._check_error(data, "order_resv_ccnl_us")
@@ -513,9 +646,15 @@ class KISOverseasRestOrders:
         headers = await self._auth_headers()
         headers.update({"tr_id": self._get_tr_id("dayornight"), "custtype": "P"})
         try:
-            session = await self._get_session()
-            async with session.get(url, headers=headers) as resp:
-                data = await resp.json()
+            data = await self._request_json(
+                "GET",
+                url,
+                headers=headers,
+                context="overseas_dayornight",
+                max_attempts=4,
+                retry_on_rate_limit=True,
+                retry_on_transport=True,
+            )
             err = self._check_error(data, "overseas_dayornight")
             if err:
                 return None
@@ -548,31 +687,28 @@ class KISOverseasRestOrders:
         ]
 
         try:
-            session = await self._get_session()
             last_err = None
             for tr_id, params in variants:
                 headers = await self._auth_headers()
                 headers.update({"tr_id": tr_id, "custtype": "P"})
 
-                # Retry on rate-limit (EGW00201)
-                for attempt in range(4):
-                    async with session.get(url, params=params, headers=headers) as resp:
-                        data = await resp.json()
+                data = await self._request_json(
+                    "GET",
+                    url,
+                    params=params,
+                    headers=headers,
+                    context=f"overseas_get_balance[{tr_id}]",
+                    max_attempts=4,
+                    retry_on_rate_limit=True,
+                    retry_on_transport=True,
+                )
 
-                    err = self._check_error(data, f"overseas_get_balance[{tr_id}]")
-                    if err:
-                        if "EGW00201" in err or "초당" in err:
-                            wait = 1 * (2**attempt)
-                            self.logger.warning(f"overseas_get_balance rate-limited. retry in {wait}s: {err}")
-                            await asyncio.sleep(wait)
-                            continue
-                        last_err = err
-                        break
-
-                    return data
-
-                if last_err:
+                err = self._check_error(data, f"overseas_get_balance[{tr_id}]")
+                if err:
+                    last_err = err
                     continue
+
+                return data
 
             if last_err:
                 self.logger.warning(f"overseas_get_balance failed after variants: {last_err}")
@@ -677,7 +813,6 @@ class KISOverseasRestOrders:
         url = f"{self.base_url}/uapi/overseas-stock/v1/trading/inquire-psamount"
 
         try:
-            session = await self._get_session()
             last_err = None
             resolved_ex = self._resolve_exchange(symbol)
             exchange_candidates: list[str] = [resolved_ex, "NASD", "NYSE", "AMEX"]
@@ -730,60 +865,59 @@ class KISOverseasRestOrders:
 
                         for params in base_variants:
                             # Many examples use POST; some expect query params.
-                            for attempt in range(4):
-                                async with session.post(url, params=params, headers=headers) as resp:
-                                    data = await resp.json()
+                            data = await self._request_json(
+                                "POST",
+                                url,
+                                params=params,
+                                headers=headers,
+                                context=f"overseas_get_cash_available[{tr}]",
+                                max_attempts=4,
+                                retry_on_rate_limit=True,
+                                retry_on_transport=True,
+                            )
 
-                                err = self._check_error(data, f"overseas_get_cash_available[{tr}]")
-                                if err:
-                                    if "EGW00201" in err or "초당" in err:
-                                        wait = 1 * (2**attempt)
-                                        self.logger.warning(
-                                            f"overseas_get_cash_available rate-limited. retry in {wait}s: {err}"
-                                        )
-                                        await asyncio.sleep(wait)
-                                        continue
+                            err = self._check_error(data, f"overseas_get_cash_available[{tr}]")
+                            if err:
+                                # For rt_cd=7 "상품이 없습니다", continue trying exchange/day-night variants.
+                                msg = str(data.get("msg1") or "")
+                                rt_cd = str(data.get("rt_cd") or "")
+                                if rt_cd == "7" and ("상품이 없습니다" in msg or "상품이 없" in msg):
+                                    last_err = f"rt_cd={rt_cd} msg={msg}"
+                                    continue
 
-                                    # For rt_cd=7 "상품이 없습니다", continue trying exchange/day-night variants.
-                                    msg = str(data.get("msg1") or "")
-                                    rt_cd = str(data.get("rt_cd") or "")
-                                    if rt_cd == "7" and ("상품이 없습니다" in msg or "상품이 없" in msg):
-                                        last_err = f"rt_cd={rt_cd} msg={msg}"
-                                        break
+                                last_err = err
+                                continue
 
-                                    last_err = err
-                                    break
-
-                                out = data.get("output", {}) or {}
-                                cash = 0.0
-                                for k in ("ovrs_ord_psbl_amt", "ord_psbl_cash", "psbl_cash"):
-                                    v = out.get(k)
-                                    if v not in (None, ""):
-                                        try:
-                                            cash = float(v)
-                                            break
-                                        except Exception:
-                                            continue
-
-                                ord_psbl_qty: int | None = None
-                                for k in ("ord_psbl_qty", "ovrs_ord_psbl_qty", "psbl_qty"):
-                                    v = out.get(k)
-                                    if v in (None, ""):
-                                        continue
+                            out = data.get("output", {}) or {}
+                            cash = 0.0
+                            for k in ("ovrs_ord_psbl_amt", "ord_psbl_cash", "psbl_cash"):
+                                v = out.get(k)
+                                if v not in (None, ""):
                                     try:
-                                        ord_psbl_qty = int(float(v))
+                                        cash = float(v)
                                         break
                                     except Exception:
                                         continue
 
-                                return {
-                                    "cash_available": cash,
-                                    "ord_psbl_qty": ord_psbl_qty,
-                                    "err": None,
-                                    "exchange": ex,
-                                    "day_or_night": dn,
-                                    "tr_id": tr,
-                                }
+                            ord_psbl_qty: int | None = None
+                            for k in ("ord_psbl_qty", "ovrs_ord_psbl_qty", "psbl_qty"):
+                                v = out.get(k)
+                                if v in (None, ""):
+                                    continue
+                                try:
+                                    ord_psbl_qty = int(float(v))
+                                    break
+                                except Exception:
+                                    continue
+
+                            return {
+                                "cash_available": cash,
+                                "ord_psbl_qty": ord_psbl_qty,
+                                "err": None,
+                                "exchange": ex,
+                                "day_or_night": dn,
+                                "tr_id": tr,
+                            }
 
             if last_err:
                 self.logger.warning(f"overseas_get_cash_available failed after variants: {last_err}")
@@ -827,7 +961,6 @@ class KISOverseasRestOrders:
         candidates = [primary, "NASD", "NYSE", "AMEX"]
 
         try:
-            session = await self._get_session()
             last_exc: Exception | None = None
             for ex in candidates:
                 if not ex or ex in tried:
@@ -835,8 +968,16 @@ class KISOverseasRestOrders:
                 tried.append(ex)
                 params = {"EXCD": self._quote_excd(ex), "SYMB": symbol}
                 try:
-                    async with session.get(url, params=params, headers=headers) as resp:
-                        data = await resp.json()
+                    data = await self._request_json(
+                        "GET",
+                        url,
+                        params=params,
+                        headers=headers,
+                        context=f"overseas_get_quote({symbol})[{ex}]",
+                        max_attempts=4,
+                        retry_on_rate_limit=True,
+                        retry_on_transport=True,
+                    )
                     # success heuristic
                     if isinstance(data, dict) and str(data.get("rt_cd", "0")) == "0":
                         self._symbol_exchange_cache[symbol.strip().upper()] = ex

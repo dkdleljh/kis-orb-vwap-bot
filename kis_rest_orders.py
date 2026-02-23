@@ -5,8 +5,11 @@ from typing import Dict, Optional
 
 import aiohttp
 import asyncio
+import json
+import random
 
 from models import OrderResult, Position
+from core.rate_limiter import get_global_rate_limiter
 
 
 def _validate_symbol(symbol: str) -> None:
@@ -61,6 +64,7 @@ class KISRestOrders:
 
         self._external_session = session is not None
         self._session: aiohttp.ClientSession | None = session
+        self._rate_limiter = get_global_rate_limiter()
 
     async def aclose(self) -> None:
         """Close internally-owned session."""
@@ -93,6 +97,98 @@ class KISRestOrders:
             return msg
         return None
 
+    @staticmethod
+    def _is_rate_limit_error(data: dict) -> bool:
+        msg_cd = str(data.get("msg_cd", "") or "")
+        msg1 = str(data.get("msg1", "") or "")
+        merged = f"{msg_cd} {msg1}"
+        return ("EGW00201" in merged) or ("초당" in merged)
+
+    @staticmethod
+    def _is_cancel_retry_error(data: dict) -> bool:
+        msg_cd = str(data.get("msg_cd", "") or "")
+        msg1 = str(data.get("msg1", "") or "")
+        merged = f"{msg_cd} {msg1}"
+        return "IGW00019" in merged
+
+    @staticmethod
+    def _retry_delay(attempt: int, *, base: float = 0.5, cap: float = 8.0) -> float:
+        jitter = random.uniform(0.0, 0.35)
+        return min(cap, base * (2 ** max(0, attempt))) + jitter
+
+    async def _request_json(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: dict | None = None,
+        headers: dict | None = None,
+        json_payload: dict | None = None,
+        data_payload: str | None = None,
+        context: str,
+        max_attempts: int = 1,
+        retry_on_rate_limit: bool = False,
+        retry_on_cancel_error: bool = False,
+        retry_on_transport: bool = False,
+    ) -> dict:
+        session = await self._get_session()
+        last_data: dict | None = None
+
+        for attempt in range(max(1, int(max_attempts))):
+            try:
+                await self._rate_limiter.acquire()
+                async with session.request(
+                    method=method.upper(),
+                    url=url,
+                    params=params,
+                    headers=headers,
+                    json=json_payload,
+                    data=data_payload,
+                ) as resp:
+                    try:
+                        data = await resp.json()
+                    except Exception:
+                        text = await resp.text()
+                        try:
+                            data = json.loads(text) if text else {}
+                        except Exception:
+                            data = {
+                                "rt_cd": "1",
+                                "msg_cd": f"HTTP{resp.status}",
+                                "msg1": text[:200],
+                            }
+            except aiohttp.ClientError as e:
+                if retry_on_transport and attempt < (max_attempts - 1):
+                    wait = self._retry_delay(attempt)
+                    self.logger.warning(
+                        f"{context} transport retry {attempt + 1}/{max_attempts} in {wait:.2f}s: {e}"
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                raise
+
+            if not isinstance(data, dict):
+                data = {}
+            last_data = data
+
+            should_retry = False
+            if retry_on_rate_limit and self._is_rate_limit_error(data):
+                should_retry = True
+            if retry_on_cancel_error and self._is_cancel_retry_error(data):
+                should_retry = True
+
+            if should_retry and attempt < (max_attempts - 1):
+                wait = self._retry_delay(attempt)
+                self.logger.warning(
+                    f"{context} retryable broker error {attempt + 1}/{max_attempts} in {wait:.2f}s: msg_cd={data.get('msg_cd')} msg={data.get('msg1')}"
+                )
+                await asyncio.sleep(wait)
+                continue
+
+            return data
+
+        return last_data or {}
+
     async def place_buy_limit(self, symbol: str, qty: int, price: float) -> OrderResult:
         _validate_symbol(symbol)
         _validate_positive_int(qty, "Quantity")
@@ -111,9 +207,16 @@ class KISRestOrders:
         headers.update({"tr_id": "TTTC0802U", "custtype": "P"})
 
         try:
-            session = await self._get_session()
-            async with session.post(url, json=payload, headers=headers) as resp:
-                data = await resp.json()
+            data = await self._request_json(
+                "POST",
+                url,
+                json_payload=payload,
+                headers=headers,
+                context=f"buy_limit({symbol})",
+                max_attempts=4,
+                retry_on_rate_limit=True,
+                retry_on_transport=True,
+            )
 
             err = self._check_error(data, f"buy_limit({symbol})")
             if err:
@@ -148,9 +251,16 @@ class KISRestOrders:
         headers.update({"tr_id": "TTTC0801U", "custtype": "P"})
 
         try:
-            session = await self._get_session()
-            async with session.post(url, json=payload, headers=headers) as resp:
-                data = await resp.json()
+            data = await self._request_json(
+                "POST",
+                url,
+                json_payload=payload,
+                headers=headers,
+                context=f"sell_limit({symbol})",
+                max_attempts=4,
+                retry_on_rate_limit=True,
+                retry_on_transport=True,
+            )
 
             err = self._check_error(data, f"sell_limit({symbol})")
             if err:
@@ -182,9 +292,16 @@ class KISRestOrders:
         headers.update({"tr_id": "TTTC0801U", "custtype": "P"})
 
         try:
-            session = await self._get_session()
-            async with session.post(url, json=payload, headers=headers) as resp:
-                data = await resp.json()
+            data = await self._request_json(
+                "POST",
+                url,
+                json_payload=payload,
+                headers=headers,
+                context=f"sell_market({symbol})",
+                max_attempts=4,
+                retry_on_rate_limit=True,
+                retry_on_transport=True,
+            )
 
             err = self._check_error(data, f"sell_market({symbol})")
             if err:
@@ -217,9 +334,17 @@ class KISRestOrders:
         headers.update({"tr_id": "TTTC0803U", "custtype": "P"})
 
         try:
-            session = await self._get_session()
-            async with session.post(url, json=payload, headers=headers) as resp:
-                data = await resp.json()
+            data = await self._request_json(
+                "POST",
+                url,
+                json_payload=payload,
+                headers=headers,
+                context=f"cancel_order({order_id})",
+                max_attempts=4,
+                retry_on_rate_limit=True,
+                retry_on_cancel_error=True,
+                retry_on_transport=True,
+            )
 
             err = self._check_error(data, f"cancel_order({order_id})")
             if err:
@@ -241,28 +366,22 @@ class KISRestOrders:
 
         # Retry on rate-limit (EGW00201)
         try:
-            session = await self._get_session()
-            for attempt in range(4):
-                headers = await self._auth_headers()
-                headers.update({"tr_id": "TTTC8434R", "custtype": "P"})
+            headers = await self._auth_headers()
+            headers.update({"tr_id": "TTTC8434R", "custtype": "P"})
+            data = await self._request_json(
+                "GET",
+                url,
+                params=params,
+                headers=headers,
+                context="get_positions",
+                max_attempts=4,
+                retry_on_rate_limit=True,
+                retry_on_transport=True,
+            )
 
-                async with session.get(url, params=params, headers=headers) as resp:
-                    data = await resp.json()
-
-                err = self._check_error(data, "get_positions")
-                if err:
-                    if "EGW00201" in err or "초당" in err:
-                        # backoff: 1s,2s,4s
-                        wait = 1 * (2**attempt)
-                        self.logger.warning(f"get_positions rate-limited. retry in {wait}s: {err}")
-                        await asyncio.sleep(wait)
-                        continue
-                    self.logger.error(f"get_positions failed: {err}")
-                    return None
-
-                # success
-                break
-            else:
+            err = self._check_error(data, "get_positions")
+            if err:
+                self.logger.error(f"get_positions failed: {err}")
                 return None
 
             outputs = data.get("output1", [])
@@ -304,9 +423,16 @@ class KISRestOrders:
 
         positions: Dict[str, Dict[str, any]] = {}
         try:
-            session = await self._get_session()
-            async with session.get(url, params=params, headers=headers) as resp:
-                data = await resp.json()
+            data = await self._request_json(
+                "GET",
+                url,
+                params=params,
+                headers=headers,
+                context="get_all_positions",
+                max_attempts=4,
+                retry_on_rate_limit=True,
+                retry_on_transport=True,
+            )
 
             err = self._check_error(data, "get_all_positions")
             if err:
@@ -377,42 +503,19 @@ class KISRestOrders:
             return 0.0
 
         try:
-            session = await self._get_session()
             last_err = None
             for key_name, params in params_variants:
                 try:
-                    # Retry on rate-limit (EGW00201)
-                    for attempt in range(4):
-                        async with session.get(url, params=params, headers=headers) as resp:
-                            try:
-                                data = await resp.json()
-                            except Exception:
-                                text = await resp.text()
-                                self.logger.error(
-                                    f"get_cash_available({key_name}) non-json resp: status={resp.status} text={text[:200]}"
-                                )
-                                data = None
-
-                        if not isinstance(data, dict):
-                            break
-
-                        rt_cd = str(data.get("rt_cd", "1"))
-                        if rt_cd == "0":
-                            return await _parse_cash(data)
-
-                        msg_cd = str(data.get("msg_cd", "") or "")
-                        msg1 = str(data.get("msg1", "") or "")
-                        msg = msg1 or msg_cd or "Unknown"
-                        err = f"rt_cd={rt_cd} msg_cd={msg_cd} msg={msg}"
-
-                        if "EGW00201" in err or "초당" in err:
-                            wait = 1 * (2**attempt)
-                            self.logger.warning(f"get_cash_available rate-limited. retry in {wait}s: {err}")
-                            await asyncio.sleep(wait)
-                            continue
-
-                        # fallthrough to variant handling
-                        break
+                    data = await self._request_json(
+                        "GET",
+                        url,
+                        params=params,
+                        headers=headers,
+                        context=f"get_cash_available({key_name})",
+                        max_attempts=4,
+                        retry_on_rate_limit=True,
+                        retry_on_transport=True,
+                    )
 
                     # if we reached here, data contains an error that wasn't rate-limit handled
                     if not isinstance(data, dict):
@@ -423,6 +526,9 @@ class KISRestOrders:
                     msg1 = str(data.get("msg1", "") or "")
                     msg = msg1 or msg_cd or "Unknown"
                     err = f"rt_cd={rt_cd} msg_cd={msg_cd} msg={msg}"
+
+                    if rt_cd == "0":
+                        return await _parse_cash(data)
 
                     if "INPUT_FIELD_NAME" in msg or "INPUT" in msg:
                         self.logger.warning(
@@ -456,9 +562,16 @@ class KISRestOrders:
         headers.update({"tr_id": "FHKST01010100"})
 
         try:
-            session = await self._get_session()
-            async with session.get(url, params=params, headers=headers) as resp:
-                data = await resp.json()
+            data = await self._request_json(
+                "GET",
+                url,
+                params=params,
+                headers=headers,
+                context=f"get_quote({symbol})",
+                max_attempts=4,
+                retry_on_rate_limit=True,
+                retry_on_transport=True,
+            )
             return data
         except Exception as e:
             self.logger.error(f"get_quote({symbol}) exception: {e}")
@@ -494,9 +607,16 @@ class KISRestOrders:
         }
 
         try:
-            session = await self._get_session()
-            async with session.get(url, params=params, headers=headers) as resp:
-                data = await resp.json()
+            data = await self._request_json(
+                "GET",
+                url,
+                params=params,
+                headers=headers,
+                context="get_open_orders",
+                max_attempts=3,
+                retry_on_rate_limit=True,
+                retry_on_transport=True,
+            )
 
             err = self._check_error(data, "get_open_orders")
             if err:
@@ -575,21 +695,16 @@ class KISRestOrders:
             params["PDNO"] = symbol
 
         try:
-            session = await self._get_session()
-            async with session.get(url, params=params, headers=headers) as resp:
-                # KIS sometimes returns JSON with missing/incorrect content-type.
-                data = None
-                try:
-                    data = await resp.json()
-                except Exception:
-                    try:
-                        text = await resp.text()
-                        if text:
-                            import json as _json
-                            data = _json.loads(text)
-                    except Exception:
-                        # Broker outage / non-json: treat as no fills.
-                        return []
+            data = await self._request_json(
+                "GET",
+                url,
+                params=params,
+                headers=headers,
+                context="get_fills",
+                max_attempts=3,
+                retry_on_rate_limit=True,
+                retry_on_transport=True,
+            )
 
             if not isinstance(data, dict):
                 return []

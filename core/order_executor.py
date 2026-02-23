@@ -44,6 +44,7 @@ class OrderExecutor:
 
     def __init__(self, engine: _EngineLike) -> None:
         self.engine = engine
+        self._exit_cooldown_until: dict[str, float] = {}
 
     def _execution_cfg(self) -> dict:
         return (
@@ -60,6 +61,52 @@ class OrderExecutor:
             .get("slippage_guard", {})
             or {}
         )
+
+    @staticmethod
+    def _is_sell_open_order(symbol: str, row: dict) -> bool:
+        if not isinstance(row, dict):
+            return False
+        sym = str(
+            row.get("pdno")
+            or row.get("PDNO")
+            or row.get("ovrs_pdno")
+            or row.get("OVRS_PDNO")
+            or ""
+        ).strip()
+        if sym != symbol:
+            return False
+
+        side_raw = str(
+            row.get("sll_buy_dvsn_cd")
+            or row.get("SLL_BUY_DVSN_CD")
+            or row.get("sll_buy_dvsn")
+            or row.get("SLL_BUY_DVSN")
+            or row.get("side")
+            or row.get("SIDE")
+            or ""
+        ).strip().upper()
+        is_sell = side_raw in {"01", "1", "SELL", "S"}
+        if not is_sell:
+            return False
+
+        for key in (
+            "rmn_qty",
+            "RMN_QTY",
+            "ord_psbl_qty",
+            "ORD_PSBL_QTY",
+            "unfilled_qty",
+            "UNFILLED_QTY",
+            "ord_qty",
+            "ORD_QTY",
+        ):
+            v = row.get(key)
+            if v in (None, ""):
+                continue
+            try:
+                return int(float(v)) > 0
+            except Exception:
+                continue
+        return True
 
     @staticmethod
     def _slippage_bps(*, side: str, expected: float, filled: float) -> float | None:
@@ -336,20 +383,32 @@ class OrderExecutor:
         idempotency_key: str,
         correlation_id: str,
     ) -> None:
-        self.engine.event_store.append(
-            ievents.OrderIntent(
-                symbol=symbol,
-                side="SELL",
-                qty=int(pos.qty),
-                order_type="MKT" if use_market else "LMT",
-                limit_price=None,
-                idempotency_key=idempotency_key,
-                correlation_id=correlation_id,
-                module="engine_orb_vwap",
-            ).to_event(run_id=self.engine.run_id)
-        )
+        ecfg = self._execution_cfg()
+        cooldown_sec = max(3.0, float(ecfg.get("exit_fail_cooldown_sec", 20.0) or 20.0))
+        now_mono = time.monotonic()
+        cooldown_until = float(self._exit_cooldown_until.get(symbol, 0.0) or 0.0)
+        if now_mono < cooldown_until:
+            self.engine.logger.warning(
+                "exit skipped by cooldown symbol=%s remain=%.1fs reason=%s",
+                symbol,
+                cooldown_until - now_mono,
+                reason,
+            )
+            return
 
         if not self.engine.live_ordering_enabled():
+            self.engine.event_store.append(
+                ievents.OrderIntent(
+                    symbol=symbol,
+                    side="SELL",
+                    qty=int(pos.qty),
+                    order_type="MKT" if use_market else "LMT",
+                    limit_price=None,
+                    idempotency_key=idempotency_key,
+                    correlation_id=correlation_id,
+                    module="engine_orb_vwap",
+                ).to_event(run_id=self.engine.run_id)
+            )
             exit_price = self.engine.last_price.get(symbol, pos.avg_price)
             gross_pnl_pct = (
                 (exit_price - pos.avg_price) / pos.avg_price if pos.avg_price else 0.0
@@ -410,7 +469,31 @@ class OrderExecutor:
             )
             return
 
-        ecfg = self._execution_cfg()
+        try:
+            open_orders = await self.engine.rest.get_open_orders()
+        except Exception:
+            open_orders = []
+        if any(self._is_sell_open_order(symbol, row) for row in (open_orders or [])):
+            self.engine.logger.warning(
+                "exit skipped: existing open SELL order detected symbol=%s reason=%s",
+                symbol,
+                reason,
+            )
+            return
+
+        self.engine.event_store.append(
+            ievents.OrderIntent(
+                symbol=symbol,
+                side="SELL",
+                qty=int(pos.qty),
+                order_type="MKT" if use_market else "LMT",
+                limit_price=None,
+                idempotency_key=idempotency_key,
+                correlation_id=correlation_id,
+                module="engine_orb_vwap",
+            ).to_event(run_id=self.engine.run_id)
+        )
+
         smart_limit_exit = bool(ecfg.get("enable_smart_limit_exit", False))
         exit_retry_limit = max(1, int(ecfg.get("exit_retry_limit", 2) or 2))
         exit_poll_sec = max(0.2, float(ecfg.get("exit_poll_sec", 2.0) or 2.0))
@@ -546,3 +629,13 @@ class OrderExecutor:
             self.engine.logger.info(
                 "exit done symbol=%s reason=%s pnl=%.4f", symbol, reason, pnl_pct
             )
+            self._exit_cooldown_until.pop(symbol, None)
+            return
+
+        self._exit_cooldown_until[symbol] = time.monotonic() + cooldown_sec
+        self.engine.logger.warning(
+            "exit failed; cooldown set symbol=%s cooldown=%.1fs reason=%s",
+            symbol,
+            cooldown_sec,
+            reason,
+        )

@@ -48,8 +48,8 @@
     "atr_multiplier": 2.7,
     "enable_time_filter": true,
     "scoring": {
-      "kr_scalp_entry_threshold": 77.0,
-      "kr_swing_entry_threshold": 65,
+      "kr_scalp_entry_threshold": 50,
+      "kr_swing_entry_threshold": 50,
       "us_scalp_entry_threshold": 75,
       "us_swing_entry_threshold": 68
     },
@@ -72,7 +72,7 @@
     "news_safety_mode": true,
     "enable_dynamic_ml_threshold": true,
     "microstructure_filter": {
-      "enabled": true,
+      "enabled": false,
       "max_spread_pct": 0.006,
       "max_book_age_sec": 6.0,
       "min_quote_depth_ratio": 0.4

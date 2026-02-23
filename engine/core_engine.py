@@ -1741,7 +1741,7 @@ class TradingEngine:
             finally:
                 # avoid leaking aiohttp sessions created during baseline capture
                 try:
-                    await self.rest.close()
+                    await self.rest.aclose()
                 except Exception:
                     pass
 

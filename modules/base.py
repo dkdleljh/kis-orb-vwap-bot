@@ -75,8 +75,21 @@ class BaseTradingModule(ABC):
         pass
     
     async def _on_shutdown(self) -> None:
-        """서브클래스에서 구현할 종료 로직"""
-        pass
+        """기본 종료 로직: 보유한 async closable 리소스 정리."""
+        seen: set[int] = set()
+        for _name, obj in vars(self).items():
+            if obj is None:
+                continue
+            obj_id = id(obj)
+            if obj_id in seen:
+                continue
+            seen.add(obj_id)
+            aclose = getattr(obj, "aclose", None)
+            if callable(aclose):
+                try:
+                    await aclose()
+                except Exception as e:
+                    self.logger.warning(f"[{self.name}] cleanup failed for {_name}: {e}")
     
     # =========================================================================
     # 필수 구현 메서드 (Trading Interface)
