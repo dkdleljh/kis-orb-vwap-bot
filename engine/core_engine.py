@@ -962,21 +962,33 @@ class TradingEngine:
             except Exception:
                 pass
 
-            # Adjustments (conservative):
+            # Adjustments (tunable via env for today-only ops):
             # - high vol / wide spread -> stricter
             # - BULL -> slightly looser
             # - BEAR -> stricter
+            def _fenv(name: str, default: float) -> float:
+                try:
+                    return float(os.environ.get(name, str(default)) or default)
+                except Exception:
+                    return default
+
+            ATR_ADJ_3 = _fenv("KIS_ADJ_ATR_GE_3", 5.0)
+            ATR_ADJ_5 = _fenv("KIS_ADJ_ATR_GE_5", 5.0)
+            SPREAD_ADJ = _fenv("KIS_ADJ_SPREAD_GE_0P3", 5.0)
+            BULL_ADJ = _fenv("KIS_ADJ_BULL", -3.0)
+            BEAR_ADJ = _fenv("KIS_ADJ_BEAR", 10.0)
+
             adj = 0.0
             if atr_pct >= 3.0:
-                adj += 5.0
+                adj += ATR_ADJ_3
             if atr_pct >= 5.0:
-                adj += 5.0
+                adj += ATR_ADJ_5
             if spread_pct >= 0.003:
-                adj += 5.0
+                adj += SPREAD_ADJ
             if self.market_regime == "BULL":
-                adj -= 3.0
+                adj += BULL_ADJ
             if self.market_regime == "BEAR":
-                adj += 10.0
+                adj += BEAR_ADJ
 
             min_score = max(45.0, min(85.0, base_thr + adj))
 
