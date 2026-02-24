@@ -117,6 +117,8 @@ async def _fetch_fills() -> list[dict]:
 
     _load_dotenv(ROOT / ".env")
 
+    # Cron delivers stdout to chat; keep logs in files only.
+    os.environ.setdefault("NO_STDOUT_LOG", "1")
     logger = setup_logger(str(ROOT / "logs" / "notify_fills"), "Asia/Seoul")
 
     base_url = os.environ.get("KIS_BASE_URL", "https://openapi.koreainvestment.com:9443")

@@ -7,6 +7,7 @@ import aiohttp
 import asyncio
 import json
 import random
+import os
 
 from models import OrderResult, Position
 from core.rate_limiter import get_global_rate_limiter
@@ -145,6 +146,7 @@ class KISRestOrders:
                     json=json_payload,
                     data=data_payload,
                 ) as resp:
+                    status = resp.status
                     try:
                         data = await resp.json()
                     except Exception:
@@ -154,9 +156,16 @@ class KISRestOrders:
                         except Exception:
                             data = {
                                 "rt_cd": "1",
-                                "msg_cd": f"HTTP{resp.status}",
-                                "msg1": text[:200],
+                                "msg_cd": f"HTTP{status}",
+                                "msg1": (text or "")[:200],
                             }
+
+                    # Attach HTTP status for better diagnostics
+                    if isinstance(data, dict):
+                        if data == {}:
+                            # Empty body; normalize to an error payload
+                            data = {"rt_cd": "1", "msg_cd": f"HTTP{status}", "msg1": "empty response body"}
+                        data.setdefault("_http_status", status)
             except aiohttp.ClientError as e:
                 if retry_on_transport and attempt < (max_attempts - 1):
                     wait = self._retry_delay(attempt)
@@ -666,7 +675,11 @@ class KISRestOrders:
         """
         url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-ccnl"
         headers = await self._auth_headers()
-        headers.update({"tr_id": "TTTC8001R", "custtype": "P"})
+        # Some KIS environments (e.g., virtual trading) require different TR IDs.
+        tr_id = os.environ.get("KIS_TR_ID_FILLS")
+        if not tr_id:
+            tr_id = "VTTC8001R" if ("openapivts" in self.base_url or ":29443" in self.base_url) else "TTTC8001R"
+        headers.update({"tr_id": tr_id, "custtype": "P"})
 
         from datetime import datetime, timedelta
 
