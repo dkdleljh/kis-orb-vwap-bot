@@ -6,10 +6,14 @@ cd "$BASE"
 export KIS_CONFIG_PATH="config.us.json"
 export KIS_LOCK_FILE=".kis_bot_us.lock"
 
-# Live trading + integrated margin
-# User approved live US trading.
-export KIS_US_LIVE_CONFIRM="YES"
-export KIS_KILL_SWITCH="0"
+if [ -f .env ]; then
+  set -a
+  . ./.env
+  set +a
+fi
+
+export KIS_US_LIVE_CONFIRM="${KIS_US_LIVE_CONFIRM:-NO}"
+export KIS_KILL_SWITCH="${KIS_KILL_SWITCH:-1}"
 
 # Integrated margin mode: allow US buying power estimate from KRW cash when USD cash is 0.
 export KIS_US_USE_INTEGRATED_MARGIN="1"

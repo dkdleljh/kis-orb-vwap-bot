@@ -28,6 +28,7 @@ from fee_calculator import FeeCalculator
 from news import NewsSentimentAnalyzer
 from premarket_collector import PremarketCollector, CollectStats
 from universe_builder import build_universe, resolve_universe_config
+from core.audit_log import audit_decision
 
 
 KST = ZoneInfo("Asia/Seoul")
@@ -107,6 +108,7 @@ class KukjangModule(BaseTradingModule):
         )
 
         self.peak_pnl_pct: Dict[str, float] = {}
+        self._risk_day = datetime.now(tz=KST).date()
         self._fallback_or_start = None
         self._fallback_or_end = None
 
@@ -118,8 +120,12 @@ class KukjangModule(BaseTradingModule):
 
         self.market_regime = "NEUTRAL"
 
-        self.dynamic_config = resolve_universe_config("SCALP", context.config.get("dynamic_universe", {}))
-        self.dynamic_enabled = os.environ.get("KIS_DYNAMIC_UNIVERSE", "1").strip() != "0"
+        self.dynamic_config = resolve_universe_config(
+            "SCALP", context.config.get("dynamic_universe", {})
+        )
+        self.dynamic_enabled = (
+            os.environ.get("KIS_DYNAMIC_UNIVERSE", "1").strip() != "0"
+        )
         self._scanner = None
         self._current_universe: List[str] = []
         self._last_good_universe: List[str] = []
@@ -130,15 +136,25 @@ class KukjangModule(BaseTradingModule):
         self._data_root = Path(os.environ.get("KIS_DATA_DIR", "data"))
 
         # KR pre-market data/analysis mode (08:00~09:00 KST, data collection only)
-        self._premarket_enabled = os.environ.get("KIS_KR_PREMARKET_COLLECT", "1").strip() == "1"
-        self._premarket_poll_sec = max(15.0, float(os.environ.get("KIS_KR_PREMARKET_POLL_SEC", "60")))
+        self._premarket_enabled = (
+            os.environ.get("KIS_KR_PREMARKET_COLLECT", "1").strip() == "1"
+        )
+        self._premarket_poll_sec = max(
+            15.0, float(os.environ.get("KIS_KR_PREMARKET_POLL_SEC", "60"))
+        )
         default_premarket_max = int(self.dynamic_config.get("max_symbols", 0) or 0)
         self._premarket_max_symbols = int(
             os.environ.get("KIS_KR_PREMARKET_MAX_SYMBOLS", str(default_premarket_max))
         )
-        self._premarket_summary_interval_sec = int(os.environ.get("KIS_KR_PREMARKET_SUMMARY_SEC", "600"))
-        self._premarket_news_interval_sec = int(os.environ.get("KIS_KR_PREMARKET_NEWS_SEC", "300"))
-        self._premarket_metrics_interval_sec = int(os.environ.get("KIS_KR_PREMARKET_METRICS_SEC", "300"))
+        self._premarket_summary_interval_sec = int(
+            os.environ.get("KIS_KR_PREMARKET_SUMMARY_SEC", "600")
+        )
+        self._premarket_news_interval_sec = int(
+            os.environ.get("KIS_KR_PREMARKET_NEWS_SEC", "300")
+        )
+        self._premarket_metrics_interval_sec = int(
+            os.environ.get("KIS_KR_PREMARKET_METRICS_SEC", "300")
+        )
         self._premarket_last_summary_ts = 0.0
         self._premarket_last_news_ts = 0.0
         self._premarket_last_metrics_ts = 0.0
@@ -163,7 +179,7 @@ class KukjangModule(BaseTradingModule):
 
         # scoring threshold
         # Prefer config.trading.scoring.* (shared across engine/modules).
-        scoring_cfg = ((config.get("trading", {}) or {}).get("scoring", {}) or {})
+        scoring_cfg = (config.get("trading", {}) or {}).get("scoring", {}) or {}
         kr_scalp_th = int(scoring_cfg.get("kr_scalp_entry_threshold", 72))
 
         self.perfect_strategy = Perfect100Strategy(
@@ -242,7 +258,7 @@ class KukjangModule(BaseTradingModule):
     async def get_positions(self) -> Optional[Position]:
         return await self.rest.get_positions()
 
-    async def get_quote(self, symbol: str) -> dict:
+    async def get_quote(self, symbol: str) -> dict[str, Any]:
         return await self.rest.get_quote(symbol)
 
     async def on_tick(self, tick: TradeTick) -> None:
@@ -310,7 +326,9 @@ class KukjangModule(BaseTradingModule):
 
         if self.perfect_strategy.state != State.WAIT_SIGNAL:
             if os.environ.get("KIS_DEBUG_ENTRY_SKIPS", "0").strip() == "1":
-                self.log_info(f"[SKIP] {symbol} state={self.perfect_strategy.state} (not WAIT_SIGNAL)")
+                self.log_info(
+                    f"[SKIP] {symbol} state={self.perfect_strategy.state} (not WAIT_SIGNAL)"
+                )
             return
 
         if not self.risk.can_enter():
@@ -326,7 +344,11 @@ class KukjangModule(BaseTradingModule):
 
         # If websocket orderbook is missing/stale, fall back to REST quote so
         # signal generation doesn't completely stall after a restart.
-        if book is None or (getattr(book, "ask", 0) or 0) <= 0 or (getattr(book, "bid", 0) or 0) <= 0:
+        if (
+            book is None
+            or (getattr(book, "ask", 0) or 0) <= 0
+            or (getattr(book, "bid", 0) or 0) <= 0
+        ):
             try:
                 q = await self.get_quote(symbol)
                 out = (q or {}).get("output", {}) or {}
@@ -352,7 +374,9 @@ class KukjangModule(BaseTradingModule):
             return
         if last_price <= 0 or book.ask <= 0 or book.bid <= 0:
             if os.environ.get("KIS_DEBUG_ENTRY_SKIPS", "0").strip() == "1":
-                self.log_info(f"[SKIP] {symbol} invalid prices last={last_price} bid={book.bid} ask={book.ask}")
+                self.log_info(
+                    f"[SKIP] {symbol} invalid prices last={last_price} bid={book.bid} ask={book.ask}"
+                )
             return
 
         indicators = await self._calculate_indicators(symbol, bar)
@@ -375,9 +399,10 @@ class KukjangModule(BaseTradingModule):
             if signal.side:
                 # standardized score line
                 from scoring import ScoreBreakdown, SignalScore
-                from core.audit_log import audit_decision
 
-                bd = ScoreBreakdown({"MQ": 25, "MOMO": 25, "VWAP": 20, "OR": 20, "RR": 10})
+                bd = ScoreBreakdown(
+                    {"MQ": 25, "MOMO": 25, "VWAP": 20, "OR": 20, "RR": 10}
+                )
                 out = SignalScore(
                     symbol=str(signal.symbol),
                     side=str(signal.side),
@@ -394,7 +419,9 @@ class KukjangModule(BaseTradingModule):
         except Exception as e:
             self.log_error(f"Entry evaluation failed: {e}")
 
-    async def _calculate_indicators(self, symbol: str, bar: Bar1m) -> Optional[Dict]:
+    async def _calculate_indicators(
+        self, symbol: str, bar: Bar1m
+    ) -> Optional[Dict[str, Any]]:
         try:
             indicators = {}
             indicators["prev_close"] = float(
@@ -463,7 +490,9 @@ class KukjangModule(BaseTradingModule):
         # KR live gate
         if os.environ.get("KIS_KILL_SWITCH", "0").strip() == "1":
             return False
-        if os.path.exists(os.path.join(os.path.dirname(__file__), "..", "STOP_TRADING.flag")):
+        if os.path.exists(
+            os.path.join(os.path.dirname(__file__), "..", "STOP_TRADING.flag")
+        ):
             return False
         if os.environ.get("KIS_LIVE_ENABLED", "0").strip() != "1":
             return False
@@ -474,7 +503,9 @@ class KukjangModule(BaseTradingModule):
             return
 
         if not self._live_allowed():
-            self.log_warning("KR live ordering suppressed (set KIS_LIVE_ENABLED=1 and KIS_LIVE_CONFIRM=YES; ensure kill switch OFF)")
+            self.log_warning(
+                "KR live ordering suppressed (set KIS_LIVE_ENABLED=1 and KIS_LIVE_CONFIRM=YES; ensure kill switch OFF)"
+            )
             return
 
         symbol: str = signal.symbol if signal.symbol else ""
@@ -543,14 +574,20 @@ class KukjangModule(BaseTradingModule):
         symbols = self._current_universe or list(self.symbols)
         if not symbols:
             return []
-        cap = self._premarket_max_symbols if self._premarket_max_symbols > 0 else len(symbols)
+        cap = (
+            self._premarket_max_symbols
+            if self._premarket_max_symbols > 0
+            else len(symbols)
+        )
         return symbols[:cap]
 
     def _news_cache_path(self, now: datetime) -> Path:
         return self._data_root / "news_cache_kr" / f"{now.strftime('%Y%m%d')}.json"
 
     def _metrics_path(self, now: datetime) -> Path:
-        return self._data_root / "premarket_metrics_kr" / f"{now.strftime('%Y%m%d')}.json"
+        return (
+            self._data_root / "premarket_metrics_kr" / f"{now.strftime('%Y%m%d')}.json"
+        )
 
     def _write_json(self, path: Path, payload: Dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -625,7 +662,9 @@ class KukjangModule(BaseTradingModule):
             "sample_count": len(samples),
         }
 
-    async def _update_premarket_metrics(self, symbols: List[str], now: datetime) -> None:
+    async def _update_premarket_metrics(
+        self, symbols: List[str], now: datetime
+    ) -> None:
         metrics_by_symbol: Dict[str, Any] = {}
         for symbol in symbols:
             m = self._build_symbol_premarket_metrics(symbol)
@@ -651,7 +690,9 @@ class KukjangModule(BaseTradingModule):
 
         if self.dynamic_enabled:
             interval = int(self.dynamic_config.get("scan_interval_sec", 300))
-            due = (self._last_scan_time is None) or ((now - self._last_scan_time).total_seconds() >= interval)
+            due = (self._last_scan_time is None) or (
+                (now - self._last_scan_time).total_seconds() >= interval
+            )
             if due:
                 await self._refresh_universe()
                 await self._load_prev_closes_if_needed(self._current_universe)
@@ -668,11 +709,15 @@ class KukjangModule(BaseTradingModule):
             await self._update_premarket_news(symbols, now)
             self._premarket_last_news_ts = now_ts
 
-        if (now_ts - self._premarket_last_metrics_ts) >= self._premarket_metrics_interval_sec:
+        if (
+            now_ts - self._premarket_last_metrics_ts
+        ) >= self._premarket_metrics_interval_sec:
             await self._update_premarket_metrics(symbols, now)
             self._premarket_last_metrics_ts = now_ts
 
-        if (now_ts - self._premarket_last_summary_ts) >= self._premarket_summary_interval_sec:
+        if (
+            now_ts - self._premarket_last_summary_ts
+        ) >= self._premarket_summary_interval_sec:
             fail_rate = 0.0
             if stats.requested > 0:
                 fail_rate = (stats.failed / float(stats.requested)) * 100.0
@@ -689,6 +734,7 @@ class KukjangModule(BaseTradingModule):
 
         while self._running:
             try:
+                self._roll_risk_day()
                 status = get_kr_market_status(datetime.now(tz=KST))
                 self._log_market_mode_transition(status)
                 if status.get("is_pre_market") and self._premarket_enabled:
@@ -706,6 +752,13 @@ class KukjangModule(BaseTradingModule):
 
         if universe_task:
             universe_task.cancel()
+
+    def _roll_risk_day(self) -> None:
+        today = datetime.now(tz=KST).date()
+        if today != self._risk_day:
+            self._risk_day = today
+            self.risk.reset_daily()
+            self.log_info("Risk counters reset for new trading day")
 
     async def _check_tp_sl(self) -> None:
         if not self.perfect_strategy.in_position():
@@ -736,6 +789,7 @@ class KukjangModule(BaseTradingModule):
                     f"TP1 Scale-out: {pos.symbol} PnL={net_pnl_pct:.2%} (gross={gross_pnl_pct:.2%})"
                 )
                 from core.correlation import new_corr
+
                 corr = new_corr("kr_exit")
                 audit_decision(
                     symbol=pos.symbol,
@@ -754,7 +808,11 @@ class KukjangModule(BaseTradingModule):
                     market="KR",
                     style="SCALP",
                     side="SELL",
-                    extra={"reason": "tp1_scale_out", "odno": getattr(r, 'order_id', None), "order": getattr(r, '__dict__', None) or str(r)},
+                    extra={
+                        "reason": "tp1_scale_out",
+                        "odno": getattr(r, "order_id", None),
+                        "order": getattr(r, "__dict__", None) or str(r),
+                    },
                 )
                 pos.qty -= half_qty
                 pos.tp1_done = True
@@ -804,6 +862,7 @@ class KukjangModule(BaseTradingModule):
         if current_book and current_book.bid > 0:
             exit_price = current_book.bid
             from core.correlation import new_corr
+
             corr = new_corr("kr_exit")
             audit_decision(
                 symbol=pos.symbol,
@@ -812,7 +871,11 @@ class KukjangModule(BaseTradingModule):
                 market="KR",
                 style="SCALP",
                 side="SELL",
-                extra={"reason": reason, "qty": int(pos.qty), "limit_price": float(current_book.bid)},
+                extra={
+                    "reason": reason,
+                    "qty": int(pos.qty),
+                    "limit_price": float(current_book.bid),
+                },
             )
             r = await self.rest.place_sell_limit(pos.symbol, pos.qty, current_book.bid)
             audit_decision(
@@ -822,12 +885,17 @@ class KukjangModule(BaseTradingModule):
                 market="KR",
                 style="SCALP",
                 side="SELL",
-                extra={"reason": reason, "odno": getattr(r, 'order_id', None), "order": getattr(r, '__dict__', None) or str(r)},
+                extra={
+                    "reason": reason,
+                    "odno": getattr(r, "order_id", None),
+                    "order": getattr(r, "__dict__", None) or str(r),
+                },
             )
             self.log_info(f"Exit order: {reason} price={current_book.bid}")
         else:
             exit_price = self.last_price.get(pos.symbol, pos.avg_price)
             from core.correlation import new_corr
+
             corr = new_corr("kr_exit")
             audit_decision(
                 symbol=pos.symbol,
@@ -846,7 +914,11 @@ class KukjangModule(BaseTradingModule):
                 market="KR",
                 style="SCALP",
                 side="SELL",
-                extra={"reason": reason, "odno": getattr(r, 'order_id', None), "order": getattr(r, '__dict__', None) or str(r)},
+                extra={
+                    "reason": reason,
+                    "odno": getattr(r, "order_id", None),
+                    "order": getattr(r, "__dict__", None) or str(r),
+                },
             )
             self.log_info(f"Exit order (market): {reason}")
 
@@ -938,3 +1010,8 @@ class RiskManager:
             self.consecutive_stops += 1
         else:
             self.consecutive_stops = 0
+
+    def reset_daily(self) -> None:
+        self.entries_today = 0
+        self.daily_pnl = 0.0
+        self.consecutive_stops = 0
