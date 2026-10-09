@@ -6,6 +6,8 @@ KIS OpenAPI 기반 KR/US ORB·VWAP 전략, 시세 수집, 리스크 게이트를
 
 ## 변경사항
 
+- SemVer/CalVer 혼용과 PR 생성 권한 오류가 있던 release-please를 명시적 버전 검증·수동 발행 워크플로우로 교체했습니다.
+
 - 저장소 설명, VERSION, 최신 릴리즈 안내를 현재 소스 기준으로 정리했습니다.
 - 로컬 프로젝트와 GitHub 저장소의 연결을 확인했습니다.
 

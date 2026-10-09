@@ -1,20 +1,36 @@
-name: release-please
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-
+name: Validate and publish documented release
 on:
   push:
-    branches:
-      - main
-
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the version documented in VERSION
+        type: boolean
+        default: false
 permissions:
   contents: write
-  pull-requests: write
-
 jobs:
-  release-please:
+  release:
     runs-on: ubuntu-latest
     steps:
-      - uses: googleapis/release-please-action@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
-          release-type: simple
+          python-version: '3.12'
+      - name: Validate version and release notes
+        run: |
+          python - <<'PYCODE'
+          from pathlib import Path
+          import re
+          version = Path('VERSION').read_text().strip()
+          assert re.fullmatch(r'[0-9]+(?:\.[0-9]+){2,3}', version), 'Invalid SemVer/CalVer'
+          assert 'v' + version in Path('RELEASE_NOTES.md').read_text(), 'Version/notes mismatch'
+          PYCODE
+      - name: Publish explicitly requested release
+        if: github.event_name == 'workflow_dispatch' && inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v$(cat VERSION)"
+          gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" --notes-file RELEASE_NOTES.md
